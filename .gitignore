@@ -1,0 +1,46 @@
+# Go编译生成的二进制文件
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# IDE配置文件
+.idea/
+.vscode/
+*.iml
+*.iws
+*.ipr
+
+# 环境变量文件
+*.env
+
+# 上传的文件
+uploads/
+
+# 日志文件
+*.log
+logs/
+
+# 临时文件
+tmp/
+temp/
+
+# Mac OS系统文件
+.DS_Store
+
+# Windows系统文件
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# 依赖管理
+vendor/
+
+# 测试覆盖率文件
+coverage.txt
+coverage.html 
+
+database.sql

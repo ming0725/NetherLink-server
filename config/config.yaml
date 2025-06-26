@@ -1,0 +1,41 @@
+server:
+  http:
+    port: 8080
+    mode: debug  # debug or release
+    base_url: http://localhost:8080  # 添加基础URL配置
+  websocket:
+    port: 8081
+
+database:
+  driver: mysql
+  host: localhost
+  port: 3306
+  username: root
+  password: 123456
+  dbname: netherlink
+  charset: utf8mb4
+  parse_time: true
+  loc: Local
+  max_idle_conns: 10
+  max_open_conns: 100
+
+jwt:
+  secret: secret
+  expire: 24h  # token过期时间
+
+ai:
+  model: deepseek-chat
+  api_key: your-deepseek-api-key
+  base_url: https://api.deepseek.com  # deepseek API 基础URL
+  max_history: 10  # 最大历史消息数量
+
+email:
+  smtp_host: smtp.qq.com
+  smtp_port: 465
+  sender: "your-email@example.com"      # 发件人邮箱
+  password: "your-email-password"       # QQ邮箱授权码（非QQ密码）
+  use_ssl: true
+
+image:
+  upload_dir: uploads/images
+  url_prefix: /static/images 
