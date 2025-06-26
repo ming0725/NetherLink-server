@@ -44,3 +44,4 @@ coverage.txt
 coverage.html 
 
 database.sql
+config/config.yaml
