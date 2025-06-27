@@ -14,7 +14,7 @@ NetherLink-server 是一个基于 Go 语言开发的即时通讯服务器，提�
    - 📨 私聊消息
    - 👥 群聊功能
    - 👬 好友系统
-   - 🟢 在线状态管理
+   - 🟢 多种在线状态显示
 
 3. 📱 社交动态
    - 📝 发布动态（支持文字和图片）
@@ -96,6 +96,12 @@ email:
 ```bash
 go run main.go
 ```
+
+### 4. 客户端仓库地址 🌐
+
+- 客户端代码仓库：[NetherLink](https://github.com/ming0725/NetherLink)
+
+- 按照客户端仓库的说明进行部署
 
 ## 📚 API 文档
 
