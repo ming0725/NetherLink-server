@@ -39,7 +39,5 @@ vendor/
 
 # 测试覆盖率文件
 coverage.txt
-coverage.html 
-
+coverage.html
 database.sql
-config/config.yaml
