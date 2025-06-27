@@ -25,15 +25,15 @@ jwt:
 
 ai:
   model: deepseek-chat
-  api_key: your-deepseek-api-key
+  api_key: sk-6a01b92a11334fec97466cea00f1d0fc
   base_url: https://api.deepseek.com  # deepseek API 基础URL
   max_history: 10  # 最大历史消息数量
 
 email:
   smtp_host: smtp.qq.com
   smtp_port: 465
-  sender: "your-email@example.com"      # 发件人邮箱
-  password: "your-email-password"       # QQ邮箱授权码（非QQ密码）
+  sender: "1285280778@qq.com"      # 发件人邮箱
+  password: "idszhwywoxsmhfda"       # QQ邮箱授权码（非QQ密码）
   use_ssl: true
 
 image:
