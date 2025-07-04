@@ -45,10 +45,12 @@ CREATE DATABASE netherlink;
 ```
 
 2. 导入数据库结构
-```bash
-mysql -u your_username -p netherlink < netherlink.sql
+```mysql
+use netherlink;
+source netherlink.sql;
 ```
 
+> 💡 **提示：** 你也可以使用项目文件夹中的 \`create_sql.txt\` 文件手动创建表结构，该文件包含了完整的建表语句，适用于未使用 \`netherlink.sql\` 的场景。
 ### 2. 修改配置文件 ⚙️
 
 配置文件位于 `config/config.yaml`，需要修改以下配置：
