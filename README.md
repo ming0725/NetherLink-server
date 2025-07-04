@@ -96,6 +96,7 @@ email:
 ### 3. 运行服务器 🚀
 
 ```bash
+go mod tidy
 go run main.go
 ```
 
