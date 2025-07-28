@@ -2,9 +2,9 @@ package utils
 
 import (
 	"NetherLink-server/config"
+	"fmt"
 	"os"
 	"path/filepath"
-	"fmt"
 )
 
 // GetExecDir 获取可执行文件所在目录
@@ -29,6 +29,6 @@ func GetImageURL(filename string) string {
 
 // GetFullImageURL 获取完整图片URL（带协议和host）
 func GetFullImageURL(filename string) string {
-	port := config.GlobalConfig.Server.HTTP.Port
-	return fmt.Sprintf("http://localhost:%d%s/%s", port, config.GlobalConfig.Image.URLPrefix, filename)
-} 
+	BaseUrl := config.GlobalConfig.Server.HTTP.BaseURL
+	return fmt.Sprintf("%s%d%s/%s", BaseUrl, config.GlobalConfig.Image.URLPrefix, filename)
+}

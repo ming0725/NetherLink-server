@@ -50,13 +50,6 @@ type registerRequest struct {
 	AvatarURL  string `json:"avatar_url"`
 }
 
-type registerResponse struct {
-	UID       string `json:"uid"`
-	User      string `json:"user"`
-	Email     string `json:"email"`
-	AvatarURL string `json:"avatar_url"`
-}
-
 type loginRequest struct {
 	Email  string `json:"email" binding:"required,email"`
 	Passwd string `json:"passwd" binding:"required"`
@@ -167,7 +160,7 @@ func sendCodeHandler(c *gin.Context) {
 	codeStoreMutex.Unlock()
 
 	emailCfg := config.GlobalConfig.Email
-	sender := utils.NewEmailSender(emailCfg.SMTPHost, emailCfg.SMTPPort, emailCfg.Sender, emailCfg.Password, emailCfg.UseSSL)
+	sender := utils.NewEmailSender(emailCfg.SMTPHost, emailCfg.SMTPPort, emailCfg.Sender, emailCfg.DisplayName, emailCfg.Password, emailCfg.UseSSL)
 
 	template := utils.GetEmailTemplate(code)
 	err := sender.Send(req.Email, "NetherLink 注册验证码", template)
@@ -802,9 +795,9 @@ func getPostDetailHandler(c *gin.Context) {
 		user, exists := commentUsers[comment.UserID]
 		commentData := gin.H{
 			"comment_id": comment.CommentID,
-			"post_id":   comment.PostID,
-			"user_id":   comment.UserID,
-			"content":   comment.Content,
+			"post_id":    comment.PostID,
+			"user_id":    comment.UserID,
+			"content":    comment.Content,
 			"created_at": comment.CreatedAt.Format("2006-01-02 15:04:05"),
 		}
 		if exists {
@@ -1343,71 +1336,52 @@ func (h *AIHandler) sendError(message string) error {
 }
 
 func searchUsersHandler(c *gin.Context) {
-	// 获取搜索关键词
 	keyword := c.Query("keyword")
 	if keyword == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "搜索关键词不能为空",
-		})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "搜索关键词不能为空"})
 		return
 	}
 
-	// 获取当前用户ID（用于排除自己）
 	currentUID := c.GetString("user_id")
-
 	db, err := getDB()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "数据库连接失败",
-		})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "数据库连接失败"})
 		return
 	}
 
 	var users []SearchUserResponse
 
-	// 构建基础查询
-	query := db.Table("users").
-		Select("uid, id, name, avatar_url, signature, status").
-		Where("uid != ?", currentUID) // 排除当前用户
-
-	// 使用CASE WHEN来计算相关度得分
 	scoreQuery := `
-		CASE 
-			WHEN id = ? THEN 100    -- 完全匹配ID，最高优先级
-			WHEN name = ? THEN 90    -- 完全匹配用户名
-			WHEN id LIKE ? THEN 80   -- ID前缀匹配
-			WHEN name LIKE ? THEN 70 -- 用户名前缀匹配
-			WHEN id LIKE ? THEN 60   -- ID包含关键词
-			WHEN name LIKE ? THEN 50 -- 用户名包含关键词
-			ELSE 0
-		END as relevance_score`
+    CASE 
+        WHEN id = ? THEN 100
+        WHEN name = ? THEN 90
+        WHEN id LIKE ? THEN 80
+        WHEN name LIKE ? THEN 70
+        WHEN id LIKE ? THEN 60
+        WHEN name LIKE ? THEN 50
+        ELSE 0
+    END AS relevance_score`
 
-	// 构建搜索条件
-	searchQuery := query.Select("*, "+scoreQuery,
-		keyword,         // 完全匹配ID
-		keyword,         // 完全匹配用户名
-		keyword+"%",     // ID前缀匹配
-		keyword+"%",     // 用户名前缀匹配
-		"%"+keyword+"%", // ID包含关键词
-		"%"+keyword+"%", // 用户名包含关键词
-	).Where(
-		db.Where("id LIKE ?", "%"+keyword+"%").
-			Or("name LIKE ?", "%"+keyword+"%"),
-	).Order("relevance_score DESC").
-		Limit(20) // 限制返回结果数量
-
-	// 执行查询
-	if err := searchQuery.Find(&users).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "搜索用户失败",
-		})
+	if err := db.Table("users u").
+		Select("u.uid, u.id, u.name, u.avatar_url, u.signature, u.status, "+scoreQuery,
+			keyword, keyword,
+			keyword+"%", keyword+"%",
+			"%"+keyword+"%", "%"+keyword+"%",
+		).
+		Joins("LEFT JOIN friends f ON f.friend_id = u.uid AND f.user_id = ?", currentUID).
+		Where("u.uid != ?", currentUID). // 排除自己
+		Where("f.friend_id IS NULL"). // 排除已添加的好友
+		Where(db.Where("u.id LIKE ?", "%"+keyword+"%").
+			Or("u.name LIKE ?", "%"+keyword+"%"),
+		).
+		Order("relevance_score DESC").
+		Limit(20).
+		Find(&users).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "搜索用户失败"})
 		return
 	}
 
-	// 返回包含users数组的对象
-	c.JSON(http.StatusOK, gin.H{
-		"users": users,
-	})
+	c.JSON(http.StatusOK, gin.H{"users": users})
 }
 
 func searchGroupsHandler(c *gin.Context) {

@@ -8,10 +8,10 @@ import (
 type Config struct {
 	Server   ServerConfig   `mapstructure:"server"`
 	Database DatabaseConfig `mapstructure:"database"`
-	JWT      JWTConfig     `mapstructure:"jwt"`
-	AI       AIConfig      `mapstructure:"ai"`
-	Email    EmailConfig   `mapstructure:"email"`
-	Image    ImageConfig   `mapstructure:"image"`
+	JWT      JWTConfig      `mapstructure:"jwt"`
+	AI       AIConfig       `mapstructure:"ai"`
+	Email    EmailConfig    `mapstructure:"email"`
+	Image    ImageConfig    `mapstructure:"image"`
 }
 
 type ServerConfig struct {
@@ -56,16 +56,17 @@ type AIConfig struct {
 }
 
 type EmailConfig struct {
-	SMTPHost string `mapstructure:"smtp_host"`
-	SMTPPort int    `mapstructure:"smtp_port"`
-	Sender   string `mapstructure:"sender"`
-	Password string `mapstructure:"password"`
-	UseSSL   bool   `mapstructure:"use_ssl"`
+	SMTPHost    string `mapstructure:"smtp_host"`
+	SMTPPort    int    `mapstructure:"smtp_port"`
+	Sender      string `mapstructure:"sender"`
+	DisplayName string `mapstructure:"display_name"`
+	Password    string `mapstructure:"password"`
+	UseSSL      bool   `mapstructure:"use_ssl"`
 }
 
 type ImageConfig struct {
-	UploadDir   string `mapstructure:"upload_dir"`
-	URLPrefix   string `mapstructure:"url_prefix"`
+	UploadDir string `mapstructure:"upload_dir"`
+	URLPrefix string `mapstructure:"url_prefix"`
 }
 
 var GlobalConfig Config
@@ -84,4 +85,4 @@ func Init() error {
 	}
 
 	return nil
-} 
+}

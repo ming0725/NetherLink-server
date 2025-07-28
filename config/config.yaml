@@ -1,8 +1,8 @@
 server:
   http:
     port: 8080
-    mode: debug  # debug or release
-    base_url: http://localhost:8080  # 添加基础URL配置
+    mode: debug
+    base_url: http://127.0.0.1:8080  # 服务器非本地请注意修改，否则返回的图片Url为本地无法正确获取图片
   websocket:
     port: 8081
 
@@ -25,15 +25,16 @@ jwt:
 
 ai:
   model: deepseek-chat
-  api_key: your-deepseek-key
+  api_key: sk-6xxx
   base_url: https://api.deepseek.com  # deepseek API 基础URL
   max_history: 10  # 最大历史消息数量
 
 email:
   smtp_host: smtp.qq.com
   smtp_port: 465
-  sender: "your-email@qq.com"      # 发件人邮箱
-  password: "your-email-key"       # QQ邮箱授权码（非QQ密码）
+  sender: "xxx@qq.com"  # 发件人邮箱
+  display_name: "NetherLink"
+  password: "123" # QQ邮箱授权码（非QQ密码）
   use_ssl: true
 
 image:
