@@ -30,5 +30,5 @@ func GetImageURL(filename string) string {
 // GetFullImageURL 获取完整图片URL（带协议和host）
 func GetFullImageURL(filename string) string {
 	BaseUrl := config.GlobalConfig.Server.HTTP.BaseURL
-	return fmt.Sprintf("%s%d%s/%s", BaseUrl, config.GlobalConfig.Image.URLPrefix, filename)
+	return fmt.Sprintf("%s%s/%s", BaseUrl, config.GlobalConfig.Image.URLPrefix, filename)
 }

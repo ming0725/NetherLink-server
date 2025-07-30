@@ -557,11 +557,6 @@ func getPostsHandler(c *gin.Context) {
 		return
 	}
 
-	log.Printf("查询到 %d 条帖子", len(posts))
-	for i, post := range posts {
-		log.Printf("帖子 %d: ID=%d, Title=%s", i+1, post.PostID, post.Title)
-	}
-
 	// 获取每个帖子的点赞信息
 	var result []model.PostPreview
 	for _, post := range posts {
@@ -1370,7 +1365,7 @@ func searchUsersHandler(c *gin.Context) {
 		).
 		Joins("LEFT JOIN friends f ON f.friend_id = u.uid AND f.user_id = ?", currentUID).
 		Where("u.uid != ?", currentUID). // 排除自己
-		Where("f.friend_id IS NULL"). // 排除已添加的好友
+		Where("f.friend_id IS NULL").    // 排除已添加的好友
 		Where(db.Where("u.id LIKE ?", "%"+keyword+"%").
 			Or("u.name LIKE ?", "%"+keyword+"%"),
 		).
