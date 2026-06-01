@@ -3,8 +3,11 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -26,6 +29,25 @@ const userSelectColumns = `
 	created_at,
 	updated_at,
 	deleted_at`
+
+const userSelectColumnsU = `
+	u.id,
+	u.public_id,
+	u.email,
+	u.password_hash,
+	u.nick,
+	u.gender,
+	u.gender_custom,
+	u.avatar_file_id,
+	u.status,
+	u.signature,
+	u.region,
+	u.last_seen_at,
+	u.token_version,
+	u.version,
+	u.created_at,
+	u.updated_at,
+	u.deleted_at`
 
 const userIDChangeSelectColumns = `
 	id,
@@ -173,6 +195,90 @@ func (r *UserRepository) PublicIDExists(ctx context.Context, publicID string) (b
 		normalizeText(publicID),
 	).Scan(&exists)
 	return exists, translateReadError(err)
+}
+
+func (r *UserRepository) Search(ctx context.Context, keyword string, limit int, offset int) ([]User, int, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT `+userSelectColumns+`, (count(*) OVER())::int AS total_count
+		FROM users
+		WHERE deleted_at IS NULL
+		  AND status = 'active'
+		  AND (
+		    $1 = ''
+		    OR public_id ILIKE '%' || $1 || '%'
+		    OR nick ILIKE '%' || $1 || '%'
+		  )
+		ORDER BY updated_at DESC, id ASC
+		LIMIT $2 OFFSET $3`,
+		normalizeText(keyword),
+		limit,
+		offset,
+	)
+	if err != nil {
+		return nil, 0, translateReadError(err)
+	}
+	defer rows.Close()
+
+	var total int
+	users, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (User, error) {
+		user, rowTotal, err := scanUserWithTotal(row)
+		if err != nil {
+			return User{}, err
+		}
+		total = rowTotal
+		return user, nil
+	})
+	if err != nil {
+		return nil, 0, translateReadError(err)
+	}
+
+	return users, total, nil
+}
+
+func (r *UserRepository) BatchGetByIDs(ctx context.Context, userIDs []string) ([]User, error) {
+	normalized := make([]string, 0, len(userIDs))
+	for _, userID := range userIDs {
+		userID = normalizeText(userID)
+		if userID != "" {
+			normalized = append(normalized, userID)
+		}
+	}
+	if len(normalized) == 0 {
+		return []User{}, nil
+	}
+
+	placeholders := make([]string, 0, len(normalized))
+	args := make([]any, 0, len(normalized))
+	for i, userID := range normalized {
+		placeholders = append(placeholders, fmt.Sprintf("($%d::uuid, %d)", i+1, i+1))
+		args = append(args, userID)
+	}
+
+	rows, err := r.db.Query(ctx, `
+		WITH input_ids(id, ord) AS (
+			VALUES `+strings.Join(placeholders, ",")+`
+		)
+		SELECT `+userSelectColumnsU+`
+		FROM input_ids
+		JOIN users u ON u.id = input_ids.id
+		WHERE u.deleted_at IS NULL
+		  AND u.status = 'active'
+		ORDER BY input_ids.ord`,
+		args...,
+	)
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	defer rows.Close()
+
+	users, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (User, error) {
+		return scanUser(row)
+	})
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+
+	return users, nil
 }
 
 func (r *UserRepository) UpdateProfile(ctx context.Context, params UpdateUserProfileParams) (User, error) {
@@ -387,6 +493,64 @@ func scanUser(row scanner) (User, error) {
 	}
 
 	return user, nil
+}
+
+func scanUserWithTotal(row scanner) (User, int, error) {
+	var (
+		user         User
+		id           pgtype.UUID
+		genderCustom sql.NullString
+		avatarFileID pgtype.UUID
+		signature    sql.NullString
+		region       sql.NullString
+		lastSeenAt   sql.NullTime
+		deletedAt    sql.NullTime
+		total        int
+	)
+
+	err := row.Scan(
+		&id,
+		&user.PublicID,
+		&user.Email,
+		&user.PasswordHash,
+		&user.Nick,
+		&user.Gender,
+		&genderCustom,
+		&avatarFileID,
+		&user.Status,
+		&signature,
+		&region,
+		&lastSeenAt,
+		&user.TokenVersion,
+		&user.Version,
+		&user.CreatedAt,
+		&user.UpdatedAt,
+		&deletedAt,
+		&total,
+	)
+	if err != nil {
+		return User{}, 0, err
+	}
+
+	user.ID = uuidString(id)
+	if genderCustom.Valid {
+		user.GenderCustom = &genderCustom.String
+	}
+	user.AvatarFileID = uuidStringPtr(avatarFileID)
+	if signature.Valid {
+		user.Signature = &signature.String
+	}
+	if region.Valid {
+		user.Region = &region.String
+	}
+	if lastSeenAt.Valid {
+		user.LastSeenAt = &lastSeenAt.Time
+	}
+	if deletedAt.Valid {
+		user.DeletedAt = &deletedAt.Time
+	}
+
+	return user, total, nil
 }
 
 func scanUserIDChange(row scanner) (UserIDChange, error) {

@@ -79,6 +79,15 @@ func TestProtectedRouteWithoutTokenReturnsTokenMissing(t *testing.T) {
 		{method: http.MethodPatch, path: "/api/v1/me"},
 		{method: http.MethodGet, path: "/api/v1/me/user-id/check?userId=netherlink"},
 		{method: http.MethodPatch, path: "/api/v1/me/user-id"},
+		{method: http.MethodGet, path: "/api/v1/users?keyword=ming"},
+		{method: http.MethodGet, path: "/api/v1/users/by-id/netherlink"},
+		{method: http.MethodGet, path: "/api/v1/users/00000000-0000-0000-0000-000000000000"},
+		{method: http.MethodPost, path: "/api/v1/users/batch"},
+		{method: http.MethodGet, path: "/api/v1/friends"},
+		{method: http.MethodGet, path: "/api/v1/friend-groups"},
+		{method: http.MethodGet, path: "/api/v1/groups"},
+		{method: http.MethodGet, path: "/api/v1/groups/00000000-0000-0000-0000-000000000000"},
+		{method: http.MethodGet, path: "/api/v1/groups/00000000-0000-0000-0000-000000000000/members"},
 	}
 
 	for _, route := range protectedRoutes {

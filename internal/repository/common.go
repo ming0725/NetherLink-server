@@ -26,6 +26,8 @@ type Repositories struct {
 	Users       *UserRepository
 	Preferences *UserPreferenceRepository
 	Sessions    *UserSessionRepository
+	Friends     *FriendRepository
+	Groups      *GroupRepository
 }
 
 func New(db DBTX) Repositories {
@@ -33,6 +35,8 @@ func New(db DBTX) Repositories {
 		Users:       NewUserRepository(db),
 		Preferences: NewUserPreferenceRepository(db),
 		Sessions:    NewUserSessionRepository(db),
+		Friends:     NewFriendRepository(db),
+		Groups:      NewGroupRepository(db),
 	}
 }
 

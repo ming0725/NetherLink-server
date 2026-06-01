@@ -84,6 +84,15 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("PATCH /api/v1/me/user-id", s.withAuthRequired(http.HandlerFunc(s.handlePatchMeUserID)))
 	mux.Handle("GET /api/v1/me/preferences", s.withAuthRequired(http.HandlerFunc(s.handleGetMePreferences)))
 	mux.Handle("PATCH /api/v1/me/preferences", s.withAuthRequired(http.HandlerFunc(s.handlePatchMePreferences)))
+	mux.Handle("GET /api/v1/users", s.withAuthRequired(http.HandlerFunc(s.handleUsersSearch)))
+	mux.Handle("GET /api/v1/users/by-id/{userId}", s.withAuthRequired(http.HandlerFunc(s.handleUserByPublicID)))
+	mux.Handle("GET /api/v1/users/{userUuid}", s.withAuthRequired(http.HandlerFunc(s.handleUserByUUID)))
+	mux.Handle("POST /api/v1/users/batch", s.withAuthRequired(http.HandlerFunc(s.handleUsersBatch)))
+	mux.Handle("GET /api/v1/friends", s.withAuthRequired(http.HandlerFunc(s.handleFriends)))
+	mux.Handle("GET /api/v1/friend-groups", s.withAuthRequired(http.HandlerFunc(s.handleFriendGroups)))
+	mux.Handle("GET /api/v1/groups", s.withAuthRequired(http.HandlerFunc(s.handleGroups)))
+	mux.Handle("GET /api/v1/groups/{groupId}", s.withAuthRequired(http.HandlerFunc(s.handleGroupDetail)))
+	mux.Handle("GET /api/v1/groups/{groupId}/members", s.withAuthRequired(http.HandlerFunc(s.handleGroupMembers)))
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

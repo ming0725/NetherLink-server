@@ -9,7 +9,7 @@ Current scope is intentionally small:
 - Thin HTTP server under `internal/server`.
 - PostgreSQL connection pool setup under `internal/database`.
 - Redis client setup under `internal/cache`.
-- PostgreSQL repositories for users, user preferences, and user sessions under `internal/repository`.
+- PostgreSQL repositories for users, user preferences, user sessions, friends, and groups under `internal/repository`.
 - P0 auth service under `internal/auth`: password hashing, access token signing/validation, refresh token hashing/rotation, PostgreSQL-backed session checks, current-user profile updates, public ID checks/changes, and device session management.
 - Object storage interface skeleton under `internal/storage`.
 - PostgreSQL schema bootstrap under `db/`.
@@ -17,7 +17,8 @@ Current scope is intentionally small:
 - MinIO object storage bootstrap under `minio/`.
 - Health endpoints, API v1 root, request IDs, panic recovery, structured access logs, JSON 404/405 responses, request body helper functions, readiness checks for PostgreSQL and Redis, and Bearer access-token validation are available.
 - P0 auth HTTP handlers are available: register, login, refresh, logout, session listing/revoke, `/me`, profile editing, public ID availability/change, `GET /me/preferences`, and `PATCH /me/preferences`.
-- No MinIO SDK implementation, file processing workers, friend/group/chat/post/AI API handlers, or WebSocket realtime events yet.
+- User/friend/group read HTTP handlers are available: user search/detail/batch, friend list/group list, group list/detail/member list.
+- No MinIO SDK implementation, file processing workers, friend/group write handlers, chat/post/AI API handlers, or WebSocket realtime events yet.
 - Redis is used only for auth rate limiting today. It is not used as the source of truth for users, refresh token sessions, messages, notifications, file metadata, or durable business state.
 
 ## Start Local Dependencies
@@ -67,6 +68,7 @@ The current API foundation includes:
 - JSON body decoding helpers with unknown-field rejection and a 1 MiB request body limit.
 - Bearer auth middleware validates access token signature, expiry, active PostgreSQL session, active user status, and `tokenVersion`.
 - Auth endpoints: `POST /api/v1/auth/register`, `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/sessions`, `POST /api/v1/auth/sessions/{sessionId}/revoke`, `GET /api/v1/me`, `PATCH /api/v1/me`, `GET /api/v1/me/user-id/check`, `PATCH /api/v1/me/user-id`, `GET /api/v1/me/preferences`, and `PATCH /api/v1/me/preferences`.
+- Directory read endpoints: `GET /api/v1/users`, `GET /api/v1/users/{userUuid}`, `GET /api/v1/users/by-id/{userId}`, `POST /api/v1/users/batch`, `GET /api/v1/friends`, `GET /api/v1/friend-groups`, `GET /api/v1/groups`, `GET /api/v1/groups/{groupId}`, and `GET /api/v1/groups/{groupId}/members`.
 
 PostgreSQL:
 
@@ -130,6 +132,8 @@ The first PostgreSQL repositories cover:
 - `users`: create account records, read by UUID/email/public ID/account, update profile fields, check and update public ID with history, enforce public ID change idempotency, increment token version, and update last-seen time.
 - `user_preferences`: ensure defaults, upsert full preferences, read by user UUID, and patch preference fields.
 - `user_sessions`: create refresh-token sessions, read active sessions, list user sessions, rotate refresh token hash, revoke sessions, and update session last-seen time.
+- `friends`: list current-user friend groups, list active friends with keyword/group filters, and read current-user friendship relation metadata.
+- `groups`: list current-user groups with keyword/category filters, read group details only for members, and page group members only when the viewer belongs to the group.
 
 These repositories are persistence primitives only. They do not hash passwords, mint tokens, enforce auth policy, or write HTTP responses.
 
@@ -152,7 +156,7 @@ The former `internal/database/postgres_test.go` was a single DSN unit test, not 
 
 ## Next Build Steps
 
-1. Add user/friend/group read APIs on top of the authenticated current-user foundation.
+1. Add friend request and friend group write APIs on top of the read-only relationship foundation.
 2. Add a MinIO-backed implementation of `ObjectStorageProvider`.
 3. Add only the file upload-session API skeleton before implementing full chat, posts, or AI workflows.
 4. Add WebSocket auth and chat message persistence after identity and file metadata paths are stable.
