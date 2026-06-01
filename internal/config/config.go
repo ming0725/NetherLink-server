@@ -10,6 +10,7 @@ import (
 type Config struct {
 	Env      string
 	HTTP     HTTPConfig
+	Auth     AuthConfig
 	Postgres PostgresConfig
 	Redis    RedisConfig
 	Storage  StorageConfig
@@ -17,6 +18,12 @@ type Config struct {
 
 type HTTPConfig struct {
 	Addr string
+}
+
+type AuthConfig struct {
+	TokenSecret     string
+	AccessTokenTTL  time.Duration
+	RefreshTokenTTL time.Duration
 }
 
 type PostgresConfig struct {
@@ -59,6 +66,11 @@ func Load() Config {
 		Env: getEnv("NETHERLINK_ENV", "local"),
 		HTTP: HTTPConfig{
 			Addr: getEnv("NETHERLINK_HTTP_ADDR", ":8080"),
+		},
+		Auth: AuthConfig{
+			TokenSecret:     getEnv("NETHERLINK_AUTH_TOKEN_SECRET", "nlserver-local-dev-token-secret-change-me"),
+			AccessTokenTTL:  getEnvDuration("NETHERLINK_AUTH_ACCESS_TOKEN_TTL", 15*time.Minute),
+			RefreshTokenTTL: getEnvDuration("NETHERLINK_AUTH_REFRESH_TOKEN_TTL", 30*24*time.Hour),
 		},
 		Postgres: PostgresConfig{
 			Host:     getEnv("NETHERLINK_POSTGRES_HOST", "localhost"),

@@ -10,13 +10,15 @@ Current scope is intentionally small:
 - PostgreSQL connection pool setup under `internal/database`.
 - Redis client setup under `internal/cache`.
 - PostgreSQL repositories for users, user preferences, and user sessions under `internal/repository`.
+- P0 auth service under `internal/auth`: password hashing, access token signing/validation, refresh token hashing/rotation, and PostgreSQL-backed session checks.
 - Object storage interface skeleton under `internal/storage`.
 - PostgreSQL schema bootstrap under `db/`.
 - Redis service bootstrap under `docker-compose.yml`.
 - MinIO object storage bootstrap under `minio/`.
-- Health endpoints, API v1 root, request IDs, panic recovery, structured access logs, JSON 404/405 responses, request body helper functions, readiness checks for PostgreSQL and Redis, and a Bearer auth middleware skeleton are available.
-- No business API handlers, auth token validation, MinIO SDK implementation, or file processing workers yet.
-- Redis is connected as infrastructure only. It is not yet used for login rate limits, online presence, token/session acceleration, WebSocket fanout, or temporary workflow state.
+- Health endpoints, API v1 root, request IDs, panic recovery, structured access logs, JSON 404/405 responses, request body helper functions, readiness checks for PostgreSQL and Redis, and Bearer access-token validation are available.
+- P0 auth HTTP handlers are available: register, login, refresh, logout, `/me`, `GET /me/preferences`, and `PATCH /me/preferences`.
+- No MinIO SDK implementation, file processing workers, friend/group/chat/post/AI API handlers, or WebSocket realtime events yet.
+- Redis is used only for auth rate limiting today. It is not used as the source of truth for users, refresh token sessions, messages, notifications, file metadata, or durable business state.
 
 ## Start Local Dependencies
 
@@ -42,6 +44,12 @@ Default server address:
 `/healthz` only verifies that the process is serving HTTP. `/readyz` pings PostgreSQL and Redis, and returns `503 SERVICE_NOT_READY` until both dependencies are reachable.
 Unknown routes and unsupported methods return the standard JSON error shape with `code`, `message`, and `requestId`.
 
+Auth configuration:
+
+- `NETHERLINK_AUTH_TOKEN_SECRET`: HMAC signing secret for access tokens.
+- `NETHERLINK_AUTH_ACCESS_TOKEN_TTL`: default `15m`.
+- `NETHERLINK_AUTH_REFRESH_TOKEN_TTL`: default `720h`.
+
 ## API Foundation
 
 All HTTP responses written by the shared helpers use JSON and preserve `X-Request-Id`.
@@ -52,7 +60,8 @@ The current API foundation includes:
 - Panic recovery mapped to `INTERNAL_ERROR`.
 - JSON `NOT_FOUND` and `METHOD_NOT_ALLOWED` fallback responses.
 - JSON body decoding helpers with unknown-field rejection and a 1 MiB request body limit.
-- Bearer auth middleware skeleton. It only extracts a token today; actual token validation belongs to the P0 auth implementation.
+- Bearer auth middleware validates access token signature, expiry, active PostgreSQL session, active user status, and `tokenVersion`.
+- Auth endpoints: `POST /api/v1/auth/register`, `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`, `GET /api/v1/me`, `GET /api/v1/me/preferences`, and `PATCH /api/v1/me/preferences`.
 
 PostgreSQL:
 
@@ -96,7 +105,7 @@ Redis is an auxiliary runtime dependency. PostgreSQL remains the source of truth
 
 Initial intended Redis uses:
 
-- Login/register/IP rate limiting.
+- Login/register/IP rate limiting. This is the only current Redis business use.
 - Short-lived verification or workflow state.
 - WebSocket online presence and later fanout support.
 - Optional access-token/session lookup acceleration after PostgreSQL-backed auth is implemented.
@@ -113,6 +122,10 @@ The first PostgreSQL repositories cover:
 
 These repositories are persistence primitives only. They do not hash passwords, mint tokens, enforce auth policy, or write HTTP responses.
 
+## Auth Boundary
+
+`internal/auth` owns password hashing, refresh token hashing, access-token signing, refresh token rotation, and access-token validation. PostgreSQL remains authoritative for users and refresh token sessions. Redis keys used by auth are namespaced as `nl:rate:auth:*`, have TTLs, and are only rate-limit counters.
+
 ## Testing
 
 Repository tests live under `tests/` instead of the production `internal/` package directories.
@@ -126,7 +139,7 @@ The former `internal/database/postgres_test.go` was a single DSN unit test, not 
 
 ## Next Build Steps
 
-1. Implement P0 auth service and handlers: register, login, refresh token rotation, logout, `/me`, `/me/preferences`, and access token validation.
-2. Use Redis for auth rate limits and short-lived token/session acceleration only after PostgreSQL-backed auth is correct.
-3. Add a MinIO-backed implementation of `ObjectStorageProvider`.
-4. Add only the file upload-session API skeleton before implementing full chat, posts, or AI workflows.
+1. Add user/friend/group read APIs and profile editing on top of the authenticated current-user foundation.
+2. Add a MinIO-backed implementation of `ObjectStorageProvider`.
+3. Add only the file upload-session API skeleton before implementing full chat, posts, or AI workflows.
+4. Add WebSocket auth and chat message persistence after identity and file metadata paths are stable.

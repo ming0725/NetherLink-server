@@ -4,11 +4,11 @@
 
 ## 0. 当前实现状态
 
-当前代码库已完成后端基础骨架：环境配置、PostgreSQL 连接池、Redis 客户端基础设施、users / user_preferences / user_sessions repository、数据库 schema 初始化、MinIO bucket 初始化脚本、对象存储接口定义、HTTP 服务、`GET /healthz`、`GET /readyz`、`GET /api/v1`、请求 ID、panic recovery、结构化访问日志、JSON 404/405、JSON 请求体解析辅助函数，以及 Bearer 鉴权 middleware 骨架。
+当前代码库已完成后端基础骨架：环境配置、PostgreSQL 连接池、Redis 客户端基础设施、users / user_preferences / user_sessions repository、数据库 schema 初始化、MinIO bucket 初始化脚本、对象存储接口定义、HTTP 服务、`GET /healthz`、`GET /readyz`、`GET /api/v1`、请求 ID、panic recovery、结构化访问日志、JSON 404/405、JSON 请求体解析辅助函数，以及 Bearer access token 校验。
 
-尚未实现业务 API、access token 校验、refresh token 轮换、Redis 业务用途、MinIO SDK provider、文件处理 worker、WebSocket 和实时事件。
+已实现 P0 Auth：注册、登录、refresh token 轮换、登出、`GET /me`、`GET /me/preferences`、`PATCH /me/preferences`、密码哈希、access token 签名与校验、refresh token hash 存储。尚未实现 MinIO SDK provider、文件处理 worker、好友/群/聊天/帖子/AI API、WebSocket 和实时事件。
 
-Redis 当前只作为基础设施接入，用于后续登录限流、短时验证码或流程状态、WebSocket 在线状态、事件扇出和 token/session 加速。PostgreSQL 仍然是用户、偏好、会话、消息、通知和文件元数据等持久业务数据的权威来源。
+Redis 当前仅用于 auth 登录/注册限流，key 命名空间为 `nl:rate:auth:*` 且带 TTL；后续仍只允许用于短时验证码或流程状态、WebSocket 在线状态、事件扇出和 token/session 加速。PostgreSQL 仍然是用户、refresh token 会话、偏好、消息、通知和文件元数据等持久业务数据的权威来源。
 
 测试约定：测试文件集中放在仓库根目录的 `tests/` 包内，通过 `go test ./...` 运行；不在 `internal/` 生产包目录内放置 `*_test.go`。
 
@@ -424,9 +424,9 @@ AI 文件默认保留策略建议：
 
 | 项 | 设计 |
 | --- | --- |
-| Access Token | JWT，短有效期建议 15 分钟；只放 `sub=userUuid`、`sid=sessionId`、`deviceId`、`iat`、`exp`、`scope`、`tokenVersion`。 |
+| Access Token | 当前实现为 HS256 签名的 JWT 形态 token，短有效期默认 15 分钟；只放 `sub=userUuid`、`sid=sessionId`、`deviceId`、`iat`、`exp`、`scope`、`tokenVersion`。 |
 | Refresh Token | 高熵随机字符串，服务端只存 hash，建议 30 天有效；每次刷新后轮换，旧 refresh token 立即失效。 |
-| 服务端验证 | 校验签名、`exp`、`sid` 是否存在且未撤销、用户是否禁用、`tokenVersion` 是否匹配。 |
+| 服务端验证 | 已实现校验签名、`exp`、`sid` 是否存在且未撤销、用户是否禁用、`tokenVersion` 是否匹配。 |
 | 权限校验 | 资料修改只允许本人；好友关系按 `friendships.user_id`；群管理操作按 `group_members.role`；消息发送必须是会话参与者。 |
 | WebSocket 鉴权 | 建连时使用 `Authorization: Bearer <access_token>` 或 `?token=`；服务端验证后绑定 `userUuid/sessionId/deviceId`。 |
 | 续期流程 | REST 返回 401 且错误码 `TOKEN_EXPIRED`；调用 `/auth/refresh` 成功后获得新 token，失败则必须重新登录。 |
@@ -658,7 +658,7 @@ AI 文件响应必须暴露解析状态和上下文成本：
 
 | 优先级 | 后端能力 | 原因 |
 | --- | --- | --- |
-| P0 | Auth 注册/登录/刷新、`/me`、`/me/preferences`、token 验证 | 所有登录态业务依赖账号、鉴权和当前用户资料。 |
+| P0 | Auth 注册/登录/刷新、`/me`、`/me/preferences`、token 验证 | 已实现；所有登录态业务依赖账号、鉴权和当前用户资料。 |
 | P0 | 用户/好友/群详情 GET、头像文件元数据 | 基础社交关系和资料展示依赖这些接口。 |
 | P0 | WebSocket 鉴权、消息发送/接收、历史消息分页 | 聊天是实时核心功能，必须先保证消息可靠性和补偿拉取。 |
 | P1 | 好友申请、群申请、通知未读 | 社交关系变更和通知需要后端统一裁决。 |

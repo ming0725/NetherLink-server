@@ -54,6 +54,30 @@ func TestAPIV1Root(t *testing.T) {
 	}
 }
 
+func TestAuthRouteWithoutDatabaseReturnsServiceNotReady(t *testing.T) {
+	srv := newHTTPTestServer()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{}`))
+	req.Header.Set("X-Request-Id", "req_auth")
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	assertErrorResponse(t, rec, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "req_auth")
+}
+
+func TestProtectedRouteWithoutTokenReturnsTokenMissing(t *testing.T) {
+	srv := newHTTPTestServer()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/me", nil)
+	req.Header.Set("X-Request-Id", "req_me")
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	assertErrorResponse(t, rec, http.StatusUnauthorized, "TOKEN_MISSING", "req_me")
+}
+
 func TestJSONNotFound(t *testing.T) {
 	srv := newHTTPTestServer()
 

@@ -10,15 +10,19 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	authsvc "nlserver/internal/auth"
 	"nlserver/internal/config"
+	"nlserver/internal/repository"
 )
 
 type Server struct {
-	cfg     config.Config
-	db      *pgxpool.Pool
-	redis   *redis.Client
-	logger  *slog.Logger
-	handler http.Handler
+	cfg         config.Config
+	db          *pgxpool.Pool
+	redis       *redis.Client
+	repos       repository.Repositories
+	authService *authsvc.Service
+	logger      *slog.Logger
+	handler     http.Handler
 }
 
 func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client, logger *slog.Logger) *Server {
@@ -27,6 +31,10 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client, logger 
 		db:     db,
 		redis:  redisClient,
 		logger: logger,
+	}
+	if db != nil {
+		server.repos = repository.New(db)
+		server.authService = authsvc.NewService(cfg.Auth, server.repos)
 	}
 
 	mux := http.NewServeMux()
@@ -64,6 +72,13 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1", s.handleAPIRoot)
+	mux.HandleFunc("POST /api/v1/auth/register", s.handleAuthRegister)
+	mux.HandleFunc("POST /api/v1/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("POST /api/v1/auth/refresh", s.handleAuthRefresh)
+	mux.HandleFunc("POST /api/v1/auth/logout", s.handleAuthLogout)
+	mux.Handle("GET /api/v1/me", s.withAuthRequired(http.HandlerFunc(s.handleMe)))
+	mux.Handle("GET /api/v1/me/preferences", s.withAuthRequired(http.HandlerFunc(s.handleGetMePreferences)))
+	mux.Handle("PATCH /api/v1/me/preferences", s.withAuthRequired(http.HandlerFunc(s.handlePatchMePreferences)))
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
