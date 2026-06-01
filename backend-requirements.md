@@ -2,6 +2,14 @@
 
 本文只定义后端需要提供和保证的能力：数据模型、接口、鉴权、实时事件、响应结构和错误码。调用方内部架构和运行时保存策略不属于本文范围，不能作为后端开发约束。
 
+## 0. 当前实现状态
+
+当前代码库已完成后端基础骨架：环境配置、PostgreSQL 连接池、数据库 schema 初始化、MinIO bucket 初始化脚本、对象存储接口定义、HTTP 服务、`GET /healthz`、`GET /readyz`、`GET /api/v1`、请求 ID、panic recovery、结构化访问日志、JSON 404/405、JSON 请求体解析辅助函数，以及 Bearer 鉴权 middleware 骨架。
+
+尚未实现业务 API、access token 校验、refresh token 轮换、数据库 repository、MinIO SDK provider、文件处理 worker、WebSocket 和实时事件。
+
+测试约定：测试文件集中放在仓库根目录的 `tests/` 包内，通过 `go test ./...` 运行；不在 `internal/` 生产包目录内放置 `*_test.go`。
+
 ## 1. 总体原则
 
 | 项 | 要求 |

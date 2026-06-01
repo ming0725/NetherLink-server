@@ -1,0 +1,104 @@
+package tests
+
+import (
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"nlserver/internal/config"
+	"nlserver/internal/server"
+)
+
+func newHTTPTestServer() *server.Server {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return server.New(config.Config{Env: "test"}, nil, logger)
+}
+
+func TestHealthz(t *testing.T) {
+	srv := newHTTPTestServer()
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	req.Header.Set("X-Request-Id", "req_test")
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if rec.Header().Get("X-Request-Id") != "req_test" {
+		t.Fatalf("request id header = %q, want req_test", rec.Header().Get("X-Request-Id"))
+	}
+	if !strings.Contains(rec.Body.String(), `"status":"ok"`) {
+		t.Fatalf("body = %s, want status ok", rec.Body.String())
+	}
+}
+
+func TestAPIV1Root(t *testing.T) {
+	srv := newHTTPTestServer()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if !strings.Contains(rec.Body.String(), `"apiVersion":"v1"`) {
+		t.Fatalf("body = %s, want apiVersion v1", rec.Body.String())
+	}
+}
+
+func TestJSONNotFound(t *testing.T) {
+	srv := newHTTPTestServer()
+
+	req := httptest.NewRequest(http.MethodGet, "/missing", nil)
+	req.Header.Set("X-Request-Id", "req_missing")
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	assertErrorResponse(t, rec, http.StatusNotFound, "NOT_FOUND", "req_missing")
+}
+
+func TestJSONMethodNotAllowed(t *testing.T) {
+	srv := newHTTPTestServer()
+
+	req := httptest.NewRequest(http.MethodPost, "/healthz", nil)
+	req.Header.Set("X-Request-Id", "req_method")
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	assertErrorResponse(t, rec, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "req_method")
+	if allow := rec.Header().Get("Allow"); !strings.Contains(allow, http.MethodGet) {
+		t.Fatalf("allow header = %q, want it to include GET", allow)
+	}
+}
+
+func assertErrorResponse(t *testing.T, rec *httptest.ResponseRecorder, status int, code string, requestID string) {
+	t.Helper()
+
+	if rec.Code != status {
+		t.Fatalf("status = %d, want %d; body = %s", rec.Code, status, rec.Body.String())
+	}
+
+	var body struct {
+		Code      string `json:"code"`
+		RequestID string `json:"requestId"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error response: %v; body = %s", err, rec.Body.String())
+	}
+	if body.Code != code {
+		t.Fatalf("code = %q, want %q", body.Code, code)
+	}
+	if body.RequestID != requestID {
+		t.Fatalf("requestId = %q, want %q", body.RequestID, requestID)
+	}
+}

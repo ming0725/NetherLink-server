@@ -4,7 +4,8 @@ This module is the first backend foundation for NetherLink. It contains only the
 
 - Docker Compose service for PostgreSQL.
 - Init SQL mounted into `/docker-entrypoint-initdb.d`.
-- No migration framework is selected yet. Add one when the Go service layer starts using migrations.
+- Go service readiness checks currently ping PostgreSQL through the configured connection pool.
+- No migration framework is selected yet. Add one before schema changes need ordered, repeatable upgrades.
 
 ## Start
 
@@ -14,10 +15,17 @@ docker compose up -d postgres
 docker compose ps
 ```
 
+The API server reads the same `NETHERLINK_POSTGRES_*` variables:
+
+```sh
+go run ./cmd/nlserver
+curl http://localhost:8080/readyz
+```
+
 ## Connect
 
 ```sh
-docker exec -it nlserver-postgres psql -U netherlink -d netherlink
+docker exec -it nlserver-postgres psql -U netherlink_app -d netherlink
 ```
 
 ## Reset local data

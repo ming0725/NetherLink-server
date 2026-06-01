@@ -32,4 +32,5 @@ docker compose up --force-recreate minio-init
 
 - API code should persist only `files.id`, `bucket`, `object_key`, `etag`, `content_hash`, `storage_status`, and visibility metadata internally.
 - Public APIs should return public URLs or short-lived signed URLs, not MinIO endpoint, bucket, object key, or credentials.
+- Current Go code only defines the `ObjectStorageProvider` interface; a MinIO-backed implementation has not been added yet.
 - Lifecycle cleanup for `netherlink-tmp` is intentionally left for the later background worker phase.

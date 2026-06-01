@@ -1,0 +1,114 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"nlserver/internal/config"
+)
+
+type Server struct {
+	cfg     config.Config
+	db      *pgxpool.Pool
+	logger  *slog.Logger
+	handler http.Handler
+}
+
+func New(cfg config.Config, db *pgxpool.Pool, logger *slog.Logger) *Server {
+	server := &Server{
+		cfg:    cfg,
+		db:     db,
+		logger: logger,
+	}
+
+	mux := http.NewServeMux()
+	server.registerRoutes(mux)
+
+	server.handler = withRequestID(server.withAccessLog(server.withRecover(withJSONFallbacks(mux))))
+	return server
+}
+
+func (s *Server) Handler() http.Handler {
+	return s.handler
+}
+
+func (s *Server) ListenAndServe() error {
+	httpServer := &http.Server{
+		Addr:              s.cfg.HTTP.Addr,
+		Handler:           s.handler,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	err := httpServer.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+
+	return err
+}
+
+func (s *Server) registerRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /readyz", s.handleReady)
+
+	s.registerAPIRoutes(mux)
+}
+
+func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/v1", s.handleAPIRoot)
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"service": "nlserver",
+		"env":     s.cfg.Env,
+	})
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "PostgreSQL is not configured")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+
+	if err := s.db.Ping(ctx); err != nil {
+		s.logger.WarnContext(ctx, "postgres readiness check failed", "error", err)
+		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "PostgreSQL is not ready")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":   "ok",
+		"postgres": "ok",
+	})
+}
+
+func (s *Server) handleAPIRoot(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":     "ok",
+		"service":    "nlserver",
+		"apiVersion": "v1",
+	})
+}
+
+func (s *Server) withRecover(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				s.logger.ErrorContext(r.Context(), "http request panic", "panic", recovered)
+				writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error")
+			}
+		}()
+
+		next.ServeHTTP(w, r)
+	})
+}
