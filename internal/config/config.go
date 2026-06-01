@@ -11,6 +11,7 @@ type Config struct {
 	Env      string
 	HTTP     HTTPConfig
 	Postgres PostgresConfig
+	Redis    RedisConfig
 	Storage  StorageConfig
 }
 
@@ -25,6 +26,14 @@ type PostgresConfig struct {
 	User     string
 	Password string
 	SSLMode  string
+}
+
+type RedisConfig struct {
+	Host     string
+	Port     int
+	Username string
+	Password string
+	Database int
 }
 
 type StorageConfig struct {
@@ -58,6 +67,13 @@ func Load() Config {
 			User:     getEnv("NETHERLINK_POSTGRES_USER", "netherlink_app"),
 			Password: getEnv("NETHERLINK_POSTGRES_PASSWORD", "nl_pg_v1_Pq9xJ4mR7tL2cW8s"),
 			SSLMode:  getEnv("NETHERLINK_POSTGRES_SSLMODE", "disable"),
+		},
+		Redis: RedisConfig{
+			Host:     getEnv("NETHERLINK_REDIS_HOST", "localhost"),
+			Port:     getEnvInt("NETHERLINK_REDIS_PORT", 6379),
+			Username: getEnv("NETHERLINK_REDIS_USERNAME", ""),
+			Password: getEnv("NETHERLINK_REDIS_PASSWORD", ""),
+			Database: getEnvInt("NETHERLINK_REDIS_DB", 0),
 		},
 		Storage: StorageConfig{
 			Provider:         getEnv("NETHERLINK_OBJECT_STORAGE_PROVIDER", "minio"),

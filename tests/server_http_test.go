@@ -15,7 +15,7 @@ import (
 
 func newHTTPTestServer() *server.Server {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return server.New(config.Config{Env: "test"}, nil, logger)
+	return server.New(config.Config{Env: "test"}, nil, nil, logger)
 }
 
 func TestHealthz(t *testing.T) {

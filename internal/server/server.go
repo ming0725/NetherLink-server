@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	"nlserver/internal/config"
 )
@@ -15,14 +16,16 @@ import (
 type Server struct {
 	cfg     config.Config
 	db      *pgxpool.Pool
+	redis   *redis.Client
 	logger  *slog.Logger
 	handler http.Handler
 }
 
-func New(cfg config.Config, db *pgxpool.Pool, logger *slog.Logger) *Server {
+func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client, logger *slog.Logger) *Server {
 	server := &Server{
 		cfg:    cfg,
 		db:     db,
+		redis:  redisClient,
 		logger: logger,
 	}
 
@@ -86,9 +89,21 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.redis == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "Redis is not configured")
+		return
+	}
+
+	if err := s.redis.Ping(ctx).Err(); err != nil {
+		s.logger.WarnContext(ctx, "redis readiness check failed", "error", err)
+		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "Redis is not ready")
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":   "ok",
 		"postgres": "ok",
+		"redis":    "ok",
 	})
 }
 

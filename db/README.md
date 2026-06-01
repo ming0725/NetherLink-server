@@ -4,14 +4,15 @@ This module is the first backend foundation for NetherLink. It contains only the
 
 - Docker Compose service for PostgreSQL.
 - Init SQL mounted into `/docker-entrypoint-initdb.d`.
-- Go service readiness checks currently ping PostgreSQL through the configured connection pool.
+- Go repositories for `users`, `user_preferences`, and `user_sessions`.
+- Go service readiness checks currently ping PostgreSQL through the configured connection pool. The top-level `/readyz` endpoint also checks Redis when the full API server is running.
 - No migration framework is selected yet. Add one before schema changes need ordered, repeatable upgrades.
 
 ## Start
 
 ```sh
 cp .env.example .env
-docker compose up -d postgres
+docker compose up -d postgres redis
 docker compose ps
 ```
 

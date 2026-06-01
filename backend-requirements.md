@@ -4,9 +4,11 @@
 
 ## 0. 当前实现状态
 
-当前代码库已完成后端基础骨架：环境配置、PostgreSQL 连接池、数据库 schema 初始化、MinIO bucket 初始化脚本、对象存储接口定义、HTTP 服务、`GET /healthz`、`GET /readyz`、`GET /api/v1`、请求 ID、panic recovery、结构化访问日志、JSON 404/405、JSON 请求体解析辅助函数，以及 Bearer 鉴权 middleware 骨架。
+当前代码库已完成后端基础骨架：环境配置、PostgreSQL 连接池、Redis 客户端基础设施、users / user_preferences / user_sessions repository、数据库 schema 初始化、MinIO bucket 初始化脚本、对象存储接口定义、HTTP 服务、`GET /healthz`、`GET /readyz`、`GET /api/v1`、请求 ID、panic recovery、结构化访问日志、JSON 404/405、JSON 请求体解析辅助函数，以及 Bearer 鉴权 middleware 骨架。
 
-尚未实现业务 API、access token 校验、refresh token 轮换、数据库 repository、MinIO SDK provider、文件处理 worker、WebSocket 和实时事件。
+尚未实现业务 API、access token 校验、refresh token 轮换、Redis 业务用途、MinIO SDK provider、文件处理 worker、WebSocket 和实时事件。
+
+Redis 当前只作为基础设施接入，用于后续登录限流、短时验证码或流程状态、WebSocket 在线状态、事件扇出和 token/session 加速。PostgreSQL 仍然是用户、偏好、会话、消息、通知和文件元数据等持久业务数据的权威来源。
 
 测试约定：测试文件集中放在仓库根目录的 `tests/` 包内，通过 `go test ./...` 运行；不在 `internal/` 生产包目录内放置 `*_test.go`。
 
@@ -15,6 +17,7 @@
 | 项 | 要求 |
 | --- | --- |
 | 数据权威 | 用户资料、好友关系、群资料、群权限、通知、会话状态、消息、偏好配置以后端持久化数据为准。 |
+| Redis 边界 | Redis 只保存可重建、短时或辅助状态；用户、refresh token 会话、消息、通知、文件元数据等持久状态必须以 PostgreSQL 为准。 |
 | 身份模型 | 用户必须同时具备不可变内部 UUID 和可修改公开 ID。内部 UUID 用作数据库主键和业务外键；公开 ID 只用于展示、搜索和用户输入。 |
 | 接口边界 | API 返回业务所需字段，不暴露内部关联字段、对象存储路径、密码散列、refresh token hash 等实现细节。 |
 | 分页同步 | 列表、消息、通知等接口必须支持分页或游标补偿，不要求任何调用方一次性拉取全量历史。 |

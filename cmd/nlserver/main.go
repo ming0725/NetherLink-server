@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 
+	"nlserver/internal/cache"
 	"nlserver/internal/config"
 	"nlserver/internal/database"
 	"nlserver/internal/server"
@@ -21,14 +22,18 @@ func main() {
 	}
 	defer db.Close()
 
+	redisClient := cache.NewRedisClient(cfg.Redis)
+	defer redisClient.Close()
+
 	logger.Info("nlserver starting",
 		"env", cfg.Env,
 		"addr", cfg.HTTP.Addr,
 		"postgres_db", cfg.Postgres.Database,
+		"redis_addr", cache.RedisAddr(cfg.Redis),
 		"minio_endpoint", cfg.Storage.Endpoint,
 	)
 
-	if err := server.New(cfg, db, logger).ListenAndServe(); err != nil {
+	if err := server.New(cfg, db, redisClient, logger).ListenAndServe(); err != nil {
 		logger.Error("nlserver stopped with error", "error", err)
 		os.Exit(1)
 	}

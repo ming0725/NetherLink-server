@@ -19,6 +19,23 @@ services:
       timeout: 3s
       retries: 20
 
+  redis:
+    image: redis:latest
+    container_name: nlserver-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "${NETHERLINK_REDIS_PORT:-6379}:6379"
+    volumes:
+      - nlserver-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   minio:
     image: minio/minio:latest
     container_name: nlserver-minio
@@ -60,4 +77,5 @@ services:
 
 volumes:
   nlserver-postgres-data:
+  nlserver-redis-data:
   nlserver-minio-data:
