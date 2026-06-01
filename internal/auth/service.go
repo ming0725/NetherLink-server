@@ -20,9 +20,20 @@ var (
 	ErrValidation         = errors.New("auth: validation failed")
 	ErrConflict           = errors.New("auth: conflict")
 	ErrInactiveUser       = errors.New("auth: inactive user")
+	ErrForbidden          = errors.New("auth: forbidden")
+	ErrPublicIDCooldown   = errors.New("auth: public id cooldown")
 )
 
 var publicIDPattern = regexp.MustCompile(`^[A-Za-z0-9_]{4,32}$`)
+
+const (
+	publicIDChangeCooldown = 30 * 24 * time.Hour
+	maxDisplayNameLength   = 64
+	maxGenderCustomLength  = 64
+	maxSignatureLength     = 256
+	maxRegionLength        = 64
+	maxOperationIDLength   = 128
+)
 
 type Service struct {
 	cfg   config.AuthConfig
@@ -52,6 +63,22 @@ type RefreshInput struct {
 	DeviceID     string
 }
 
+type UpdateProfileInput struct {
+	UserID       string
+	NickName     *string
+	Gender       *string
+	GenderCustom *string
+	Status       *string
+	Signature    *string
+	Region       *string
+}
+
+type ChangePublicIDInput struct {
+	UserID            string
+	PublicID          string
+	ClientOperationID string
+}
+
 type AuthResult struct {
 	User         repository.User
 	Preferences  repository.UserPreference
@@ -73,10 +100,12 @@ type Principal struct {
 	TokenVersion int
 }
 
+type PublicIDAvailability struct {
+	Available bool
+	Reason    string
+}
+
 func NewService(cfg config.AuthConfig, repos repository.Repositories) *Service {
-	if cfg.TokenSecret == "" {
-		cfg.TokenSecret = "nlserver-local-dev-token-secret-change-me"
-	}
 	if cfg.AccessTokenTTL <= 0 {
 		cfg.AccessTokenTTL = 15 * time.Minute
 	}
@@ -115,9 +144,9 @@ func (s *Service) Register(ctx context.Context, input RegisterInput) (AuthResult
 		return AuthResult{}, ErrValidation
 	}
 
-	gender := strings.TrimSpace(input.Gender)
-	if gender == "" {
-		gender = "unspecified"
+	gender, err := normalizeGender(input.Gender, nil)
+	if err != nil {
+		return AuthResult{}, err
 	}
 
 	passwordHash, err := hashPassword(input.Password)
@@ -148,6 +177,163 @@ func (s *Service) Register(ctx context.Context, input RegisterInput) (AuthResult
 	}
 	result.Preferences = preferences
 	return result, nil
+}
+
+func (s *Service) UpdateProfile(ctx context.Context, input UpdateProfileInput) (repository.User, error) {
+	if strings.TrimSpace(input.UserID) == "" {
+		return repository.User{}, ErrValidation
+	}
+
+	params := repository.UpdateUserProfileParams{
+		UserID: strings.TrimSpace(input.UserID),
+	}
+
+	if input.NickName != nil {
+		nick := strings.TrimSpace(*input.NickName)
+		if nick == "" || len([]rune(nick)) > maxDisplayNameLength {
+			return repository.User{}, ErrValidation
+		}
+		params.Nick = &nick
+	}
+
+	if input.Gender != nil || input.GenderCustom != nil {
+		genderValue := stringValue(input.Gender)
+		if input.Gender == nil && input.GenderCustom != nil {
+			genderValue = "custom"
+		}
+		gender, err := normalizeGender(genderValue, input.GenderCustom)
+		if err != nil {
+			return repository.User{}, err
+		}
+		params.Gender = &gender
+
+		if input.GenderCustom != nil {
+			genderCustom := strings.TrimSpace(*input.GenderCustom)
+			if genderCustom != "" {
+				params.GenderCustom = &genderCustom
+			}
+		}
+	}
+
+	if input.Status != nil {
+		status := strings.TrimSpace(*input.Status)
+		if status != "active" {
+			return repository.User{}, ErrValidation
+		}
+		params.Status = &status
+	}
+
+	if input.Signature != nil {
+		signature := strings.TrimSpace(*input.Signature)
+		if len([]rune(signature)) > maxSignatureLength {
+			return repository.User{}, ErrValidation
+		}
+		params.Signature = &signature
+	}
+
+	if input.Region != nil {
+		region := strings.TrimSpace(*input.Region)
+		if len([]rune(region)) > maxRegionLength {
+			return repository.User{}, ErrValidation
+		}
+		params.Region = &region
+	}
+
+	user, err := s.repos.Users.UpdateProfile(ctx, params)
+	if err != nil {
+		return repository.User{}, mapRepositoryError(err)
+	}
+
+	return user, nil
+}
+
+func (s *Service) CheckPublicID(ctx context.Context, userID string, publicID string) (PublicIDAvailability, error) {
+	normalized := strings.TrimSpace(publicID)
+	if !validPublicID(normalized) {
+		return PublicIDAvailability{Available: false, Reason: "invalid_format"}, nil
+	}
+
+	current, err := s.repos.Users.GetByID(ctx, userID)
+	if err != nil {
+		return PublicIDAvailability{}, mapRepositoryError(err)
+	}
+	if current.PublicID == normalized {
+		return PublicIDAvailability{Available: true, Reason: "current"}, nil
+	}
+
+	exists, err := s.repos.Users.PublicIDExists(ctx, normalized)
+	if err != nil {
+		return PublicIDAvailability{}, err
+	}
+	if exists {
+		return PublicIDAvailability{Available: false, Reason: "taken"}, nil
+	}
+
+	return PublicIDAvailability{Available: true}, nil
+}
+
+func (s *Service) ChangePublicID(ctx context.Context, input ChangePublicIDInput) (repository.User, error) {
+	userID := strings.TrimSpace(input.UserID)
+	publicID := strings.TrimSpace(input.PublicID)
+	clientOperationID := strings.TrimSpace(input.ClientOperationID)
+
+	if userID == "" || !validPublicID(publicID) || !validClientOperationID(clientOperationID) {
+		return repository.User{}, ErrValidation
+	}
+
+	existingOperation, err := s.repos.Users.GetPublicIDChangeByOperation(ctx, userID, clientOperationID)
+	if err == nil {
+		if existingOperation.NewPublicID != publicID {
+			return repository.User{}, ErrConflict
+		}
+		return s.repos.Users.GetByID(ctx, userID)
+	}
+	if !errors.Is(err, repository.ErrNotFound) {
+		return repository.User{}, err
+	}
+
+	current, err := s.repos.Users.GetByID(ctx, userID)
+	if err != nil {
+		return repository.User{}, mapRepositoryError(err)
+	}
+	if current.PublicID == publicID {
+		return current, nil
+	}
+
+	lastChange, err := s.repos.Users.GetLastPublicIDChange(ctx, userID)
+	if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		return repository.User{}, err
+	}
+	if err == nil && s.now().UTC().Sub(lastChange.ChangedAt) < publicIDChangeCooldown {
+		return repository.User{}, ErrPublicIDCooldown
+	}
+
+	user, err := s.repos.Users.UpdatePublicID(ctx, userID, publicID, &clientOperationID)
+	if err != nil {
+		return repository.User{}, mapRepositoryError(err)
+	}
+
+	return user, nil
+}
+
+func (s *Service) ListActiveSessions(ctx context.Context, userID string) ([]repository.UserSession, error) {
+	if strings.TrimSpace(userID) == "" {
+		return nil, ErrValidation
+	}
+
+	return s.repos.Sessions.ListByUserID(ctx, userID, true)
+}
+
+func (s *Service) RevokeSession(ctx context.Context, userID string, sessionID string) error {
+	if strings.TrimSpace(userID) == "" || strings.TrimSpace(sessionID) == "" {
+		return ErrValidation
+	}
+
+	err := s.repos.Sessions.RevokeForUser(ctx, sessionID, userID)
+	if err != nil {
+		return mapRepositoryError(err)
+	}
+	return nil
 }
 
 func (s *Service) Login(ctx context.Context, input LoginInput) (AuthResult, error) {
@@ -369,6 +555,45 @@ func normalizeEmail(value string) (string, error) {
 
 func validPublicID(value string) bool {
 	return publicIDPattern.MatchString(strings.TrimSpace(value))
+}
+
+func validClientOperationID(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	return trimmed != "" && len([]rune(trimmed)) <= maxOperationIDLength
+}
+
+func normalizeGender(value string, custom *string) (string, error) {
+	gender := strings.TrimSpace(value)
+	if gender == "" {
+		gender = "unspecified"
+	}
+
+	switch gender {
+	case "unspecified", "male", "female", "custom":
+	default:
+		return "", ErrValidation
+	}
+
+	if custom != nil {
+		genderCustom := strings.TrimSpace(*custom)
+		if len([]rune(genderCustom)) > maxGenderCustomLength {
+			return "", ErrValidation
+		}
+		if gender == "custom" && genderCustom == "" {
+			return "", ErrValidation
+		}
+	} else if gender == "custom" {
+		return "", ErrValidation
+	}
+
+	return gender, nil
+}
+
+func stringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func deviceIDOrDefault(value string) string {

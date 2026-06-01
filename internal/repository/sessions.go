@@ -161,6 +161,10 @@ func (r *UserSessionRepository) Revoke(ctx context.Context, sessionID string) er
 	return r.revokeWhere(ctx, `id = $1::uuid`, normalizeText(sessionID))
 }
 
+func (r *UserSessionRepository) RevokeForUser(ctx context.Context, sessionID string, userID string) error {
+	return r.revokeWhere(ctx, `id = $1::uuid AND user_id = $2::uuid`, normalizeText(sessionID), normalizeText(userID))
+}
+
 func (r *UserSessionRepository) RevokeByRefreshTokenHash(ctx context.Context, refreshTokenHash string) error {
 	return r.revokeWhere(ctx, `refresh_token_hash = $1`, refreshTokenHash)
 }

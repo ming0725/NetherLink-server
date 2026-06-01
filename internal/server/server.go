@@ -76,7 +76,12 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/auth/login", s.handleAuthLogin)
 	mux.HandleFunc("POST /api/v1/auth/refresh", s.handleAuthRefresh)
 	mux.HandleFunc("POST /api/v1/auth/logout", s.handleAuthLogout)
+	mux.Handle("GET /api/v1/auth/sessions", s.withAuthRequired(http.HandlerFunc(s.handleAuthSessions)))
+	mux.Handle("POST /api/v1/auth/sessions/{sessionId}/revoke", s.withAuthRequired(http.HandlerFunc(s.handleAuthRevokeSession)))
 	mux.Handle("GET /api/v1/me", s.withAuthRequired(http.HandlerFunc(s.handleMe)))
+	mux.Handle("PATCH /api/v1/me", s.withAuthRequired(http.HandlerFunc(s.handlePatchMe)))
+	mux.Handle("GET /api/v1/me/user-id/check", s.withAuthRequired(http.HandlerFunc(s.handleCheckMeUserID)))
+	mux.Handle("PATCH /api/v1/me/user-id", s.withAuthRequired(http.HandlerFunc(s.handlePatchMeUserID)))
 	mux.Handle("GET /api/v1/me/preferences", s.withAuthRequired(http.HandlerFunc(s.handleGetMePreferences)))
 	mux.Handle("PATCH /api/v1/me/preferences", s.withAuthRequired(http.HandlerFunc(s.handlePatchMePreferences)))
 }

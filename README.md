@@ -10,13 +10,13 @@ Current scope is intentionally small:
 - PostgreSQL connection pool setup under `internal/database`.
 - Redis client setup under `internal/cache`.
 - PostgreSQL repositories for users, user preferences, and user sessions under `internal/repository`.
-- P0 auth service under `internal/auth`: password hashing, access token signing/validation, refresh token hashing/rotation, and PostgreSQL-backed session checks.
+- P0 auth service under `internal/auth`: password hashing, access token signing/validation, refresh token hashing/rotation, PostgreSQL-backed session checks, current-user profile updates, public ID checks/changes, and device session management.
 - Object storage interface skeleton under `internal/storage`.
 - PostgreSQL schema bootstrap under `db/`.
 - Redis service bootstrap under `docker-compose.yml`.
 - MinIO object storage bootstrap under `minio/`.
 - Health endpoints, API v1 root, request IDs, panic recovery, structured access logs, JSON 404/405 responses, request body helper functions, readiness checks for PostgreSQL and Redis, and Bearer access-token validation are available.
-- P0 auth HTTP handlers are available: register, login, refresh, logout, `/me`, `GET /me/preferences`, and `PATCH /me/preferences`.
+- P0 auth HTTP handlers are available: register, login, refresh, logout, session listing/revoke, `/me`, profile editing, public ID availability/change, `GET /me/preferences`, and `PATCH /me/preferences`.
 - No MinIO SDK implementation, file processing workers, friend/group/chat/post/AI API handlers, or WebSocket realtime events yet.
 - Redis is used only for auth rate limiting today. It is not used as the source of truth for users, refresh token sessions, messages, notifications, file metadata, or durable business state.
 
@@ -24,6 +24,8 @@ Current scope is intentionally small:
 
 ```sh
 cp .env.example .env
+# Fill NETHERLINK_AUTH_TOKEN_SECRET, NETHERLINK_POSTGRES_PASSWORD,
+# NETHERLINK_OBJECT_STORAGE_ACCESS_KEY, and NETHERLINK_OBJECT_STORAGE_SECRET_KEY.
 docker compose up -d postgres redis minio minio-init
 docker compose ps
 ```
@@ -31,6 +33,9 @@ docker compose ps
 ## Run The API Server
 
 ```sh
+set -a
+. ./.env
+set +a
 go run ./cmd/nlserver
 ```
 
@@ -46,7 +51,7 @@ Unknown routes and unsupported methods return the standard JSON error shape with
 
 Auth configuration:
 
-- `NETHERLINK_AUTH_TOKEN_SECRET`: HMAC signing secret for access tokens.
+- `NETHERLINK_AUTH_TOKEN_SECRET`: HMAC signing secret for access tokens. Required; at least 32 characters.
 - `NETHERLINK_AUTH_ACCESS_TOKEN_TTL`: default `15m`.
 - `NETHERLINK_AUTH_REFRESH_TOKEN_TTL`: default `720h`.
 
@@ -61,7 +66,7 @@ The current API foundation includes:
 - JSON `NOT_FOUND` and `METHOD_NOT_ALLOWED` fallback responses.
 - JSON body decoding helpers with unknown-field rejection and a 1 MiB request body limit.
 - Bearer auth middleware validates access token signature, expiry, active PostgreSQL session, active user status, and `tokenVersion`.
-- Auth endpoints: `POST /api/v1/auth/register`, `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`, `GET /api/v1/me`, `GET /api/v1/me/preferences`, and `PATCH /api/v1/me/preferences`.
+- Auth endpoints: `POST /api/v1/auth/register`, `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/sessions`, `POST /api/v1/auth/sessions/{sessionId}/revoke`, `GET /api/v1/me`, `PATCH /api/v1/me`, `GET /api/v1/me/user-id/check`, `PATCH /api/v1/me/user-id`, `GET /api/v1/me/preferences`, and `PATCH /api/v1/me/preferences`.
 
 PostgreSQL:
 
@@ -81,12 +86,18 @@ MinIO:
 
 - S3 API: http://localhost:9000
 - Console: http://localhost:9001
-- Default local credentials are defined in `.env.example`.
+- Local credentials must be filled in `.env`; `.env.example` is only a committed template.
 
 ## Configuration Naming
 
 Project-level configuration uses the `NETHERLINK_` prefix, for example `NETHERLINK_POSTGRES_PASSWORD` and `NETHERLINK_OBJECT_STORAGE_SECRET_KEY`.
 Docker Compose maps those values to the official container variables required by PostgreSQL and MinIO.
+
+## Configuration And Secrets
+
+`.env.example` is not a production environment file. It is a committed template that documents required variable names. Real passwords, token signing secrets, object-storage credentials, and production endpoints belong in `.env`, deployment environment variables, or a secret manager.
+
+The API server intentionally fails during startup when required secret variables are missing or malformed. Non-secret local defaults are kept only for developer ergonomics, such as `localhost` hosts and default ports.
 
 ## Storage Boundary
 
@@ -116,7 +127,7 @@ Redis keys should be namespaced with `nl:` and should have explicit TTLs unless 
 
 The first PostgreSQL repositories cover:
 
-- `users`: create account records, read by UUID/email/public ID/account, update profile fields, update public ID with history, increment token version, and update last-seen time.
+- `users`: create account records, read by UUID/email/public ID/account, update profile fields, check and update public ID with history, enforce public ID change idempotency, increment token version, and update last-seen time.
 - `user_preferences`: ensure defaults, upsert full preferences, read by user UUID, and patch preference fields.
 - `user_sessions`: create refresh-token sessions, read active sessions, list user sessions, rotate refresh token hash, revoke sessions, and update session last-seen time.
 
@@ -124,7 +135,9 @@ These repositories are persistence primitives only. They do not hash passwords, 
 
 ## Auth Boundary
 
-`internal/auth` owns password hashing, refresh token hashing, access-token signing, refresh token rotation, and access-token validation. PostgreSQL remains authoritative for users and refresh token sessions. Redis keys used by auth are namespaced as `nl:rate:auth:*`, have TTLs, and are only rate-limit counters.
+`internal/auth` owns password hashing, refresh token hashing, access-token signing, refresh token rotation, access-token validation, current-user profile validation, public ID policy, and user session management. PostgreSQL remains authoritative for users and refresh token sessions. Redis keys used by auth are namespaced as `nl:rate:auth:*`, have TTLs, and are only rate-limit counters.
+
+Public IDs must match `[A-Za-z0-9_]{4,32}`. `PATCH /api/v1/me/user-id` requires `clientOperationId`, records successful changes in `user_id_changes`, and enforces a 30-day cooldown after each successful public ID change. Self-service `PATCH /api/v1/me` accepts `status` only as `active`; online presence states belong to the later realtime presence layer, not the account-active status used by token validation.
 
 ## Testing
 
@@ -139,7 +152,7 @@ The former `internal/database/postgres_test.go` was a single DSN unit test, not 
 
 ## Next Build Steps
 
-1. Add user/friend/group read APIs and profile editing on top of the authenticated current-user foundation.
+1. Add user/friend/group read APIs on top of the authenticated current-user foundation.
 2. Add a MinIO-backed implementation of `ObjectStorageProvider`.
 3. Add only the file upload-session API skeleton before implementing full chat, posts, or AI workflows.
 4. Add WebSocket auth and chat message persistence after identity and file metadata paths are stable.

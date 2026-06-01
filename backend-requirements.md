@@ -4,9 +4,9 @@
 
 ## 0. 当前实现状态
 
-当前代码库已完成后端基础骨架：环境配置、PostgreSQL 连接池、Redis 客户端基础设施、users / user_preferences / user_sessions repository、数据库 schema 初始化、MinIO bucket 初始化脚本、对象存储接口定义、HTTP 服务、`GET /healthz`、`GET /readyz`、`GET /api/v1`、请求 ID、panic recovery、结构化访问日志、JSON 404/405、JSON 请求体解析辅助函数，以及 Bearer access token 校验。
+当前代码库已完成后端基础骨架：正式环境配置校验、PostgreSQL 连接池、Redis 客户端基础设施、users / user_preferences / user_sessions repository、数据库 schema 初始化、MinIO bucket 初始化脚本、对象存储接口定义、HTTP 服务、`GET /healthz`、`GET /readyz`、`GET /api/v1`、请求 ID、panic recovery、结构化访问日志、JSON 404/405、JSON 请求体解析辅助函数，以及 Bearer access token 校验。
 
-已实现 P0 Auth：注册、登录、refresh token 轮换、登出、`GET /me`、`GET /me/preferences`、`PATCH /me/preferences`、密码哈希、access token 签名与校验、refresh token hash 存储。尚未实现 MinIO SDK provider、文件处理 worker、好友/群/聊天/帖子/AI API、WebSocket 和实时事件。
+已实现 P0 Auth：注册、登录、refresh token 轮换、登出、`GET /auth/sessions`、`POST /auth/sessions/{sessionId}/revoke`、`GET /me`、`PATCH /me`、`GET /me/user-id/check`、`PATCH /me/user-id`、`GET /me/preferences`、`PATCH /me/preferences`、密码哈希、access token 签名与校验、refresh token hash 存储、公开 ID 格式校验、公开 ID 修改历史和 30 天冷却。尚未实现 MinIO SDK provider、文件处理 worker、好友/群/聊天/帖子/AI API、WebSocket 和实时事件。
 
 Redis 当前仅用于 auth 登录/注册限流，key 命名空间为 `nl:rate:auth:*` 且带 TTL；后续仍只允许用于短时验证码或流程状态、WebSocket 在线状态、事件扇出和 token/session 加速。PostgreSQL 仍然是用户、refresh token 会话、偏好、消息、通知和文件元数据等持久业务数据的权威来源。
 

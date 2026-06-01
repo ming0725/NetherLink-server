@@ -12,6 +12,7 @@ This module is the first backend foundation for NetherLink. It contains only the
 
 ```sh
 cp .env.example .env
+# Fill the required secret values in .env first.
 docker compose up -d postgres redis
 docker compose ps
 ```
@@ -19,6 +20,9 @@ docker compose ps
 The API server reads the same `NETHERLINK_POSTGRES_*` variables:
 
 ```sh
+set -a
+. ./.env
+set +a
 go run ./cmd/nlserver
 curl http://localhost:8080/readyz
 ```

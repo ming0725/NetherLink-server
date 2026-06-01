@@ -12,9 +12,13 @@ import (
 )
 
 func main() {
-	cfg := config.Load()
-
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	cfg, err := config.Load()
+	if err != nil {
+		logger.Error("failed to load configuration", "error", err)
+		os.Exit(1)
+	}
+
 	db, err := database.OpenPostgres(context.Background(), cfg.Postgres)
 	if err != nil {
 		logger.Error("failed to configure postgres connection pool", "error", err)

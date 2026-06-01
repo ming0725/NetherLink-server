@@ -41,6 +41,20 @@ type authLogoutRequest struct {
 	RefreshToken string `json:"refreshToken"`
 }
 
+type patchMeRequest struct {
+	NickName     *string `json:"nickName"`
+	Signature    *string `json:"signature"`
+	Region       *string `json:"region"`
+	Status       *string `json:"status"`
+	Gender       *string `json:"gender"`
+	GenderCustom *string `json:"genderCustom"`
+}
+
+type patchUserIDRequest struct {
+	UserID            string `json:"userId"`
+	ClientOperationID string `json:"clientOperationId"`
+}
+
 type patchPreferencesRequest struct {
 	ThemeColor   *string         `json:"themeColor"`
 	FontMode     *string         `json:"fontMode"`
@@ -88,6 +102,25 @@ type preferencesResponse struct {
 	Settings     json.RawMessage `json:"settings"`
 	Version      int             `json:"version"`
 	UpdatedAt    time.Time       `json:"updatedAt"`
+}
+
+type userIDAvailabilityResponse struct {
+	Available bool   `json:"available"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+type sessionsResponse struct {
+	Sessions []sessionResponse `json:"sessions"`
+}
+
+type sessionResponse struct {
+	SessionID  string     `json:"sessionId"`
+	DeviceID   string     `json:"deviceId"`
+	DeviceName *string    `json:"deviceName"`
+	ExpiresAt  time.Time  `json:"expiresAt"`
+	LastSeenAt *time.Time `json:"lastSeenAt"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	Current    bool       `json:"current"`
 }
 
 func (s *Server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
@@ -226,6 +259,114 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, makeUserResponse(user))
 }
 
+func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	var req patchMeRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+
+	user, err := s.authService.UpdateProfile(r.Context(), authsvc.UpdateProfileInput{
+		UserID:       principal.UserID,
+		NickName:     req.NickName,
+		Gender:       req.Gender,
+		GenderCustom: req.GenderCustom,
+		Status:       req.Status,
+		Signature:    req.Signature,
+		Region:       req.Region,
+	})
+	if err != nil {
+		writeAccountError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, makeUserResponse(user))
+}
+
+func (s *Server) handleCheckMeUserID(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	availability, err := s.authService.CheckPublicID(r.Context(), principal.UserID, r.URL.Query().Get("userId"))
+	if err != nil {
+		writeAccountError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, userIDAvailabilityResponse{
+		Available: availability.Available,
+		Reason:    availability.Reason,
+	})
+}
+
+func (s *Server) handlePatchMeUserID(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	var req patchUserIDRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+
+	user, err := s.authService.ChangePublicID(r.Context(), authsvc.ChangePublicIDInput{
+		UserID:            principal.UserID,
+		PublicID:          req.UserID,
+		ClientOperationID: req.ClientOperationID,
+	})
+	if err != nil {
+		writeAccountError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, makeUserResponse(user))
+}
+
+func (s *Server) handleAuthSessions(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	sessions, err := s.authService.ListActiveSessions(r.Context(), principal.UserID)
+	if err != nil {
+		writeAccountError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, sessionsResponse{
+		Sessions: makeSessionResponses(sessions, principal.SessionID),
+	})
+}
+
+func (s *Server) handleAuthRevokeSession(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	if err := s.authService.RevokeSession(r.Context(), principal.UserID, r.PathValue("sessionId")); err != nil {
+		writeAccountError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (s *Server) handleGetMePreferences(w http.ResponseWriter, r *http.Request) {
 	principal, ok := authPrincipalFromContext(r.Context())
 	if !ok {
@@ -335,6 +476,22 @@ func makePreferencesResponse(preferences repository.UserPreference) preferencesR
 	}
 }
 
+func makeSessionResponses(sessions []repository.UserSession, currentSessionID string) []sessionResponse {
+	responses := make([]sessionResponse, 0, len(sessions))
+	for _, session := range sessions {
+		responses = append(responses, sessionResponse{
+			SessionID:  session.ID,
+			DeviceID:   session.DeviceID,
+			DeviceName: session.DeviceName,
+			ExpiresAt:  session.ExpiresAt,
+			LastSeenAt: session.LastSeenAt,
+			CreatedAt:  session.CreatedAt,
+			Current:    session.ID == currentSessionID,
+		})
+	}
+	return responses
+}
+
 func writeRequestError(w http.ResponseWriter, r *http.Request, err *requestError) {
 	writeError(w, r, err.Status, err.Code, err.Message)
 }
@@ -353,6 +510,25 @@ func writeAuthError(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, r, http.StatusUnauthorized, "REFRESH_TOKEN_INVALID", "Refresh token invalid")
 	case errors.Is(err, authsvc.ErrInactiveUser):
 		writeError(w, r, http.StatusForbidden, "USER_INACTIVE", "User is inactive")
+	default:
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error")
+	}
+}
+
+func writeAccountError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, authsvc.ErrValidation):
+		writeError(w, r, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid account request")
+	case errors.Is(err, authsvc.ErrConflict):
+		writeError(w, r, http.StatusConflict, "CONFLICT", "Account resource conflict")
+	case errors.Is(err, authsvc.ErrPublicIDCooldown):
+		writeError(w, r, http.StatusConflict, "PUBLIC_ID_COOLDOWN", "Public ID can only be changed once per cooldown window")
+	case errors.Is(err, authsvc.ErrForbidden):
+		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Forbidden")
+	case errors.Is(err, authsvc.ErrTokenInvalid):
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+	case errors.Is(err, repository.ErrNotFound):
+		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "Resource not found")
 	default:
 		writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error")
 	}

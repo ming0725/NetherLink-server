@@ -69,13 +69,27 @@ func TestAuthRouteWithoutDatabaseReturnsServiceNotReady(t *testing.T) {
 func TestProtectedRouteWithoutTokenReturnsTokenMissing(t *testing.T) {
 	srv := newHTTPTestServer()
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/me", nil)
-	req.Header.Set("X-Request-Id", "req_me")
-	rec := httptest.NewRecorder()
+	protectedRoutes := []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodGet, path: "/api/v1/auth/sessions"},
+		{method: http.MethodPost, path: "/api/v1/auth/sessions/00000000-0000-0000-0000-000000000000/revoke"},
+		{method: http.MethodGet, path: "/api/v1/me"},
+		{method: http.MethodPatch, path: "/api/v1/me"},
+		{method: http.MethodGet, path: "/api/v1/me/user-id/check?userId=netherlink"},
+		{method: http.MethodPatch, path: "/api/v1/me/user-id"},
+	}
 
-	srv.Handler().ServeHTTP(rec, req)
+	for _, route := range protectedRoutes {
+		req := httptest.NewRequest(route.method, route.path, nil)
+		req.Header.Set("X-Request-Id", "req_me")
+		rec := httptest.NewRecorder()
 
-	assertErrorResponse(t, rec, http.StatusUnauthorized, "TOKEN_MISSING", "req_me")
+		srv.Handler().ServeHTTP(rec, req)
+
+		assertErrorResponse(t, rec, http.StatusUnauthorized, "TOKEN_MISSING", "req_me")
+	}
 }
 
 func TestJSONNotFound(t *testing.T) {

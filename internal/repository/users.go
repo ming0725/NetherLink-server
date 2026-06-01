@@ -27,6 +27,16 @@ const userSelectColumns = `
 	updated_at,
 	deleted_at`
 
+const userIDChangeSelectColumns = `
+	id,
+	user_id,
+	old_public_id,
+	new_public_id,
+	changed_at,
+	client_operation_id,
+	created_at,
+	updated_at`
+
 type UserRepository struct {
 	db DBTX
 }
@@ -49,6 +59,17 @@ type User struct {
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 	DeletedAt    *time.Time
+}
+
+type UserIDChange struct {
+	ID                string
+	UserID            string
+	OldPublicID       string
+	NewPublicID       string
+	ChangedAt         time.Time
+	ClientOperationID *string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 type CreateUserParams struct {
@@ -183,7 +204,13 @@ func (r *UserRepository) UpdateProfile(ctx context.Context, params UpdateUserPro
 
 func (r *UserRepository) UpdatePublicID(ctx context.Context, userID string, publicID string, clientOperationID *string) (User, error) {
 	row := r.db.QueryRow(ctx, `
-		WITH existing AS (
+		WITH existing_change AS (
+			SELECT new_public_id
+			FROM user_id_changes
+			WHERE user_id = $1::uuid
+			  AND client_operation_id = $3
+			  AND $3 IS NOT NULL
+		), existing_user AS (
 			SELECT public_id
 			FROM users
 			WHERE id = $1::uuid
@@ -194,7 +221,16 @@ func (r *UserRepository) UpdatePublicID(ctx context.Context, userID string, publ
 			    version = version + 1
 			WHERE id = $1::uuid
 			  AND deleted_at IS NULL
+			  AND public_id <> $2
+			  AND NOT EXISTS (SELECT 1 FROM existing_change)
 			RETURNING `+userSelectColumns+`
+		), unchanged AS (
+			SELECT `+userSelectColumns+`
+			FROM users
+			WHERE id = $1::uuid
+			  AND deleted_at IS NULL
+			  AND public_id = $2
+			  AND NOT EXISTS (SELECT 1 FROM existing_change)
 		), inserted_history AS (
 			INSERT INTO user_id_changes (
 				user_id,
@@ -202,13 +238,30 @@ func (r *UserRepository) UpdatePublicID(ctx context.Context, userID string, publ
 				new_public_id,
 				client_operation_id
 			)
-			SELECT $1::uuid, existing.public_id, $2, $3
-			FROM existing
+			SELECT $1::uuid, existing_user.public_id, $2, $3
+			FROM existing_user
+			WHERE existing_user.public_id <> $2
+			  AND $3 IS NOT NULL
+			  AND NOT EXISTS (SELECT 1 FROM existing_change)
 			ON CONFLICT (user_id, client_operation_id) DO NOTHING
 			RETURNING id
 		)
 		SELECT `+userSelectColumns+`
-		FROM updated`,
+		FROM updated
+		UNION ALL
+		SELECT `+userSelectColumns+`
+		FROM unchanged
+		UNION ALL
+		SELECT `+userSelectColumns+`
+		FROM users
+		WHERE id = $1::uuid
+		  AND deleted_at IS NULL
+		  AND EXISTS (
+		    SELECT 1
+		    FROM existing_change
+		    WHERE existing_change.new_public_id = $2
+		  )
+		LIMIT 1`,
 		normalizeText(userID),
 		normalizeText(publicID),
 		normalizeTextPtr(clientOperationID),
@@ -216,6 +269,30 @@ func (r *UserRepository) UpdatePublicID(ctx context.Context, userID string, publ
 
 	user, err := scanUser(row)
 	return user, translateWriteError(err)
+}
+
+func (r *UserRepository) GetPublicIDChangeByOperation(ctx context.Context, userID string, clientOperationID string) (UserIDChange, error) {
+	change, err := scanUserIDChange(r.db.QueryRow(ctx, `
+		SELECT `+userIDChangeSelectColumns+`
+		FROM user_id_changes
+		WHERE user_id = $1::uuid
+		  AND client_operation_id = $2`,
+		normalizeText(userID),
+		normalizeText(clientOperationID),
+	))
+	return change, translateReadError(err)
+}
+
+func (r *UserRepository) GetLastPublicIDChange(ctx context.Context, userID string) (UserIDChange, error) {
+	change, err := scanUserIDChange(r.db.QueryRow(ctx, `
+		SELECT `+userIDChangeSelectColumns+`
+		FROM user_id_changes
+		WHERE user_id = $1::uuid
+		ORDER BY changed_at DESC
+		LIMIT 1`,
+		normalizeText(userID),
+	))
+	return change, translateReadError(err)
 }
 
 func (r *UserRepository) IncrementTokenVersion(ctx context.Context, userID string) (User, error) {
@@ -310,6 +387,37 @@ func scanUser(row scanner) (User, error) {
 	}
 
 	return user, nil
+}
+
+func scanUserIDChange(row scanner) (UserIDChange, error) {
+	var (
+		change            UserIDChange
+		id                pgtype.UUID
+		userID            pgtype.UUID
+		clientOperationID sql.NullString
+	)
+
+	err := row.Scan(
+		&id,
+		&userID,
+		&change.OldPublicID,
+		&change.NewPublicID,
+		&change.ChangedAt,
+		&clientOperationID,
+		&change.CreatedAt,
+		&change.UpdatedAt,
+	)
+	if err != nil {
+		return UserIDChange{}, err
+	}
+
+	change.ID = uuidString(id)
+	change.UserID = uuidString(userID)
+	if clientOperationID.Valid {
+		change.ClientOperationID = &clientOperationID.String
+	}
+
+	return change, nil
 }
 
 func containsAtSign(value string) bool {

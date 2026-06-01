@@ -1,12 +1,12 @@
 services:
   postgres:
-    image: postgres:latest
+    image: postgres:17.10-alpine
     container_name: nlserver-postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${NETHERLINK_POSTGRES_DB:-netherlink}
       POSTGRES_USER: ${NETHERLINK_POSTGRES_USER:-netherlink_app}
-      POSTGRES_PASSWORD: ${NETHERLINK_POSTGRES_PASSWORD:-nl_pg_v1_Pq9xJ4mR7tL2cW8s}
+      POSTGRES_PASSWORD: ${NETHERLINK_POSTGRES_PASSWORD:?Set NETHERLINK_POSTGRES_PASSWORD in .env}
       TZ: Asia/Shanghai
     ports:
       - "${NETHERLINK_POSTGRES_PORT:-5432}:5432"
@@ -20,7 +20,7 @@ services:
       retries: 20
 
   redis:
-    image: redis:latest
+    image: redis:8.6.3-alpine
     container_name: nlserver-redis
     restart: unless-stopped
     command: redis-server --appendonly yes
@@ -37,13 +37,13 @@ services:
       retries: 20
 
   minio:
-    image: minio/minio:latest
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z-cpuv1
     container_name: nlserver-minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${NETHERLINK_OBJECT_STORAGE_ACCESS_KEY:-netherlink_storage_admin}
-      MINIO_ROOT_PASSWORD: ${NETHERLINK_OBJECT_STORAGE_SECRET_KEY:-nl_minio_v1_N8sT3mQ6vX9pL2wR}
+      MINIO_ROOT_USER: ${NETHERLINK_OBJECT_STORAGE_ACCESS_KEY:?Set NETHERLINK_OBJECT_STORAGE_ACCESS_KEY in .env}
+      MINIO_ROOT_PASSWORD: ${NETHERLINK_OBJECT_STORAGE_SECRET_KEY:?Set NETHERLINK_OBJECT_STORAGE_SECRET_KEY in .env}
       TZ: Asia/Shanghai
     ports:
       - "${NETHERLINK_MINIO_API_PORT:-9000}:9000"
@@ -57,15 +57,15 @@ services:
       retries: 20
 
   minio-init:
-    image: minio/minio:latest
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z-cpuv1
     container_name: nlserver-minio-init
     restart: "no"
     depends_on:
       minio:
         condition: service_healthy
     environment:
-      MINIO_ROOT_USER: ${NETHERLINK_OBJECT_STORAGE_ACCESS_KEY:-netherlink_storage_admin}
-      MINIO_ROOT_PASSWORD: ${NETHERLINK_OBJECT_STORAGE_SECRET_KEY:-nl_minio_v1_N8sT3mQ6vX9pL2wR}
+      MINIO_ROOT_USER: ${NETHERLINK_OBJECT_STORAGE_ACCESS_KEY:?Set NETHERLINK_OBJECT_STORAGE_ACCESS_KEY in .env}
+      MINIO_ROOT_PASSWORD: ${NETHERLINK_OBJECT_STORAGE_SECRET_KEY:?Set NETHERLINK_OBJECT_STORAGE_SECRET_KEY in .env}
       MINIO_INTERNAL_ENDPOINT: ${NETHERLINK_OBJECT_STORAGE_INTERNAL_ENDPOINT:-http://minio:9000}
       MINIO_PUBLIC_BUCKET: ${NETHERLINK_OBJECT_STORAGE_PUBLIC_BUCKET:-netherlink-public}
       MINIO_PROTECTED_BUCKET: ${NETHERLINK_OBJECT_STORAGE_PROTECTED_BUCKET:-netherlink-protected}

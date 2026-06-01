@@ -20,7 +20,7 @@ docker compose ps
 
 Console: http://localhost:9001
 
-Default local credentials come from `.env.example`.
+Local credentials must be filled in `.env`. `.env.example` only documents the required variable names.
 
 To rerun bucket initialization after changing bucket names:
 
