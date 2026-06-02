@@ -288,6 +288,71 @@ func (r *FileRepository) Get(ctx context.Context, fileID string) (File, error) {
 	return file, translateReadError(err)
 }
 
+func (r *FileRepository) CanUserAccessFile(ctx context.Context, userID string, fileID string) (bool, error) {
+	var allowed bool
+	err := r.db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM files f
+			WHERE f.id = $2::uuid
+			  AND f.deleted_at IS NULL
+			  AND f.owner_user_id = $1::uuid
+		) OR EXISTS (
+			SELECT 1
+			FROM files f
+			WHERE f.id = $2::uuid
+			  AND f.deleted_at IS NULL
+			  AND f.visibility IN ('public', 'authenticated')
+		) OR EXISTS (
+			SELECT 1
+			FROM file_usages fu
+			JOIN files f ON f.id = fu.file_id
+			WHERE fu.file_id = $2::uuid
+			  AND f.deleted_at IS NULL
+			  AND fu.deleted_at IS NULL
+			  AND (
+			    fu.visibility IN ('public', 'authenticated')
+			    OR fu.owner_user_id = $1::uuid
+			  )
+		) OR EXISTS (
+			SELECT 1
+			FROM groups g
+			JOIN group_members gm ON gm.group_id = g.id
+			JOIN files f ON f.id = g.avatar_file_id
+			WHERE g.avatar_file_id = $2::uuid
+			  AND gm.user_id = $1::uuid
+			  AND g.deleted_at IS NULL
+			  AND f.deleted_at IS NULL
+		) OR EXISTS (
+			SELECT 1
+			FROM message_attachments ma
+			JOIN messages m ON m.id = ma.message_id
+			JOIN conversations c ON c.id = m.conversation_id
+			JOIN conversation_participants cp
+			  ON cp.conversation_id = m.conversation_id
+			 AND cp.user_id = $1::uuid
+			JOIN files f ON f.id = ma.file_id
+			WHERE ma.file_id = $2::uuid
+			  AND c.deleted_at IS NULL
+			  AND f.deleted_at IS NULL
+			  AND m.recalled_at IS NULL
+			  AND (cp.hidden_at IS NULL OR m.created_at > cp.hidden_at)
+		) OR EXISTS (
+			SELECT 1
+			FROM post_media pm
+			JOIN posts p ON p.id = pm.post_id
+			JOIN files f ON f.id = $2::uuid
+			WHERE (pm.file_id = $2::uuid OR pm.cover_file_id = $2::uuid)
+			  AND p.deleted_at IS NULL
+			  AND f.deleted_at IS NULL
+			  AND (p.visibility = 'public' OR p.author_id = $1::uuid)
+		)`,
+		normalizeText(userID),
+		normalizeText(fileID),
+	).Scan(&allowed)
+	return allowed, translateReadError(err)
+}
+
 func (r *FileRepository) ListVariants(ctx context.Context, fileID string) ([]FileVariant, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT `+fileVariantSelectColumns+`

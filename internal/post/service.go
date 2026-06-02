@@ -117,7 +117,7 @@ func (s *Service) CreatePost(ctx context.Context, input CreatePostInput) (reposi
 		if err != nil {
 			return mapRepositoryError(err)
 		}
-		if _, err := repos.Posts.ReplacePostMedia(ctx, created.ID, input.AuthorID, makeCreateMediaParams(input.Media)); err != nil {
+		if _, err := repos.Posts.ReplacePostMedia(ctx, created.ID, input.AuthorID, visibility, makeCreateMediaParams(input.Media)); err != nil {
 			return mapRepositoryError(err)
 		}
 		postID = created.ID
@@ -178,7 +178,11 @@ func (s *Service) UpdatePost(ctx context.Context, input UpdatePostInput) (reposi
 			return mapRepositoryError(err)
 		}
 		if input.MediaSet {
-			if _, err := repos.Posts.ReplacePostMedia(ctx, input.PostID, input.AuthorID, makeCreateMediaParams(input.Media)); err != nil {
+			if _, err := repos.Posts.ReplacePostMedia(ctx, input.PostID, input.AuthorID, visibility, makeCreateMediaParams(input.Media)); err != nil {
+				return mapRepositoryError(err)
+			}
+		} else if input.Visibility != nil {
+			if err := repos.Posts.UpdatePostMediaUsageVisibility(ctx, input.PostID, visibility); err != nil {
 				return mapRepositoryError(err)
 			}
 		}

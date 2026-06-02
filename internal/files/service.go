@@ -267,7 +267,11 @@ func (s *Service) GetFile(ctx context.Context, userID string, fileID string) (Fi
 	if err != nil {
 		return FileResult{}, err
 	}
-	if !canReadFile(userID, file) {
+	allowed, err := s.repos.Files.CanUserAccessFile(ctx, userID, file.ID)
+	if err != nil {
+		return FileResult{}, err
+	}
+	if !allowed {
 		return FileResult{}, ErrForbidden
 	}
 	return s.makeFileResult(ctx, file)
@@ -281,7 +285,11 @@ func (s *Service) PresignDownloadURL(ctx context.Context, userID string, fileID 
 	if err != nil {
 		return DownloadURLResult{}, err
 	}
-	if !canReadFile(userID, file) {
+	allowed, err := s.repos.Files.CanUserAccessFile(ctx, userID, file.ID)
+	if err != nil {
+		return DownloadURLResult{}, err
+	}
+	if !allowed {
 		return DownloadURLResult{}, ErrForbidden
 	}
 
@@ -1003,18 +1011,6 @@ func processingJobTypeForFile(file repository.File) string {
 		return fileProcessingJobAudio
 	}
 	return ""
-}
-
-func canReadFile(userID string, file repository.File) bool {
-	if file.OwnerUserID != nil && *file.OwnerUserID == strings.TrimSpace(userID) {
-		return true
-	}
-	switch strings.ToLower(strings.TrimSpace(file.Visibility)) {
-	case "public", "authenticated", "protected":
-		return strings.TrimSpace(userID) != ""
-	default:
-		return false
-	}
 }
 
 func normalizeText(value string) string {

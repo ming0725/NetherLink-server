@@ -390,6 +390,17 @@ func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (repo
 		if err != nil {
 			return err
 		}
+		for _, attachment := range attachments {
+			if _, err := repos.Files.CreateUsage(ctx, repository.CreateFileUsageParams{
+				FileID:      attachment.FileID,
+				UsageType:   "chat_attachment",
+				BusinessID:  message.ID,
+				OwnerUserID: input.UserID,
+				Visibility:  "protected",
+			}); err != nil {
+				return err
+			}
+		}
 
 		if err := repos.Chat.TouchConversationAfterMessage(ctx, input.ConversationID, message.ID, input.UserID); err != nil {
 			return err

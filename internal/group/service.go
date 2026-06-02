@@ -110,6 +110,9 @@ func (s *Service) CreateGroup(ctx context.Context, input CreateGroupInput) (repo
 	if s.repos.Groups == nil || s.tx == nil {
 		return repository.GroupListEntry{}, ErrUnavailable
 	}
+	if normalizedOptional(input.AvatarFileID) != nil && s.repos.Files == nil {
+		return repository.GroupListEntry{}, ErrUnavailable
+	}
 	name := strings.TrimSpace(input.Name)
 	if strings.TrimSpace(input.UserID) == "" || name == "" || len([]rune(name)) > maxGroupNameLength {
 		return repository.GroupListEntry{}, ErrValidation
@@ -121,15 +124,32 @@ func (s *Service) CreateGroup(ctx context.Context, input CreateGroupInput) (repo
 
 	var groupID string
 	err := repository.WithTx(ctx, s.tx, func(repos repository.Repositories) error {
+		avatarFileID := normalizedOptional(input.AvatarFileID)
+		if avatarFileID != nil {
+			if err := validateOwnedGroupAvatarFile(ctx, repos, input.UserID, *avatarFileID); err != nil {
+				return err
+			}
+		}
 		group, err := repos.Groups.Create(ctx, repository.CreateGroupParams{
 			Name:         name,
 			OwnerID:      input.UserID,
-			AvatarFileID: normalizedOptional(input.AvatarFileID),
+			AvatarFileID: avatarFileID,
 		})
 		if err != nil {
 			return mapRepositoryError(err)
 		}
 		groupID = group.ID
+		if avatarFileID != nil {
+			if _, err := repos.Files.CreateUsage(ctx, repository.CreateFileUsageParams{
+				FileID:      *avatarFileID,
+				UsageType:   "group_avatar",
+				BusinessID:  group.ID,
+				OwnerUserID: input.UserID,
+				Visibility:  "protected",
+			}); err != nil {
+				return mapRepositoryError(err)
+			}
+		}
 		if err := repos.Groups.AddMembers(ctx, group.ID, []string{input.UserID}, groupRoleOwner); err != nil {
 			return mapRepositoryError(err)
 		}
@@ -149,7 +169,10 @@ func (s *Service) CreateGroup(ctx context.Context, input CreateGroupInput) (repo
 }
 
 func (s *Service) UpdateGroup(ctx context.Context, input UpdateGroupInput) (repository.GroupListEntry, error) {
-	if s.repos.Groups == nil {
+	if s.repos.Groups == nil || s.tx == nil {
+		return repository.GroupListEntry{}, ErrUnavailable
+	}
+	if input.AvatarFileIDSet && s.repos.Files == nil {
 		return repository.GroupListEntry{}, ErrUnavailable
 	}
 	if strings.TrimSpace(input.UserID) == "" || strings.TrimSpace(input.GroupID) == "" {
@@ -176,18 +199,45 @@ func (s *Service) UpdateGroup(ctx context.Context, input UpdateGroupInput) (repo
 		return repository.GroupListEntry{}, ErrForbidden
 	}
 
-	if _, err := s.repos.Groups.Update(ctx, repository.UpdateGroupParams{
-		GroupID:         input.GroupID,
-		NameSet:         input.Name != nil,
-		Name:            name,
-		IntroductionSet: input.Introduction != nil,
-		Introduction:    introduction,
-		AnnouncementSet: input.Announcement != nil,
-		Announcement:    announcement,
-		AvatarFileIDSet: input.AvatarFileIDSet,
-		AvatarFileID:    normalizedOptional(input.AvatarFileID),
+	if err := repository.WithTx(ctx, s.tx, func(repos repository.Repositories) error {
+		avatarFileID := normalizedOptional(input.AvatarFileID)
+		if input.AvatarFileIDSet && avatarFileID != nil {
+			if err := validateOwnedGroupAvatarFile(ctx, repos, input.UserID, *avatarFileID); err != nil {
+				return err
+			}
+		}
+		if _, err := repos.Groups.Update(ctx, repository.UpdateGroupParams{
+			GroupID:         input.GroupID,
+			NameSet:         input.Name != nil,
+			Name:            name,
+			IntroductionSet: input.Introduction != nil,
+			Introduction:    introduction,
+			AnnouncementSet: input.Announcement != nil,
+			Announcement:    announcement,
+			AvatarFileIDSet: input.AvatarFileIDSet,
+			AvatarFileID:    avatarFileID,
+		}); err != nil {
+			return mapRepositoryError(err)
+		}
+		if input.AvatarFileIDSet {
+			if _, err := repos.Files.SoftDeleteUsages(ctx, "group_avatar", input.GroupID); err != nil {
+				return mapRepositoryError(err)
+			}
+			if avatarFileID != nil {
+				if _, err := repos.Files.CreateUsage(ctx, repository.CreateFileUsageParams{
+					FileID:      *avatarFileID,
+					UsageType:   "group_avatar",
+					BusinessID:  input.GroupID,
+					OwnerUserID: input.UserID,
+					Visibility:  "protected",
+				}); err != nil {
+					return mapRepositoryError(err)
+				}
+			}
+		}
+		return nil
 	}); err != nil {
-		return repository.GroupListEntry{}, mapRepositoryError(err)
+		return repository.GroupListEntry{}, err
 	}
 
 	return s.repos.Groups.GetForUser(ctx, input.UserID, input.GroupID)
@@ -205,6 +255,15 @@ func (s *Service) DeleteOrLeaveGroup(ctx context.Context, userID string, groupID
 		return mapRepositoryError(err)
 	}
 	if member.Role == groupRoleOwner {
+		if s.tx != nil && s.repos.Files != nil {
+			return repository.WithTx(ctx, s.tx, func(repos repository.Repositories) error {
+				if err := repos.Groups.SoftDelete(ctx, groupID); err != nil {
+					return mapRepositoryError(err)
+				}
+				_, err := repos.Files.SoftDeleteUsages(ctx, "group_avatar", groupID)
+				return mapRepositoryError(err)
+			})
+		}
 		return mapRepositoryError(s.repos.Groups.SoftDelete(ctx, groupID))
 	}
 	return mapRepositoryError(s.repos.Groups.RemoveMember(ctx, groupID, userID))
@@ -508,6 +567,25 @@ func (s *Service) RejectJoinRequest(ctx context.Context, userID string, requestI
 
 func canManageGroup(role string) bool {
 	return role == groupRoleOwner || role == groupRoleAdmin
+}
+
+func validateOwnedGroupAvatarFile(ctx context.Context, repos repository.Repositories, userID string, fileID string) error {
+	if repos.Files == nil {
+		return ErrUnavailable
+	}
+	file, err := repos.Files.Get(ctx, fileID)
+	if err != nil {
+		return mapRepositoryError(err)
+	}
+	if file.OwnerUserID == nil || *file.OwnerUserID != userID {
+		return ErrForbidden
+	}
+	switch file.StorageStatus {
+	case "ready", "processing", "uploaded":
+		return nil
+	default:
+		return ErrValidation
+	}
 }
 
 func uniqueUserIDs(userIDs []string) []string {

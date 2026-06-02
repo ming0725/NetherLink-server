@@ -23,6 +23,7 @@ Current scope is intentionally small:
 - File HTTP handlers are available for avatar upload, proxy upload, presigned single and multipart MinIO/S3 upload sessions, file metadata, controlled download URLs, and owner-side deletion of unreferenced files.
 - File upload completion now queues image, video, and audio processing jobs; the runtime starts a background worker that reads uploaded media from MinIO, extracts backend-side image dimensions, generates 512px JPEG image thumbnails, probes video/audio duration with `ffprobe`, extracts 512px video cover JPEGs with `ffmpeg`, retries stale processing jobs, records derived image/video variants in `file_variants`, and moves file status from `processing` to `ready` or `failed`.
 - File cleanup worker is available for expired upload sessions, unbound files, and files whose `file_usages` are all deleted; it deletes original and variant objects from MinIO and soft-deletes cleaned file metadata.
+- File metadata and download URLs now enforce business-aware access checks: chat attachments require visible conversation participation, group avatars require group membership or upload ownership, and post media follows public/author visibility.
 - Chat conversation list/open/detail/settings/read/unread endpoints are available, along with message send, history, sender recall, and current-user hidden-history clearing; image attachments require and return `width` and `height` for frontend preview placeholders.
 - WebSocket realtime foundation is available at `GET /api/v1/ws`: access-token auth, per-user connection management, PostgreSQL-backed global event IDs, durable replay, Redis pub/sub fanout, replay metrics, fanout operational counters, `ping`/`realtime.pong`, chat events, notification read sync, friend/group change events, profile/preference change events, post count/version update events, hidden-history sync, and `chat.message.send`.
 - Realtime event cleanup is available: `realtime_events` are retained for the configured window, old events are deleted in batches, and `/readyz` exposes hub, fanout, and cleanup snapshots.
@@ -129,6 +130,8 @@ The API server intentionally fails during startup when required secret variables
 
 The backend should treat MinIO as an internal S3-compatible provider. Public API responses should expose only stable file IDs, public URLs, or short-lived signed URLs. Bucket names, object keys, internal endpoints, and credentials should stay inside backend configuration and database metadata.
 
+`protected` object storage is not a blanket authenticated-user permission. `GET /api/v1/files/{fileId}` and `GET /api/v1/files/{fileId}/download-url` authorize against PostgreSQL ownership and business references before signing object URLs.
+
 Prepared buckets:
 
 - `netherlink-public`
@@ -157,11 +160,11 @@ The first PostgreSQL repositories cover:
 - `users`: create account records, read by UUID/email/public ID/account, update profile fields, check and update public ID with history, enforce public ID change idempotency, increment token version, and update last-seen time.
 - `user_preferences`: ensure defaults, upsert full preferences, read by user UUID, and patch preference fields.
 - `user_sessions`: create refresh-token sessions, read active sessions, list user sessions, rotate refresh token hash, revoke sessions, and update session last-seen time.
-- `files`: create file metadata, upload sessions, multipart part tracking, upload completion, status transitions, object-storage metadata bookkeeping, file processing job claims/results, and file variant records.
-- `chat`: list/open/read/update conversations, persist participant sync state, persist messages, assign per-conversation `message_seq`, persist message attachments, recall sender messages, hide current-user history with `hidden_at`, return attachment file metadata, and preserve image `width` and `height`.
+- `files`: create file metadata, upload sessions, multipart part tracking, upload completion, status transitions, object-storage metadata bookkeeping, file processing job claims/results, file variant records, file usage records, and business-aware access checks for signing downloads.
+- `chat`: list/open/read/update conversations, persist participant sync state, persist messages, assign per-conversation `message_seq`, persist message attachments and `chat_attachment` file usages, recall sender messages, hide current-user history with `hidden_at`, return attachment file metadata, and preserve image `width` and `height`.
 - `friends`: create and list current-user friend groups, list active friends with keyword/group filters, read current-user friendship relation metadata, update/delete friendship settings, create/list/accept/reject friend requests, and upsert bidirectional friendships when accepting requests.
-- `groups`: list current-user groups with keyword/category filters, read group details only for members, page group members only when the viewer belongs to the group, create/update/soft-delete groups, add/remove/update members, transfer ownership, upsert current-user group settings, create/list/accept/reject join requests, and record group events.
-- `posts`: list feed entries with viewer state, read post details, create/update/soft-delete posts, replace post media, record `file_usages` for post media and cover files, set post likes, set follows, list/create/delete comments and replies, and maintain persisted like/comment/reply counts.
+- `groups`: list current-user groups with keyword/category filters, read group details only for members, page group members only when the viewer belongs to the group, create/update/soft-delete groups, maintain group-avatar `file_usages`, add/remove/update members, transfer ownership, upsert current-user group settings, create/list/accept/reject join requests, and record group events.
+- `posts`: list feed entries with viewer state, read post details, create/update/soft-delete posts, replace post media, record `file_usages` for post media and cover files with visibility matching the post, set post likes, set follows, list/create/delete comments and replies, and maintain persisted like/comment/reply counts.
 - `realtime_events`: persist globally sequenced WebSocket business events, record per-user recipients, list durable replay events after a client cursor, and report the latest sequence.
 - `operation_receipts`: record and replay idempotent operation results by `user_id + client_operation_id + operation_type`.
 
@@ -234,5 +237,5 @@ The former `internal/database/postgres_test.go` was a single DSN unit test, not 
 
 ## Next Build Steps
 
-1. Tighten file access control for chat attachments, group avatars, and post media based on business ownership and visibility.
-2. Add full ETag / `If-None-Match` handling and version-conflict checks across profile, group, file, and post resources.
+1. Add full ETag / `If-None-Match` handling and version-conflict checks across profile, group, file, and post resources.
+2. Add automated coverage around business-aware file access for chat attachments, group avatars, and post media.

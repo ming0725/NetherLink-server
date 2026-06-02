@@ -297,11 +297,33 @@ func (r *PostRepository) UpdatePost(ctx context.Context, params UpdatePostParams
 	return post, translateWriteError(err)
 }
 
-func (r *PostRepository) ReplacePostMedia(ctx context.Context, postID string, ownerUserID string, media []CreatePostMediaParams) ([]PostMedia, error) {
+func (r *PostRepository) UpdatePostMediaUsageVisibility(ctx context.Context, postID string, visibility string) error {
+	usageVisibility := normalizeText(visibility)
+	if usageVisibility == "" {
+		usageVisibility = "private"
+	}
+	_, err := r.db.Exec(ctx, `
+		UPDATE file_usages
+		SET visibility = $2,
+		    updated_at = now()
+		WHERE usage_type IN ('post_media', 'post_media_cover')
+		  AND business_id = $1::uuid
+		  AND deleted_at IS NULL`,
+		normalizeText(postID),
+		usageVisibility,
+	)
+	return translateWriteError(err)
+}
+
+func (r *PostRepository) ReplacePostMedia(ctx context.Context, postID string, ownerUserID string, visibility string, media []CreatePostMediaParams) ([]PostMedia, error) {
+	usageVisibility := normalizeText(visibility)
+	if usageVisibility == "" {
+		usageVisibility = "private"
+	}
 	if _, err := r.db.Exec(ctx, `
 		UPDATE file_usages
 		SET deleted_at = now(), updated_at = now()
-		WHERE usage_type = 'post_media'
+		WHERE usage_type IN ('post_media', 'post_media_cover')
 		  AND business_id = $1::uuid
 		  AND deleted_at IS NULL`,
 		normalizeText(postID),
@@ -353,20 +375,22 @@ func (r *PostRepository) ReplacePostMedia(ctx context.Context, postID string, ow
 
 		if _, err := r.db.Exec(ctx, `
 			INSERT INTO file_usages (file_id, usage_type, business_id, owner_user_id, visibility)
-			VALUES ($1::uuid, 'post_media', $2::uuid, $3::uuid, 'public')`,
+			VALUES ($1::uuid, 'post_media', $2::uuid, $3::uuid, $4)`,
 			normalizeText(item.FileID),
 			normalizeText(postID),
 			normalizeText(ownerUserID),
+			usageVisibility,
 		); err != nil {
 			return nil, translateWriteError(err)
 		}
 		if item.CoverFileID != nil && normalizeText(*item.CoverFileID) != "" {
 			if _, err := r.db.Exec(ctx, `
 				INSERT INTO file_usages (file_id, usage_type, business_id, owner_user_id, visibility)
-				VALUES ($1::uuid, 'post_media_cover', $2::uuid, $3::uuid, 'public')`,
+				VALUES ($1::uuid, 'post_media_cover', $2::uuid, $3::uuid, $4)`,
 				normalizeText(*item.CoverFileID),
 				normalizeText(postID),
 				normalizeText(ownerUserID),
+				usageVisibility,
 			); err != nil {
 				return nil, translateWriteError(err)
 			}
