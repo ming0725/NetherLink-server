@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	aisvc "nlserver/internal/ai"
 	authsvc "nlserver/internal/auth"
 	"nlserver/internal/cache"
 	chatsvc "nlserver/internal/chat"
@@ -29,6 +30,7 @@ type Runtime struct {
 	Redis               *redis.Client
 	Repos               repository.Repositories
 	AuthService         *authsvc.Service
+	AIService           *aisvc.Service
 	ChatService         *chatsvc.Service
 	FileService         *filesvc.Service
 	FileWorker          *filesvc.ProcessingWorker
@@ -75,6 +77,14 @@ func NewRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*R
 		RealtimeHub:   realtime.NewHub(),
 		Logger:        logger,
 		cancel:        cancel,
+	}
+	if aiClient, err := aisvc.NewChatClient(cfg.AI); err == nil {
+		runtime.AIService = aisvc.NewService(cfg.AI, repos, db, aiClient)
+	} else if !errors.Is(err, aisvc.ErrProviderUnavailable) {
+		runtime.Close()
+		return nil, err
+	} else {
+		runtime.AIService = aisvc.NewService(cfg.AI, repos, db, nil)
 	}
 	runtime.RealtimeFanout = realtime.NewRedisFanout(redisClient, runtime.RealtimeHub)
 	runtime.RealtimeFanout.Start(runtimeCtx, logger)

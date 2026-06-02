@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	aisvc "nlserver/internal/ai"
 	authsvc "nlserver/internal/auth"
 	chatsvc "nlserver/internal/chat"
 	"nlserver/internal/config"
@@ -28,6 +29,7 @@ type Server struct {
 	redis           *redis.Client
 	repos           repository.Repositories
 	authService     *authsvc.Service
+	aiService       *aisvc.Service
 	chatService     *chatsvc.Service
 	fileService     *filesvc.Service
 	friendService   *friendsvc.Service
@@ -47,6 +49,7 @@ type Dependencies struct {
 	Redis           *redis.Client
 	Repos           repository.Repositories
 	AuthService     *authsvc.Service
+	AIService       *aisvc.Service
 	ChatService     *chatsvc.Service
 	FileService     *filesvc.Service
 	FriendService   *friendsvc.Service
@@ -84,6 +87,13 @@ func NewWithDependencies(deps Dependencies) *Server {
 	if deps.AuthService == nil && deps.Repos.Users != nil && deps.Repos.Sessions != nil {
 		deps.AuthService = authsvc.NewService(deps.Config.Auth, deps.Repos)
 	}
+	if deps.AIService == nil && deps.Repos.AI != nil {
+		if aiClient, err := aisvc.NewChatClient(deps.Config.AI); err == nil {
+			deps.AIService = aisvc.NewService(deps.Config.AI, deps.Repos, deps.DB, aiClient)
+		} else {
+			deps.AIService = aisvc.NewService(deps.Config.AI, deps.Repos, deps.DB, nil)
+		}
+	}
 	if deps.ChatService == nil && deps.Repos.Chat != nil {
 		deps.ChatService = chatsvc.NewService(deps.Repos, deps.DB)
 	}
@@ -113,6 +123,7 @@ func NewWithDependencies(deps Dependencies) *Server {
 		redis:           deps.Redis,
 		repos:           deps.Repos,
 		authService:     deps.AuthService,
+		aiService:       deps.AIService,
 		chatService:     deps.ChatService,
 		fileService:     deps.FileService,
 		friendService:   deps.FriendService,
@@ -141,6 +152,7 @@ func repositoriesConfigured(repos repository.Repositories) bool {
 		repos.Friends != nil ||
 		repos.Groups != nil ||
 		repos.Posts != nil ||
+		repos.AI != nil ||
 		repos.Notifications != nil ||
 		repos.RealtimeEvents != nil ||
 		repos.OperationReceipts != nil
@@ -247,6 +259,17 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/v1/conversations/{conversationId}/messages", s.withAuthRequired(http.HandlerFunc(s.handleSendMessage)))
 	mux.Handle("POST /api/v1/conversations/{conversationId}/messages/{messageId}/recall", s.withAuthRequired(http.HandlerFunc(s.handleRecallMessage)))
 	mux.Handle("DELETE /api/v1/conversations/{conversationId}/messages", s.withAuthRequired(http.HandlerFunc(s.handleHideConversationHistory)))
+	mux.Handle("GET /api/v1/ai/conversations", s.withAuthRequired(http.HandlerFunc(s.handleAIListConversations)))
+	mux.Handle("POST /api/v1/ai/conversations", s.withAuthRequired(http.HandlerFunc(s.handleAICreateConversation)))
+	mux.Handle("GET /api/v1/ai/conversations/{conversationId}/messages", s.withAuthRequired(http.HandlerFunc(s.handleAIListMessages)))
+	mux.Handle("POST /api/v1/ai/conversations/{conversationId}/messages", s.withAuthRequired(http.HandlerFunc(s.handleAISendMessage)))
+	mux.Handle("POST /api/v1/ai/conversations/{conversationId}/files", s.withAuthRequired(http.HandlerFunc(s.handleAIBindFile)))
+	mux.Handle("GET /api/v1/ai/conversations/{conversationId}/files", s.withAuthRequired(http.HandlerFunc(s.handleAIListFiles)))
+	mux.Handle("GET /api/v1/ai/files/{aiFileId}", s.withAuthRequired(http.HandlerFunc(s.handleAIGetFile)))
+	mux.Handle("DELETE /api/v1/ai/files/{aiFileId}", s.withAuthRequired(http.HandlerFunc(s.handleAIDeleteFile)))
+	mux.Handle("GET /api/v1/ai/conversations/{conversationId}/context", s.withAuthRequired(http.HandlerFunc(s.handleAIContext)))
+	mux.Handle("POST /api/v1/ai/messages/{messageId}/feedback", s.withAuthRequired(http.HandlerFunc(s.handleAIMessageFeedback)))
+	mux.Handle("POST /api/v1/ai/title", s.withAuthRequired(http.HandlerFunc(s.handleAITitle)))
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

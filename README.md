@@ -31,7 +31,7 @@ Current scope is intentionally small:
 - Post HTTP handlers are available for feed/detail/create/edit/delete, media binding, likes, follows, comments, replies, comment/reply likes, and comment/reply deletion.
 - Notification HTTP handlers are available for listing notifications, marking all notifications read, and marking one notification read.
 - Operation receipt HTTP handler is available for idempotent client-operation result lookup and creation.
-- AI provider/model runtime configuration is available under `NETHERLINK_AI_*`; AI API handlers are still intentionally paused until provider integration and streaming runtime code are implemented.
+- AI repositories, service, OpenAI-compatible provider client, and AI HTTP handlers are available for conversations, messages, uploaded-file binding, context metadata, feedback, and title generation. Message generation is currently non-streaming; SSE/WS streaming and AI file parsing workers remain next steps.
 - Redis is used for auth rate limiting and realtime fanout today. It is not used as the source of truth for users, refresh token sessions, messages, notifications, realtime events, file metadata, or durable business state.
 
 ## Start Local Dependencies
@@ -82,8 +82,24 @@ AI configuration:
 - `NETHERLINK_AI_BASE_URL`: optional provider base URL, mainly for OpenAI-compatible providers.
 - `NETHERLINK_AI_DEFAULT_MODEL`: required when the AI provider is enabled.
 - `NETHERLINK_AI_TITLE_MODEL`: optional separate title-generation model.
+- `NETHERLINK_AI_THINKING_TYPE`: optional OpenAI-compatible reasoning extension; supported values are `enabled` and `disabled`.
+- `NETHERLINK_AI_REASONING_EFFORT`: optional OpenAI-compatible reasoning extension; supported values are `low`, `medium`, and `high`.
 - `NETHERLINK_AI_MAX_CONTEXT_TOKENS`: default `0`, meaning no configured backend cap yet.
 - `NETHERLINK_AI_REQUEST_TIMEOUT`: default `1m`.
+
+DeepSeek v4 flash local example:
+
+```sh
+NETHERLINK_AI_PROVIDER=openai-compatible
+NETHERLINK_AI_BASE_URL=https://api.deepseek.com
+NETHERLINK_AI_DEFAULT_MODEL=deepseek-v4-flash
+NETHERLINK_AI_TITLE_MODEL=deepseek-v4-flash
+NETHERLINK_AI_THINKING_TYPE=enabled
+NETHERLINK_AI_REASONING_EFFORT=high
+NETHERLINK_AI_API_KEY=...
+```
+
+Keep the real API key in `.env`, shell environment variables, or a secret manager. `.env` is ignored by Git and must not be committed.
 
 ## API Foundation
 
@@ -106,6 +122,7 @@ The current API foundation includes:
 - Chat endpoints: `GET /api/v1/conversations`, `POST /api/v1/conversations/direct`, `POST /api/v1/conversations/group`, `GET /api/v1/conversations/{conversationId}`, `PATCH /api/v1/conversations/{conversationId}/settings`, `POST /api/v1/conversations/{conversationId}/read`, `POST /api/v1/conversations/{conversationId}/unread`, `POST /api/v1/conversations/{conversationId}/messages`, `GET /api/v1/conversations/{conversationId}/messages`, `POST /api/v1/conversations/{conversationId}/messages/{messageId}/recall`, and `DELETE /api/v1/conversations/{conversationId}/messages`. Image messages must include attachment `width` and `height`; message responses include those fields on each attachment.
 - Post endpoints: `GET /api/v1/posts`, `POST /api/v1/posts`, `GET /api/v1/posts/{postId}`, `PATCH /api/v1/posts/{postId}`, `DELETE /api/v1/posts/{postId}`, `POST /api/v1/posts/{postId}/like`, `POST /api/v1/users/{authorUuid}/follow`, `GET /api/v1/posts/{postId}/comments`, `POST /api/v1/posts/{postId}/comments`, `POST /api/v1/comments/{commentId}/like`, `POST /api/v1/comments/{commentId}/replies`, `POST /api/v1/replies/{replyId}/like`, `DELETE /api/v1/comments/{commentId}`, and `DELETE /api/v1/replies/{replyId}`.
 - Notification and operation endpoints: `GET /api/v1/notifications`, `POST /api/v1/notifications/read-all`, `POST /api/v1/notifications/{notificationId}/read`, and `POST /api/v1/operations/receipt`.
+- AI endpoints: `GET /api/v1/ai/conversations`, `POST /api/v1/ai/conversations`, `GET /api/v1/ai/conversations/{conversationId}/messages`, `POST /api/v1/ai/conversations/{conversationId}/messages`, `POST /api/v1/ai/conversations/{conversationId}/files`, `GET /api/v1/ai/conversations/{conversationId}/files`, `GET /api/v1/ai/files/{aiFileId}`, `DELETE /api/v1/ai/files/{aiFileId}`, `GET /api/v1/ai/conversations/{conversationId}/context`, `POST /api/v1/ai/messages/{messageId}/feedback`, and `POST /api/v1/ai/title`. Message generation uses the configured provider synchronously for now; file binding creates `ai_parse` jobs, but parsing workers are not implemented yet.
 
 PostgreSQL:
 
@@ -172,11 +189,12 @@ The first PostgreSQL repositories cover:
 - `users`: create account records, read by UUID/email/public ID/account, update profile fields, check and update public ID with history, enforce public ID change idempotency, increment token version, and update last-seen time.
 - `user_preferences`: ensure defaults, upsert full preferences, read by user UUID, and patch preference fields.
 - `user_sessions`: create refresh-token sessions, read active sessions, list user sessions, rotate refresh token hash, revoke sessions, and update session last-seen time.
-- `files`: create file metadata, upload sessions, multipart part tracking, upload completion, status transitions, object-storage metadata bookkeeping, file processing job claims/results, file variant records, file usage records, and business-aware access checks for signing downloads.
+- `files`: create file metadata, upload sessions, multipart part tracking, upload completion, status transitions, object-storage metadata bookkeeping, file processing job claims/results, file variant records, file usage records, and business-aware access checks for signing downloads, including AI uploaded files and extracted-text files.
 - `chat`: list/open/read/update conversations, persist participant sync state, persist messages, assign per-conversation `message_seq`, persist message attachments and `chat_attachment` file usages, recall sender messages, hide current-user history with `hidden_at`, return attachment file metadata, and preserve image `width` and `height`.
 - `friends`: create and list current-user friend groups, list active friends with keyword/group filters, read current-user friendship relation metadata, update/delete friendship settings, create/list/accept/reject friend requests, and upsert bidirectional friendships when accepting requests.
 - `groups`: list current-user groups with keyword/category filters, read group details only for members, page group members only when the viewer belongs to the group, create/update/soft-delete groups, maintain group-avatar `file_usages`, add/remove/update members, transfer ownership, upsert current-user group settings, create/list/accept/reject join requests, and record group events.
 - `posts`: list feed entries with viewer state, read post details, create/update/soft-delete posts, replace post media, record `file_usages` for post media and cover files with visibility matching the post, set post likes, set follows, list/create/delete comments and replies, and maintain persisted like/comment/reply counts.
+- `ai`: list/create AI conversations, store user/assistant messages, bind uploaded files to AI conversations, track parse status and retention metadata, list/delete AI file bindings, expose context token counters, and store AI message feedback.
 - `realtime_events`: persist globally sequenced WebSocket business events, record per-user recipients, list durable replay events after a client cursor, and report the latest sequence.
 - `operation_receipts`: record and replay idempotent operation results by `user_id + client_operation_id + operation_type`.
 
@@ -189,7 +207,7 @@ Repository infrastructure:
 
 ## Runtime Boundary
 
-`internal/app` owns runtime dependency assembly and lifecycle for PostgreSQL, Redis, repository aggregates, auth service, friend service, group service, post service, file service, file processing worker, file cleanup worker, realtime hub, Redis fanout, realtime cleanup worker, and object storage provider injection. `cmd/nlserver` should stay thin: load configuration, create the runtime, pass dependencies into `server.NewWithDependencies`, and start HTTP serving.
+`internal/app` owns runtime dependency assembly and lifecycle for PostgreSQL, Redis, repository aggregates, auth service, AI service/provider client, friend service, group service, post service, file service, file processing worker, file cleanup worker, realtime hub, Redis fanout, realtime cleanup worker, and object storage provider injection. `cmd/nlserver` should stay thin: load configuration, create the runtime, pass dependencies into `server.NewWithDependencies`, and start HTTP serving.
 
 The MinIO/S3 provider implements object PUT/GET/HEAD/DELETE, presigned GET/PUT URLs, multipart upload creation, part presigning, completion, and abort. File metadata remains in PostgreSQL; public API responses do not expose bucket names or object keys.
 
@@ -198,6 +216,14 @@ The MinIO/S3 provider implements object PUT/GET/HEAD/DELETE, presigned GET/PUT U
 `internal/files` now includes the upload-session service, a background processing worker, and a background cleanup worker. Completing an uploaded image, video, or audio file creates a `file_processing_jobs` row and moves the file to `processing`. The processing worker claims pending jobs with `FOR UPDATE SKIP LOCKED`, resets jobs stuck in `processing` for more than 15 minutes, reads the original object through the storage provider, records the job result JSON, and marks the file `ready`. Processing failures are recorded on the job and mark the file `failed`.
 
 The processing worker supports image metadata and `thumbnail_512` JPEG variants, video metadata plus `video_cover_512` JPEG variants through `ffprobe` / `ffmpeg`, and audio duration probing through `ffprobe`. The cleanup worker claims expired upload sessions and unused files with `FOR UPDATE SKIP LOCKED`, aborts stale multipart uploads, deletes original and variant objects, and marks cleaned file metadata as `deleted`.
+
+AI file binding creates `file_usages(usage_type=ai_upload)` and a pending `file_processing_jobs(job_type=ai_parse)` row. The current processing worker does not yet claim `ai_parse`; the next worker should parse supported document/text formats, write chunks or extracted text metadata, and mark `ai_uploaded_files.parse_status` as `ready` or `failed`.
+
+## AI Boundary
+
+`internal/ai` owns AI conversation service logic and the OpenAI-compatible `/chat/completions` provider client. The service stores user messages before model calls, stores assistant messages after successful provider responses, rejects unparsed AI files with `AI_FILE_NOT_READY`, and maps failed parses to `AI_FILE_PARSE_FAILED`. Provider credentials are read only from `NETHERLINK_AI_API_KEY`; code and docs must not contain real API keys.
+
+Current generation is synchronous and non-streaming. `POST /api/v1/ai/conversations/{conversationId}/messages` returns the stored user message, created assistant message ID, an empty `streamId`, and used files. Streaming chunks, cancellation, WebSocket `ai.message.send`, and retrieval-augmented context selection remain future work.
 
 ## Chat Boundary
 
@@ -257,5 +283,5 @@ The former `internal/database/postgres_test.go` was a single DSN unit test, not 
 
 ## Next Build Steps
 
-1. Add AI repositories/services and paused HTTP handler wiring for AI conversations, messages, uploaded files, context metadata, and feedback.
-2. Add provider integration and streaming response runtime for the configured AI provider.
+1. Add AI file parsing worker support for `ai_parse` jobs, parsed chunk storage, extracted text retention policy handling, and parse-status transitions.
+2. Add SSE/WS streaming runtime, `ai.message.send`, `ai.stream.cancel`, and provider response cancellation.

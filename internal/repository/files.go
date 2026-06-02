@@ -346,6 +346,16 @@ func (r *FileRepository) CanUserAccessFile(ctx context.Context, userID string, f
 			  AND p.deleted_at IS NULL
 			  AND f.deleted_at IS NULL
 			  AND (p.visibility = 'public' OR p.author_id = $1::uuid)
+		) OR EXISTS (
+			SELECT 1
+			FROM ai_uploaded_files auf
+			JOIN ai_conversations ac ON ac.id = auf.conversation_id
+			JOIN files f ON f.id = $2::uuid
+			WHERE (auf.file_id = $2::uuid OR auf.extracted_text_file_id = $2::uuid)
+			  AND ac.user_id = $1::uuid
+			  AND ac.deleted_at IS NULL
+			  AND auf.deleted_at IS NULL
+			  AND f.deleted_at IS NULL
 		)`,
 		normalizeText(userID),
 		normalizeText(fileID),

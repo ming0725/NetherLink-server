@@ -40,6 +40,7 @@ func main() {
 		Redis:           runtime.Redis,
 		Repos:           runtime.Repos,
 		AuthService:     runtime.AuthService,
+		AIService:       runtime.AIService,
 		ChatService:     runtime.ChatService,
 		FileService:     runtime.FileService,
 		FriendService:   runtime.FriendService,

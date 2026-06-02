@@ -112,6 +112,17 @@ func TestProtectedRouteWithoutTokenReturnsTokenMissing(t *testing.T) {
 		{method: http.MethodPost, path: "/api/v1/conversations/00000000-0000-0000-0000-000000000000/messages"},
 		{method: http.MethodPost, path: "/api/v1/conversations/00000000-0000-0000-0000-000000000000/messages/00000000-0000-0000-0000-000000000000/recall"},
 		{method: http.MethodDelete, path: "/api/v1/conversations/00000000-0000-0000-0000-000000000000/messages"},
+		{method: http.MethodGet, path: "/api/v1/ai/conversations"},
+		{method: http.MethodPost, path: "/api/v1/ai/conversations"},
+		{method: http.MethodGet, path: "/api/v1/ai/conversations/00000000-0000-0000-0000-000000000000/messages"},
+		{method: http.MethodPost, path: "/api/v1/ai/conversations/00000000-0000-0000-0000-000000000000/messages"},
+		{method: http.MethodPost, path: "/api/v1/ai/conversations/00000000-0000-0000-0000-000000000000/files"},
+		{method: http.MethodGet, path: "/api/v1/ai/conversations/00000000-0000-0000-0000-000000000000/files"},
+		{method: http.MethodGet, path: "/api/v1/ai/files/00000000-0000-0000-0000-000000000000"},
+		{method: http.MethodDelete, path: "/api/v1/ai/files/00000000-0000-0000-0000-000000000000"},
+		{method: http.MethodGet, path: "/api/v1/ai/conversations/00000000-0000-0000-0000-000000000000/context"},
+		{method: http.MethodPost, path: "/api/v1/ai/messages/00000000-0000-0000-0000-000000000000/feedback"},
+		{method: http.MethodPost, path: "/api/v1/ai/title"},
 	}
 
 	for _, route := range protectedRoutes {

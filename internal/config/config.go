@@ -76,6 +76,8 @@ type AIConfig struct {
 	BaseURL          string
 	DefaultModel     string
 	TitleModel       string
+	ThinkingType     string
+	ReasoningEffort  string
 	MaxContextTokens int
 	RequestTimeout   time.Duration
 }
@@ -135,6 +137,8 @@ func Load() (Config, error) {
 			BaseURL:          getEnv("NETHERLINK_AI_BASE_URL", ""),
 			DefaultModel:     getEnv("NETHERLINK_AI_DEFAULT_MODEL", ""),
 			TitleModel:       getEnv("NETHERLINK_AI_TITLE_MODEL", ""),
+			ThinkingType:     getEnv("NETHERLINK_AI_THINKING_TYPE", ""),
+			ReasoningEffort:  getEnv("NETHERLINK_AI_REASONING_EFFORT", ""),
 			MaxContextTokens: getEnvNonNegativeInt(&validationErrors, "NETHERLINK_AI_MAX_CONTEXT_TOKENS", 0),
 			RequestTimeout:   getEnvDuration(&validationErrors, "NETHERLINK_AI_REQUEST_TIMEOUT", time.Minute),
 		},
@@ -265,6 +269,12 @@ func validate(cfg Config, validationErrors *[]string) {
 		}
 		if cfg.AI.DefaultModel == "" {
 			*validationErrors = append(*validationErrors, "NETHERLINK_AI_DEFAULT_MODEL is required when NETHERLINK_AI_PROVIDER is enabled")
+		}
+		if cfg.AI.ThinkingType != "" && cfg.AI.ThinkingType != "enabled" && cfg.AI.ThinkingType != "disabled" {
+			*validationErrors = append(*validationErrors, "NETHERLINK_AI_THINKING_TYPE must be enabled or disabled")
+		}
+		if cfg.AI.ReasoningEffort != "" && cfg.AI.ReasoningEffort != "low" && cfg.AI.ReasoningEffort != "medium" && cfg.AI.ReasoningEffort != "high" {
+			*validationErrors = append(*validationErrors, "NETHERLINK_AI_REASONING_EFFORT must be low, medium, or high")
 		}
 	default:
 		*validationErrors = append(*validationErrors, "NETHERLINK_AI_PROVIDER must be disabled, openai, or openai-compatible")
