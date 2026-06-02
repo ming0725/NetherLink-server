@@ -75,6 +75,7 @@ func TestProtectedRouteWithoutTokenReturnsTokenMissing(t *testing.T) {
 	}{
 		{method: http.MethodGet, path: "/api/v1/auth/sessions"},
 		{method: http.MethodPost, path: "/api/v1/auth/sessions/00000000-0000-0000-0000-000000000000/revoke"},
+		{method: http.MethodGet, path: "/api/v1/ws"},
 		{method: http.MethodGet, path: "/api/v1/me"},
 		{method: http.MethodPatch, path: "/api/v1/me"},
 		{method: http.MethodGet, path: "/api/v1/me/user-id/check?userId=netherlink"},

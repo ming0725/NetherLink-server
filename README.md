@@ -22,7 +22,8 @@ Current scope is intentionally small:
 - User/friend/group HTTP handlers are available: user search/detail/batch, friend list/group list, friend group creation, friend settings update/delete, friend request create/list/accept/reject, and group list/detail/member list.
 - File upload-session HTTP handlers are available for presigned single and multipart MinIO/S3 uploads.
 - Chat conversation list/open/detail/settings/read/unread endpoints are available, along with message send, history, sender recall, and current-user hidden-history clearing; image attachments require and return `width` and `height` for frontend preview placeholders.
-- No file processing workers, group write handlers, post/AI API handlers, or WebSocket realtime events yet.
+- WebSocket realtime foundation is available at `GET /api/v1/ws`: access-token auth, per-user connection management, global event IDs, short in-memory event replay, `ping`/`realtime.pong`, `chat.message.created`, `chat.message.recalled`, `chat.conversation.sync.updated`, and hidden-history sync.
+- No file processing workers, group write handlers, post/AI API handlers, WebSocket message-write commands, persisted event log, or Redis cross-instance realtime fanout yet.
 - Redis is used only for auth rate limiting today. It is not used as the source of truth for users, refresh token sessions, messages, notifications, file metadata, or durable business state.
 
 ## Start Local Dependencies
@@ -71,6 +72,7 @@ The current API foundation includes:
 - JSON `NOT_FOUND` and `METHOD_NOT_ALLOWED` fallback responses.
 - JSON body decoding helpers with unknown-field rejection and a 1 MiB request body limit.
 - Bearer auth middleware validates access token signature, expiry, active PostgreSQL session, active user status, and `tokenVersion`.
+- WebSocket endpoint: `GET /api/v1/ws` accepts `Authorization: Bearer <access_token>`, `?accessToken=`, or `?token=`; optional `lastEventSeq` / `lastEventId=evt_N` enables short in-memory replay.
 - Auth endpoints: `POST /api/v1/auth/register`, `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/sessions`, `POST /api/v1/auth/sessions/{sessionId}/revoke`, `GET /api/v1/me`, `PATCH /api/v1/me`, `GET /api/v1/me/user-id/check`, `PATCH /api/v1/me/user-id`, `GET /api/v1/me/preferences`, and `PATCH /api/v1/me/preferences`.
 - Directory endpoints: `GET /api/v1/users`, `GET /api/v1/users/{userUuid}`, `GET /api/v1/users/by-id/{userId}`, `POST /api/v1/users/batch`, `GET /api/v1/friends`, `PATCH /api/v1/friends/{friendUserUuid}`, `DELETE /api/v1/friends/{friendUserUuid}`, `GET /api/v1/friend-groups`, `POST /api/v1/friend-groups`, `POST /api/v1/friend-requests`, `GET /api/v1/friend-requests`, `POST /api/v1/friend-requests/{requestId}/accept`, `POST /api/v1/friend-requests/{requestId}/reject`, `GET /api/v1/groups`, `GET /api/v1/groups/{groupId}`, and `GET /api/v1/groups/{groupId}/members`.
 - File endpoints: `POST /api/v1/files/upload-session`, `GET /api/v1/files/upload-session/{uploadSessionId}`, `POST /api/v1/files/upload-session/{uploadSessionId}/parts`, `POST /api/v1/files/upload-session/{uploadSessionId}/complete`, and `POST /api/v1/files/upload-session/{uploadSessionId}/abort`.
@@ -161,7 +163,21 @@ The MinIO/S3 provider implements object PUT/HEAD/DELETE, presigned GET/PUT URLs,
 
 Chat conversation support includes listing visible conversations, opening or creating direct conversations, opening group conversations for existing group members, reading conversation metadata, updating pin/DND/hidden settings, marking conversations read or unread, sender-side message recall, and current-user hidden-history clearing. Sending a message validates that the sender is a participant, assigns the next `messageSeq` in a transaction, stores attachments in `message_attachments`, updates the conversation last-message fields, increments unread counts for other participants, and brings hidden conversations back into the visible list.
 
-Image message attachments must include positive `width` and `height`. The same fields are returned in send and history responses so clients can allocate preview placeholders before the signed image URL finishes loading. Recalled message responses keep message metadata and `recalledAt` but omit content and attachment details. WebSocket broadcasting is not implemented yet; the REST `message` response shape is intended to be reused for future `chat.message.created` payloads.
+Image message attachments must include positive `width` and `height`. The same fields are returned in send and history responses so clients can allocate preview placeholders before the signed image URL finishes loading. Recalled message responses keep message metadata and `recalledAt` but omit content and attachment details. WebSocket broadcasts reuse the REST `message` response shape for `chat.message.created` and `chat.message.recalled` payloads.
+
+## Realtime Boundary
+
+`internal/realtime` is currently an in-process WebSocket hub. It tracks online connections by user/session/device, assigns globally increasing `evt_N` IDs to replayable business events, stores a short per-user replay window, and sends `sync.required` when the in-memory window cannot prove a complete replay. Connection-control events such as `realtime.ready` and `realtime.pong` use `eventSeq: 0` and are not replayed. It is suitable for a single API process and local development.
+
+Current pushed events:
+
+- `realtime.ready` after successful WebSocket auth.
+- `realtime.pong` when the client sends `{"type":"ping"}`.
+- `chat.message.created` after REST message send succeeds.
+- `chat.message.recalled` after REST sender recall succeeds.
+- `chat.conversation.sync.updated` after read/unread/settings/hidden-history changes and after new messages update participant unread state.
+
+PostgreSQL remains the source of truth. The realtime hub is not a durable event log yet; multi-process deployments still need Redis fanout or a persisted event table before relying on replay across instances or restarts.
 
 ## Auth Boundary
 
@@ -182,6 +198,6 @@ The former `internal/database/postgres_test.go` was a single DSN unit test, not 
 
 ## Next Build Steps
 
-1. Add WebSocket auth, event IDs, online connection management, conversation sync events, recall events, hidden-history sync, and `chat.message.created` broadcast using the existing REST message payload.
+1. Add durable realtime event storage and Redis/pubsub fanout, then add WebSocket message-write commands that reuse the existing chat service validation and idempotency.
 2. Add file processing workers for image thumbnails, backend-side dimension extraction, video covers, audio duration, and cleanup.
 3. Add group write APIs, post APIs, and AI workflows after the chat/file metadata paths settle.

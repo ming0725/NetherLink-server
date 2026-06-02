@@ -345,6 +345,55 @@ func (r *ChatRepository) ListGroupMemberUserIDs(ctx context.Context, groupID str
 	return userIDs, translateReadError(rows.Err())
 }
 
+func (r *ChatRepository) ListConversationParticipantUserIDs(ctx context.Context, conversationID string) ([]string, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT cp.user_id
+		FROM conversation_participants cp
+		JOIN conversations c
+		  ON c.id = cp.conversation_id
+		 AND c.deleted_at IS NULL
+		WHERE cp.conversation_id = $1::uuid
+		ORDER BY cp.created_at ASC`,
+		normalizeText(conversationID),
+	)
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	defer rows.Close()
+
+	userIDs := make([]string, 0)
+	for rows.Next() {
+		var userID pgtype.UUID
+		if err := rows.Scan(&userID); err != nil {
+			return nil, translateReadError(err)
+		}
+		userIDs = append(userIDs, uuidString(userID))
+	}
+	return userIDs, translateReadError(rows.Err())
+}
+
+func (r *ChatRepository) ListConversationParticipants(ctx context.Context, conversationID string) ([]ConversationParticipant, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT `+participantSelectColumns+`
+		FROM conversation_participants cp
+		JOIN conversations c
+		  ON c.id = cp.conversation_id
+		 AND c.deleted_at IS NULL
+		WHERE cp.conversation_id = $1::uuid
+		ORDER BY cp.created_at ASC`,
+		normalizeText(conversationID),
+	)
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	defer rows.Close()
+
+	participants, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (ConversationParticipant, error) {
+		return scanConversationParticipant(row)
+	})
+	return participants, translateReadError(err)
+}
+
 func (r *ChatRepository) UpdateConversationSettings(ctx context.Context, params UpdateConversationSettingsParams) (ConversationParticipant, error) {
 	participant, err := scanConversationParticipant(r.db.QueryRow(ctx, `
 		UPDATE conversation_participants cp

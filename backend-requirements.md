@@ -6,7 +6,7 @@
 
 当前代码库已完成后端基础骨架：正式环境配置校验、PostgreSQL 连接池、Redis 客户端基础设施、users / user_preferences / user_sessions / files / chat / friends / groups / operation_receipts repository、repository 聚合构造、事务辅助函数、应用 runtime 依赖组装、数据库 schema 初始化、MinIO bucket 初始化脚本、对象存储接口定义、MinIO/S3 provider、HTTP 服务、可注入 server dependencies、`GET /healthz`、`GET /readyz`、`GET /api/v1`、请求 ID、panic recovery、结构化访问日志、JSON 404/405、JSON 请求体解析辅助函数，以及 Bearer access token 校验。
 
-已实现 P0 Auth：注册、登录、refresh token 轮换、登出、`GET /auth/sessions`、`POST /auth/sessions/{sessionId}/revoke`、`GET /me`、`PATCH /me`、`GET /me/user-id/check`、`PATCH /me/user-id`、`GET /me/preferences`、`PATCH /me/preferences`、密码哈希、access token 签名与校验、refresh token hash 存储、公开 ID 格式校验、公开 ID 修改历史和 30 天冷却。已实现用户/好友/群 API：`GET /users`、`GET /users/{userUuid}`、`GET /users/by-id/{userId}`、`POST /users/batch`、`GET /friends`、`PATCH /friends/{friendUserUuid}`、`DELETE /friends/{friendUserUuid}`、`GET /friend-groups`、`POST /friend-groups`、`POST /friend-requests`、`GET /friend-requests`、`POST /friend-requests/{requestId}/accept`、`POST /friend-requests/{requestId}/reject`、`GET /groups`、`GET /groups/{groupId}`、`GET /groups/{groupId}/members`。已实现文件上传会话 API：创建上传会话、查询上传状态、分片 URL 签发、完成上传、取消上传。已实现 Chat 的 `GET /conversations`、`POST /conversations/direct`、`POST /conversations/group`、`GET /conversations/{conversationId}`、`PATCH /conversations/{conversationId}/settings`、`POST /conversations/{conversationId}/read`、`POST /conversations/{conversationId}/unread`、`POST /conversations/{conversationId}/messages`、`GET /conversations/{conversationId}/messages`、`POST /conversations/{conversationId}/messages/{messageId}/recall` 和 `DELETE /conversations/{conversationId}/messages`，图片附件要求并返回 `width` / `height`，供前端预览占位。尚未实现文件处理 worker、群写接口、帖子/AI API、WebSocket 和实时事件。
+已实现 P0 Auth：注册、登录、refresh token 轮换、登出、`GET /auth/sessions`、`POST /auth/sessions/{sessionId}/revoke`、`GET /me`、`PATCH /me`、`GET /me/user-id/check`、`PATCH /me/user-id`、`GET /me/preferences`、`PATCH /me/preferences`、密码哈希、access token 签名与校验、refresh token hash 存储、公开 ID 格式校验、公开 ID 修改历史和 30 天冷却。已实现用户/好友/群 API：`GET /users`、`GET /users/{userUuid}`、`GET /users/by-id/{userId}`、`POST /users/batch`、`GET /friends`、`PATCH /friends/{friendUserUuid}`、`DELETE /friends/{friendUserUuid}`、`GET /friend-groups`、`POST /friend-groups`、`POST /friend-requests`、`GET /friend-requests`、`POST /friend-requests/{requestId}/accept`、`POST /friend-requests/{requestId}/reject`、`GET /groups`、`GET /groups/{groupId}`、`GET /groups/{groupId}/members`。已实现文件上传会话 API：创建上传会话、查询上传状态、分片 URL 签发、完成上传、取消上传。已实现 Chat 的 `GET /conversations`、`POST /conversations/direct`、`POST /conversations/group`、`GET /conversations/{conversationId}`、`PATCH /conversations/{conversationId}/settings`、`POST /conversations/{conversationId}/read`、`POST /conversations/{conversationId}/unread`、`POST /conversations/{conversationId}/messages`、`GET /conversations/{conversationId}/messages`、`POST /conversations/{conversationId}/messages/{messageId}/recall` 和 `DELETE /conversations/{conversationId}/messages`，图片附件要求并返回 `width` / `height`，供前端预览占位。已实现进程内 WebSocket 基础层：`GET /api/v1/ws` 建连鉴权、全局递增事件 ID、用户连接管理、短窗口内存事件回放、`ping`/`realtime.pong`、`chat.message.created`、`chat.message.recalled`、`chat.conversation.sync.updated` 和隐藏历史同步。尚未实现文件处理 worker、群写接口、帖子/AI API、WebSocket 收消息写入、事件持久化和 Redis 跨实例事件扇出。
 
 Redis 当前仅用于 auth 登录/注册限流，key 命名空间为 `nl:rate:auth:*` 且带 TTL；后续仍只允许用于短时验证码或流程状态、WebSocket 在线状态、事件扇出和 token/session 加速。PostgreSQL 仍然是用户、refresh token 会话、偏好、消息、通知和文件元数据等持久业务数据的权威来源。
 
@@ -431,7 +431,7 @@ AI 文件默认保留策略建议：
 | Refresh Token | 高熵随机字符串，服务端只存 hash，建议 30 天有效；每次刷新后轮换，旧 refresh token 立即失效。 |
 | 服务端验证 | 已实现校验签名、`exp`、`sid` 是否存在且未撤销、用户是否禁用、`tokenVersion` 是否匹配。 |
 | 权限校验 | 资料修改只允许本人；好友关系按 `friendships.user_id`；群管理操作按 `group_members.role`；消息发送必须是会话参与者。 |
-| WebSocket 鉴权 | 建连时使用 `Authorization: Bearer <access_token>` 或 `?token=`；服务端验证后绑定 `userUuid/sessionId/deviceId`。 |
+| WebSocket 鉴权 | 建连时使用 `Authorization: Bearer <access_token>`、`?accessToken=` 或 `?token=`；服务端验证后绑定 `userUuid/sessionId/deviceId`。 |
 | 续期流程 | REST 返回 401 且错误码 `TOKEN_EXPIRED`；调用 `/auth/refresh` 成功后获得新 token，失败则必须重新登录。 |
 | 撤销策略 | 修改密码、退出登录、踢设备时撤销对应 `user_sessions`；必要时递增 `users.token_version` 让旧 token 全失效。 |
 | 防重放 | 写接口使用 `Idempotency-Key` / `clientOperationId`；消息发送额外使用 `clientMessageId` 去重。 |
@@ -462,17 +462,17 @@ AI 文件默认保留策略建议：
 
 | 项 | 要求 |
 | --- | --- |
-| URL | `wss://<host>/ws` |
+| URL | `wss://<host>/api/v1/ws` |
 | 鉴权 | 握手携带 access token；失败返回 401 并关闭。 |
 | 心跳 | 连接方每 25 秒 `ping`，服务端 10 秒内 `pong`；连续 2 次失败应断开重连。 |
-| 恢复 | 连接方保存 `lastEventId`，重连后发送 `resume`；服务端补发最近事件，超出保留窗口则返回 `sync.required`。 |
-| 顺序 | 每个用户连接收到的事件带全局递增 `eventId` 和服务端 `createdAt`；同一 conversation 内消息按服务端分配的 `messageSeq` 排序。 |
+| 恢复 | 连接方保存 `lastEventId` 或 `lastEventSeq`，重连时通过查询参数或后续 `resume` 发送；服务端补发最近事件，超出保留窗口则返回 `sync.required`。 |
+| 顺序 | 每个用户连接收到的可回放业务事件带全局递增 `eventId` 和服务端 `createdAt`；连接控制事件可使用 `eventSeq=0` 且不进入回放窗口；同一 conversation 内消息按服务端分配的 `messageSeq` 排序。 |
 
 ### 6.2 服务端接收事件
 
 | event | payload | 返回/广播 | 说明 |
 | --- | --- | --- | --- |
-| `ping` | `timestamp` | `pong` | 心跳。 |
+| `ping` | `timestamp` | `realtime.pong` | 心跳。 |
 | `resume` | `lastEventId` | `event.replay` 或 `sync.required` | 断线恢复。 |
 | `chat.message.send` | `conversationId`, `clientMessageId`, `clientSentAt?`, `type`, `content`, `attachments`, `referencedMessageId` | `chat.message.ack`，并向参与者广播 `chat.message.created` | 实时发送消息；ack 返回服务端消息 ID、`messageSeq` 和服务端时间。 |
 | `chat.message.recall` | `conversationId`, `messageId` | `chat.message.recalled` | 撤回。 |
@@ -485,9 +485,10 @@ AI 文件默认保留策略建议：
 
 | event | payload | 语义 |
 | --- | --- | --- |
-| `chat.message.created` | `conversation`, `message`, `sender`, `eventId`, `messageSeq`, `serverReceivedAt` | 新消息已创建；同时更新会话摘要和未读状态。 |
-| `chat.message.recalled` | `conversationId`, `messageId`, `replacementMessage` | 消息已撤回。 |
-| `chat.conversation.updated` | `conversationId`, `summary`, `syncState` | 会话摘要、置顶、免打扰、最后消息或未读状态变化。 |
+| `chat.message.created` | `message` | 新消息已创建；当前实现复用 REST `message` 响应结构。 |
+| `chat.message.recalled` | `message` | 消息已撤回；当前实现复用 REST 撤回后的 `message` 响应结构。 |
+| `chat.conversation.sync.updated` | `conversationId`, `userUuid`, `reason`, `syncState` | 会话置顶、免打扰、已读、未读、隐藏历史或新消息导致的用户维度同步状态变化。 |
+| `chat.conversation.updated` | `conversationId`, `summary`, `syncState` | 会话摘要、最后消息或会话元数据变化；待持久事件层实现。 |
 | `chat.read.updated` | `conversationId`, `userUuid`, `lastReadMessageId`, `unreadCount` | 已读状态变化。 |
 | `friend.request.created` | `request`, `notification` | 好友申请新增。 |
 | `friend.request.updated` | `request`, `friendship?` | 好友申请状态变化。 |
@@ -501,7 +502,7 @@ AI 文件默认保留策略建议：
 | `presence.updated` | `userUuid`, `status`, `lastSeenAt` | 在线状态变化。 |
 | `profile.updated` | `userUuid`, `userId`, `profile`, `avatarUrl`, `avatarVersion`, `avatarEtag`, `avatarContentHash` | 用户资料、公开 ID 或头像变化。 |
 | `preference.updated` | `preferences`, `version` | 用户偏好变化。 |
-| `sync.required` | `scope`, `reason` | 事件无法完整补发，需要通过 REST 重新拉取对应范围。 |
+| `sync.required` | `scope?`, `reason`, `lastEventSeq?` | 事件无法完整补发，需要通过 REST 重新拉取对应范围。 |
 
 ## 7. 响应模型字段建议
 
@@ -663,7 +664,7 @@ AI 文件响应必须暴露解析状态和上下文成本：
 | --- | --- | --- |
 | P0 | Auth 注册/登录/刷新、`/me`、`/me/preferences`、token 验证 | 已实现；所有登录态业务依赖账号、鉴权和当前用户资料。 |
 | P0 | 用户/好友/群详情 GET、头像文件元数据 | 基础社交关系和资料展示依赖这些接口。 |
-| P0 | WebSocket 鉴权、消息发送/接收、历史消息分页 | 聊天是实时核心功能，必须先保证消息可靠性和补偿拉取。 |
+| P0 | WebSocket 鉴权、消息 REST 写入后广播、历史消息分页 | 已实现基础实时广播；聊天是实时核心功能，必须继续保证消息可靠性和补偿拉取。 |
 | P1 | 好友申请、群申请、通知未读 | 社交关系变更和通知需要后端统一裁决。 |
 | P1 | 群成员和权限操作 | 敏感操作必须由服务端校验权限。 |
 | P1 | MinIO/S3 文件上传、预签名 URL、文件版本、缩略图/转码任务 | 头像、帖子媒体、聊天附件和 AI 上传文件都依赖统一文件服务。 |

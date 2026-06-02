@@ -180,6 +180,17 @@ type messageAttachmentResponse struct {
 	Height       *int    `json:"height,omitempty"`
 }
 
+type realtimeMessagePayload struct {
+	Message messageResponse `json:"message"`
+}
+
+type realtimeConversationSyncPayload struct {
+	ConversationID string                        `json:"conversationId"`
+	UserUUID       string                        `json:"userUuid"`
+	Reason         string                        `json:"reason"`
+	SyncState      conversationSyncStateResponse `json:"syncState"`
+}
+
 func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request) {
 	principal, ok := authPrincipalFromContext(r.Context())
 	if !ok {
@@ -353,7 +364,9 @@ func (s *Server) handleUpdateConversationSettings(w http.ResponseWriter, r *http
 		writeChatError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, conversationSettingsResponse{SyncState: makeConversationSyncStateResponse(participant)})
+	response := conversationSettingsResponse{SyncState: makeConversationSyncStateResponse(participant)}
+	s.publishConversationSyncState(r, participant, "settings.updated")
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleMarkConversationRead(w http.ResponseWriter, r *http.Request) {
@@ -393,7 +406,9 @@ func (s *Server) handleMarkConversationRead(w http.ResponseWriter, r *http.Reque
 		writeChatError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, conversationSettingsResponse{SyncState: makeConversationSyncStateResponse(participant)})
+	response := conversationSettingsResponse{SyncState: makeConversationSyncStateResponse(participant)}
+	s.publishConversationSyncState(r, participant, "read")
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleMarkConversationUnread(w http.ResponseWriter, r *http.Request) {
@@ -437,7 +452,9 @@ func (s *Server) handleMarkConversationUnread(w http.ResponseWriter, r *http.Req
 		writeChatError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, conversationSettingsResponse{SyncState: makeConversationSyncStateResponse(participant)})
+	response := conversationSettingsResponse{SyncState: makeConversationSyncStateResponse(participant)}
+	s.publishConversationSyncState(r, participant, "unread")
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleRecallMessage(w http.ResponseWriter, r *http.Request) {
@@ -476,6 +493,7 @@ func (s *Server) handleRecallMessage(w http.ResponseWriter, r *http.Request) {
 		writeChatError(w, r, err)
 		return
 	}
+	s.publishConversationMessage(r, conversationID, "chat.message.recalled", response)
 	writeJSON(w, http.StatusOK, messageDetailResponse{Message: response})
 }
 
@@ -496,13 +514,15 @@ func (s *Server) handleHideConversationHistory(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if _, err := s.chatService.HideConversationHistory(r.Context(), chatsvc.HideConversationHistoryInput{
+	participant, err := s.chatService.HideConversationHistory(r.Context(), chatsvc.HideConversationHistoryInput{
 		UserID:         principal.UserID,
 		ConversationID: conversationID,
-	}); err != nil {
+	})
+	if err != nil {
 		writeChatError(w, r, err)
 		return
 	}
+	s.publishConversationSyncState(r, participant, "history.hidden")
 	writeJSON(w, http.StatusOK, okResponse{OK: true})
 }
 
@@ -558,6 +578,8 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		writeChatError(w, r, err)
 		return
 	}
+	s.publishConversationMessage(r, conversationID, "chat.message.created", response)
+	s.publishAllConversationSyncStates(r, conversationID, "message.created")
 	writeJSON(w, http.StatusCreated, messageDetailResponse{Message: response})
 }
 
@@ -835,6 +857,41 @@ func makeMessageSyncCursor(messages []repository.Message) *messageSyncCursor {
 	return &messageSyncCursor{
 		FirstMessageSeq: &first,
 		LastMessageSeq:  &last,
+	}
+}
+
+func (s *Server) publishConversationMessage(r *http.Request, conversationID string, eventType string, message messageResponse) {
+	if s.realtimeHub == nil || s.repos.Chat == nil {
+		return
+	}
+	userIDs, err := s.repos.Chat.ListConversationParticipantUserIDs(r.Context(), conversationID)
+	if err != nil {
+		s.logger.WarnContext(r.Context(), "failed to list realtime message recipients", "error", err, "conversation_id", conversationID)
+		return
+	}
+	publishRealtimeEvent(s.realtimeHub, userIDs, eventType, realtimeMessagePayload{Message: message})
+}
+
+func (s *Server) publishConversationSyncState(r *http.Request, participant repository.ConversationParticipant, reason string) {
+	publishRealtimeEvent(s.realtimeHub, []string{participant.UserID}, "chat.conversation.sync.updated", realtimeConversationSyncPayload{
+		ConversationID: participant.ConversationID,
+		UserUUID:       participant.UserID,
+		Reason:         reason,
+		SyncState:      makeConversationSyncStateResponse(participant),
+	})
+}
+
+func (s *Server) publishAllConversationSyncStates(r *http.Request, conversationID string, reason string) {
+	if s.realtimeHub == nil || s.repos.Chat == nil {
+		return
+	}
+	participants, err := s.repos.Chat.ListConversationParticipants(r.Context(), conversationID)
+	if err != nil {
+		s.logger.WarnContext(r.Context(), "failed to list realtime sync recipients", "error", err, "conversation_id", conversationID)
+		return
+	}
+	for _, participant := range participants {
+		s.publishConversationSyncState(r, participant, reason)
 	}
 }
 

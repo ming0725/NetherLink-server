@@ -15,6 +15,7 @@ import (
 	"nlserver/internal/config"
 	filesvc "nlserver/internal/files"
 	friendsvc "nlserver/internal/friend"
+	"nlserver/internal/realtime"
 	"nlserver/internal/repository"
 	"nlserver/internal/storage"
 )
@@ -28,6 +29,7 @@ type Server struct {
 	chatService   *chatsvc.Service
 	fileService   *filesvc.Service
 	friendService *friendsvc.Service
+	realtimeHub   *realtime.Hub
 	storage       storage.ObjectStorageProvider
 	logger        *slog.Logger
 	handler       http.Handler
@@ -42,6 +44,7 @@ type Dependencies struct {
 	ChatService   *chatsvc.Service
 	FileService   *filesvc.Service
 	FriendService *friendsvc.Service
+	RealtimeHub   *realtime.Hub
 	Storage       storage.ObjectStorageProvider
 	Logger        *slog.Logger
 }
@@ -80,6 +83,9 @@ func NewWithDependencies(deps Dependencies) *Server {
 	if deps.FileService == nil && deps.Repos.Files != nil {
 		deps.FileService = filesvc.NewService(deps.Config.Storage, deps.Repos, deps.DB, deps.Storage)
 	}
+	if deps.RealtimeHub == nil {
+		deps.RealtimeHub = realtime.NewHub()
+	}
 
 	server := &Server{
 		cfg:           deps.Config,
@@ -90,6 +96,7 @@ func NewWithDependencies(deps Dependencies) *Server {
 		chatService:   deps.ChatService,
 		fileService:   deps.FileService,
 		friendService: deps.FriendService,
+		realtimeHub:   deps.RealtimeHub,
 		storage:       deps.Storage,
 		logger:        deps.Logger,
 	}
@@ -146,6 +153,7 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/auth/logout", s.handleAuthLogout)
 	mux.Handle("GET /api/v1/auth/sessions", s.withAuthRequired(http.HandlerFunc(s.handleAuthSessions)))
 	mux.Handle("POST /api/v1/auth/sessions/{sessionId}/revoke", s.withAuthRequired(http.HandlerFunc(s.handleAuthRevokeSession)))
+	mux.HandleFunc("GET /api/v1/ws", s.handleWebSocket)
 	mux.Handle("GET /api/v1/me", s.withAuthRequired(http.HandlerFunc(s.handleMe)))
 	mux.Handle("PATCH /api/v1/me", s.withAuthRequired(http.HandlerFunc(s.handlePatchMe)))
 	mux.Handle("GET /api/v1/me/user-id/check", s.withAuthRequired(http.HandlerFunc(s.handleCheckMeUserID)))

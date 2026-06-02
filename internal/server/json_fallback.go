@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"net/http"
+	"strings"
 )
 
 type bufferedResponseWriter struct {
@@ -32,6 +33,11 @@ func (w *bufferedResponseWriter) Write(data []byte) (int, error) {
 
 func withJSONFallbacks(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isWebSocketUpgrade(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		buffer := newBufferedResponseWriter()
 		next.ServeHTTP(buffer, r)
 
@@ -51,6 +57,21 @@ func withJSONFallbacks(next http.Handler) http.Handler {
 		w.WriteHeader(buffer.status)
 		_, _ = buffer.body.WriteTo(w)
 	})
+}
+
+func isWebSocketUpgrade(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket") {
+		return false
+	}
+	for _, part := range strings.Split(r.Header.Get("Connection"), ",") {
+		if strings.EqualFold(strings.TrimSpace(part), "upgrade") {
+			return true
+		}
+	}
+	return false
 }
 
 func copyHeader(dst, src http.Header) {
