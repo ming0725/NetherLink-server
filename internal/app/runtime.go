@@ -29,11 +29,13 @@ type Runtime struct {
 	ChatService     *chatsvc.Service
 	FileService     *filesvc.Service
 	FileWorker      *filesvc.ProcessingWorker
+	FileCleanup     *filesvc.CleanupWorker
 	FriendService   *friendsvc.Service
 	StorageProvider storage.ObjectStorageProvider
 	Logger          *slog.Logger
 	cancel          context.CancelFunc
 	fileWorkerDone  <-chan struct{}
+	fileCleanupDone <-chan struct{}
 }
 
 func NewRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Runtime, error) {
@@ -69,7 +71,9 @@ func NewRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*R
 		runtime.StorageProvider = storageProvider
 		runtime.FileService = filesvc.NewService(cfg.Storage, repos, db, storageProvider)
 		runtime.FileWorker = filesvc.NewProcessingWorker(repos, db, storageProvider, logger)
+		runtime.FileCleanup = filesvc.NewCleanupWorker(repos, storageProvider, logger)
 		runtime.fileWorkerDone = runtime.FileWorker.Start(runtimeCtx)
+		runtime.fileCleanupDone = runtime.FileCleanup.Start(runtimeCtx)
 	case errors.Is(err, storage.ErrProviderDisabled):
 		logger.Warn("object storage provider disabled")
 	case errors.Is(err, storage.ErrProviderNotImplemented):
@@ -94,6 +98,13 @@ func (r *Runtime) Close() {
 		case <-r.fileWorkerDone:
 		case <-time.After(2 * time.Second):
 			r.Logger.Warn("file processing worker did not stop before shutdown timeout")
+		}
+	}
+	if r.fileCleanupDone != nil {
+		select {
+		case <-r.fileCleanupDone:
+		case <-time.After(2 * time.Second):
+			r.Logger.Warn("file cleanup worker did not stop before shutdown timeout")
 		}
 	}
 	if r.Redis != nil {

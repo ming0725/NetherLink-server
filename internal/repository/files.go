@@ -143,6 +143,27 @@ type FileProcessingJob struct {
 	UpdatedAt  time.Time
 }
 
+type FileObjectReference struct {
+	Bucket    string
+	ObjectKey string
+}
+
+type ExpiredUploadSessionCleanupCandidate struct {
+	SessionID  string
+	FileID     string
+	Bucket     string
+	ObjectKey  string
+	UploadMode string
+	S3UploadID *string
+}
+
+type UnusedFileCleanupCandidate struct {
+	FileID    string
+	Bucket    string
+	ObjectKey string
+	Variants  []FileObjectReference
+}
+
 type CreateFileParams struct {
 	ID               string
 	OwnerUserID      string
@@ -522,6 +543,266 @@ func (r *FileRepository) MarkProcessingJobFailed(ctx context.Context, jobID stri
 		result,
 	))
 	return job, translateWriteError(err)
+}
+
+func (r *FileRepository) ClaimExpiredUploadSessionsForCleanup(ctx context.Context, limit int, retryAfter time.Duration) ([]ExpiredUploadSessionCleanupCandidate, error) {
+	if limit <= 0 {
+		limit = 25
+	}
+	if retryAfter <= 0 {
+		retryAfter = 15 * time.Minute
+	}
+
+	rows, err := r.db.Query(ctx, `
+		WITH candidates AS (
+			SELECT fus.id
+			FROM file_upload_sessions fus
+			JOIN files f ON f.id = fus.file_id
+			WHERE f.deleted_at IS NULL
+			  AND (
+			    (fus.status = 'created' AND fus.expires_at < now())
+			    OR (fus.status = 'cleanup_pending' AND fus.updated_at < now() - ($2 * interval '1 second'))
+			  )
+			ORDER BY fus.expires_at ASC, fus.created_at ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT $1
+		),
+		marked AS (
+			UPDATE file_upload_sessions fus
+			SET status = 'cleanup_pending',
+			    updated_at = now()
+			FROM candidates
+			WHERE fus.id = candidates.id
+			RETURNING fus.id, fus.file_id, fus.upload_mode, fus.s3_upload_id
+		)
+		SELECT marked.id, marked.file_id, marked.upload_mode, marked.s3_upload_id, f.bucket, f.object_key
+		FROM marked
+		JOIN files f ON f.id = marked.file_id
+		ORDER BY marked.id`,
+		limit,
+		retryAfter.Seconds(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	candidates := []ExpiredUploadSessionCleanupCandidate{}
+	for rows.Next() {
+		var (
+			candidate  ExpiredUploadSessionCleanupCandidate
+			sessionID  pgtype.UUID
+			fileID     pgtype.UUID
+			s3UploadID sql.NullString
+		)
+		if err := rows.Scan(
+			&sessionID,
+			&fileID,
+			&candidate.UploadMode,
+			&s3UploadID,
+			&candidate.Bucket,
+			&candidate.ObjectKey,
+		); err != nil {
+			return nil, err
+		}
+		candidate.SessionID = uuidString(sessionID)
+		candidate.FileID = uuidString(fileID)
+		candidate.S3UploadID = stringPtrFromNull(s3UploadID)
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return candidates, nil
+}
+
+func (r *FileRepository) MarkExpiredUploadSessionCleaned(ctx context.Context, sessionID string, fileID string) error {
+	tag, err := r.db.Exec(ctx, `
+		WITH session_update AS (
+			UPDATE file_upload_sessions
+			SET status = 'aborted',
+			    updated_at = now()
+			WHERE id = $1::uuid
+			  AND file_id = $2::uuid
+			  AND status = 'cleanup_pending'
+			RETURNING file_id
+		)
+		UPDATE files f
+		SET storage_status = 'deleted',
+		    deleted_at = COALESCE(f.deleted_at, now()),
+		    version = version + 1,
+		    updated_at = now()
+		FROM session_update
+		WHERE f.id = session_update.file_id`,
+		normalizeText(sessionID),
+		normalizeText(fileID),
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *FileRepository) ClaimUnusedFilesForCleanup(ctx context.Context, retention time.Duration, limit int, retryAfter time.Duration) ([]UnusedFileCleanupCandidate, error) {
+	if retention <= 0 {
+		retention = 24 * time.Hour
+	}
+	if limit <= 0 {
+		limit = 25
+	}
+	if retryAfter <= 0 {
+		retryAfter = 15 * time.Minute
+	}
+
+	rows, err := r.db.Query(ctx, `
+		WITH candidates AS (
+			SELECT f.id
+			FROM files f
+			WHERE f.deleted_at IS NULL
+			  AND (
+			    (
+			      f.storage_status IN ('ready', 'failed', 'uploaded', 'aborted')
+			      AND f.updated_at < now() - ($1 * interval '1 second')
+			    )
+			    OR (
+			      f.storage_status = 'cleanup_pending'
+			      AND f.updated_at < now() - ($3 * interval '1 second')
+			    )
+			  )
+			  AND NOT EXISTS (
+			    SELECT 1 FROM file_upload_sessions fus
+			    WHERE fus.file_id = f.id
+			      AND fus.status IN ('created', 'cleanup_pending')
+			  )
+			  AND NOT EXISTS (
+			    SELECT 1 FROM file_usages fu
+			    WHERE fu.file_id = f.id
+			      AND fu.deleted_at IS NULL
+			  )
+			  AND NOT EXISTS (
+			    SELECT 1 FROM file_usages fu
+			    WHERE fu.file_id = f.id
+			      AND fu.deleted_at IS NOT NULL
+			      AND fu.deleted_at > now() - ($1 * interval '1 second')
+			  )
+			  AND NOT EXISTS (
+			    SELECT 1 FROM users u
+			    WHERE u.avatar_file_id = f.id
+			      AND u.deleted_at IS NULL
+			  )
+			  AND NOT EXISTS (
+			    SELECT 1 FROM groups g
+			    WHERE g.avatar_file_id = f.id
+			      AND g.deleted_at IS NULL
+			  )
+			  AND NOT EXISTS (
+			    SELECT 1 FROM message_attachments ma
+			    WHERE ma.file_id = f.id
+			  )
+			  AND NOT EXISTS (
+			    SELECT 1 FROM post_media pm
+			    WHERE pm.file_id = f.id
+			       OR pm.cover_file_id = f.id
+			  )
+			  AND NOT EXISTS (
+			    SELECT 1 FROM ai_uploaded_files auf
+			    WHERE (auf.file_id = f.id OR auf.extracted_text_file_id = f.id)
+			      AND auf.deleted_at IS NULL
+			  )
+			ORDER BY f.updated_at ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT $2
+		),
+		marked AS (
+			UPDATE files f
+			SET storage_status = 'cleanup_pending',
+			    updated_at = now()
+			FROM candidates
+			WHERE f.id = candidates.id
+			RETURNING f.id, f.bucket, f.object_key
+		)
+		SELECT marked.id, marked.bucket, marked.object_key, fv.bucket, fv.object_key
+		FROM marked
+		LEFT JOIN file_variants fv ON fv.file_id = marked.id
+		ORDER BY marked.id`,
+		retention.Seconds(),
+		limit,
+		retryAfter.Seconds(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	candidatesByID := map[string]*UnusedFileCleanupCandidate{}
+	order := []string{}
+	for rows.Next() {
+		var (
+			fileID        pgtype.UUID
+			variantBucket sql.NullString
+			variantKey    sql.NullString
+			bucket        string
+			objectKey     string
+		)
+		if err := rows.Scan(&fileID, &bucket, &objectKey, &variantBucket, &variantKey); err != nil {
+			return nil, err
+		}
+
+		id := uuidString(fileID)
+		candidate := candidatesByID[id]
+		if candidate == nil {
+			candidate = &UnusedFileCleanupCandidate{
+				FileID:    id,
+				Bucket:    bucket,
+				ObjectKey: objectKey,
+			}
+			candidatesByID[id] = candidate
+			order = append(order, id)
+		}
+		if variantBucket.Valid && variantKey.Valid {
+			candidate.Variants = append(candidate.Variants, FileObjectReference{
+				Bucket:    variantBucket.String,
+				ObjectKey: variantKey.String,
+			})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	candidates := make([]UnusedFileCleanupCandidate, 0, len(order))
+	for _, id := range order {
+		candidates = append(candidates, *candidatesByID[id])
+	}
+	return candidates, nil
+}
+
+func (r *FileRepository) MarkUnusedFileCleaned(ctx context.Context, fileID string) error {
+	tag, err := r.db.Exec(ctx, `
+		WITH cleaned_variants AS (
+			DELETE FROM file_variants
+			WHERE file_id = $1::uuid
+		)
+		UPDATE files
+		SET storage_status = 'deleted',
+		    deleted_at = COALESCE(deleted_at, now()),
+		    version = version + 1,
+		    updated_at = now()
+		WHERE id = $1::uuid
+		  AND storage_status = 'cleanup_pending'
+		  AND deleted_at IS NULL`,
+		normalizeText(fileID),
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func scanFile(row scanner) (File, error) {

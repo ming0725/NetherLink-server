@@ -512,7 +512,10 @@ CREATE TABLE operation_receipts (
 CREATE INDEX idx_users_public_id ON users(public_id);
 CREATE INDEX idx_users_email ON users(email);
 CREATE INDEX idx_files_owner_user_id ON files(owner_user_id);
+CREATE INDEX idx_files_cleanup_status_updated ON files(storage_status, updated_at) WHERE deleted_at IS NULL;
+CREATE INDEX idx_file_upload_sessions_cleanup ON file_upload_sessions(status, expires_at, updated_at);
 CREATE INDEX idx_file_usages_business ON file_usages(usage_type, business_id);
+CREATE INDEX idx_file_usages_file_active ON file_usages(file_id) WHERE deleted_at IS NULL;
 CREATE INDEX idx_file_processing_jobs_pending ON file_processing_jobs(status, created_at);
 CREATE INDEX idx_file_processing_jobs_processing_started ON file_processing_jobs(status, started_at);
 CREATE INDEX idx_user_sessions_user_id ON user_sessions(user_id);

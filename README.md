@@ -22,9 +22,10 @@ Current scope is intentionally small:
 - User/friend/group HTTP handlers are available: user search/detail/batch, friend list/group list, friend group creation, friend settings update/delete, friend request create/list/accept/reject, and group list/detail/member list.
 - File upload-session HTTP handlers are available for presigned single and multipart MinIO/S3 uploads.
 - File upload completion now queues image, video, and audio processing jobs; the runtime starts a background worker that reads uploaded media from MinIO, extracts backend-side image dimensions, generates 512px JPEG image thumbnails, probes video/audio duration with `ffprobe`, extracts 512px video cover JPEGs with `ffmpeg`, retries stale processing jobs, records derived image/video variants in `file_variants`, and moves file status from `processing` to `ready` or `failed`.
+- File cleanup worker is available for expired upload sessions, unbound files, and files whose `file_usages` are all deleted; it deletes original and variant objects from MinIO and soft-deletes cleaned file metadata.
 - Chat conversation list/open/detail/settings/read/unread endpoints are available, along with message send, history, sender recall, and current-user hidden-history clearing; image attachments require and return `width` and `height` for frontend preview placeholders.
 - WebSocket realtime foundation is available at `GET /api/v1/ws`: access-token auth, per-user connection management, PostgreSQL-backed global event IDs, durable replay, Redis pub/sub fanout, `ping`/`realtime.pong`, `chat.message.created`, `chat.message.recalled`, `chat.conversation.sync.updated`, hidden-history sync, and `chat.message.send`.
-- No file cleanup worker, group write handlers, post/AI API handlers, realtime cleanup policy, or fanout operational metrics yet.
+- No group write handlers, post/AI API handlers, realtime cleanup policy, or fanout operational metrics yet.
 - Redis is used for auth rate limiting and realtime fanout today. It is not used as the source of truth for users, refresh token sessions, messages, notifications, realtime events, file metadata, or durable business state.
 
 ## Start Local Dependencies
@@ -160,15 +161,15 @@ Repository infrastructure:
 
 ## Runtime Boundary
 
-`internal/app` owns runtime dependency assembly and lifecycle for PostgreSQL, Redis, repository aggregates, auth service, file service, file processing worker, and object storage provider injection. `cmd/nlserver` should stay thin: load configuration, create the runtime, pass dependencies into `server.NewWithDependencies`, and start HTTP serving.
+`internal/app` owns runtime dependency assembly and lifecycle for PostgreSQL, Redis, repository aggregates, auth service, file service, file processing worker, file cleanup worker, and object storage provider injection. `cmd/nlserver` should stay thin: load configuration, create the runtime, pass dependencies into `server.NewWithDependencies`, and start HTTP serving.
 
 The MinIO/S3 provider implements object PUT/GET/HEAD/DELETE, presigned GET/PUT URLs, multipart upload creation, part presigning, completion, and abort. File metadata remains in PostgreSQL; public API responses do not expose bucket names or object keys.
 
 ## File Processing Boundary
 
-`internal/files` now includes the upload-session service and a background processing worker. Completing an uploaded image, video, or audio file creates a `file_processing_jobs` row and moves the file to `processing`. The worker claims pending jobs with `FOR UPDATE SKIP LOCKED`, resets jobs stuck in `processing` for more than 15 minutes, reads the original object through the storage provider, records the job result JSON, and marks the file `ready`. Processing failures are recorded on the job and mark the file `failed`.
+`internal/files` now includes the upload-session service, a background processing worker, and a background cleanup worker. Completing an uploaded image, video, or audio file creates a `file_processing_jobs` row and moves the file to `processing`. The processing worker claims pending jobs with `FOR UPDATE SKIP LOCKED`, resets jobs stuck in `processing` for more than 15 minutes, reads the original object through the storage provider, records the job result JSON, and marks the file `ready`. Processing failures are recorded on the job and mark the file `failed`.
 
-The current worker supports image metadata and `thumbnail_512` JPEG variants, video metadata plus `video_cover_512` JPEG variants through `ffprobe` / `ffmpeg`, and audio duration probing through `ffprobe`. Orphan object cleanup and business-level usage cleanup are still future work.
+The processing worker supports image metadata and `thumbnail_512` JPEG variants, video metadata plus `video_cover_512` JPEG variants through `ffprobe` / `ffmpeg`, and audio duration probing through `ffprobe`. The cleanup worker claims expired upload sessions and unused files with `FOR UPDATE SKIP LOCKED`, aborts stale multipart uploads, deletes original and variant objects, and marks cleaned file metadata as `deleted`.
 
 ## Chat Boundary
 
@@ -213,6 +214,5 @@ The former `internal/database/postgres_test.go` was a single DSN unit test, not 
 
 ## Next Build Steps
 
-1. Add orphan/unused object cleanup for expired upload sessions, unbound files, and deleted `file_usages`.
-2. Add realtime event cleanup policy, replay metrics, and operational health checks for Redis fanout.
-3. Add group write APIs, post APIs, and AI workflows after the chat/file metadata paths settle.
+1. Add realtime event cleanup policy, replay metrics, and operational health checks for Redis fanout.
+2. Add group write APIs, post APIs, and AI workflows after the chat/file metadata paths settle.
