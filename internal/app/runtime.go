@@ -16,26 +16,31 @@ import (
 	"nlserver/internal/database"
 	filesvc "nlserver/internal/files"
 	friendsvc "nlserver/internal/friend"
+	"nlserver/internal/realtime"
 	"nlserver/internal/repository"
 	"nlserver/internal/storage"
 )
 
 type Runtime struct {
-	Config          config.Config
-	DB              *pgxpool.Pool
-	Redis           *redis.Client
-	Repos           repository.Repositories
-	AuthService     *authsvc.Service
-	ChatService     *chatsvc.Service
-	FileService     *filesvc.Service
-	FileWorker      *filesvc.ProcessingWorker
-	FileCleanup     *filesvc.CleanupWorker
-	FriendService   *friendsvc.Service
-	StorageProvider storage.ObjectStorageProvider
-	Logger          *slog.Logger
-	cancel          context.CancelFunc
-	fileWorkerDone  <-chan struct{}
-	fileCleanupDone <-chan struct{}
+	Config              config.Config
+	DB                  *pgxpool.Pool
+	Redis               *redis.Client
+	Repos               repository.Repositories
+	AuthService         *authsvc.Service
+	ChatService         *chatsvc.Service
+	FileService         *filesvc.Service
+	FileWorker          *filesvc.ProcessingWorker
+	FileCleanup         *filesvc.CleanupWorker
+	FriendService       *friendsvc.Service
+	RealtimeHub         *realtime.Hub
+	RealtimeFanout      *realtime.RedisFanout
+	RealtimeCleanup     *realtime.CleanupWorker
+	StorageProvider     storage.ObjectStorageProvider
+	Logger              *slog.Logger
+	cancel              context.CancelFunc
+	fileWorkerDone      <-chan struct{}
+	fileCleanupDone     <-chan struct{}
+	realtimeCleanupDone <-chan struct{}
 }
 
 func NewRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Runtime, error) {
@@ -61,9 +66,20 @@ func NewRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*R
 		ChatService:   chatsvc.NewService(repos, db),
 		FileService:   filesvc.NewService(cfg.Storage, repos, db, nil),
 		FriendService: friendsvc.NewService(repos, db),
+		RealtimeHub:   realtime.NewHub(),
 		Logger:        logger,
 		cancel:        cancel,
 	}
+	runtime.RealtimeFanout = realtime.NewRedisFanout(redisClient, runtime.RealtimeHub)
+	runtime.RealtimeFanout.Start(runtimeCtx, logger)
+	runtime.RealtimeCleanup = realtime.NewCleanupWorker(
+		repos.RealtimeEvents,
+		cfg.Realtime.EventRetention,
+		cfg.Realtime.EventCleanupInterval,
+		cfg.Realtime.EventCleanupBatch,
+		logger,
+	)
+	runtime.realtimeCleanupDone = runtime.RealtimeCleanup.Start(runtimeCtx)
 
 	storageProvider, err := storage.NewProvider(cfg.Storage)
 	switch {
@@ -105,6 +121,13 @@ func (r *Runtime) Close() {
 		case <-r.fileCleanupDone:
 		case <-time.After(2 * time.Second):
 			r.Logger.Warn("file cleanup worker did not stop before shutdown timeout")
+		}
+	}
+	if r.realtimeCleanupDone != nil {
+		select {
+		case <-r.realtimeCleanupDone:
+		case <-time.After(2 * time.Second):
+			r.Logger.Warn("realtime cleanup worker did not stop before shutdown timeout")
 		}
 	}
 	if r.Redis != nil {

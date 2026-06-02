@@ -97,6 +97,28 @@ func (r *RealtimeEventRepository) LatestSeq(ctx context.Context) (uint64, error)
 	return uint64(latest), translateReadError(err)
 }
 
+func (r *RealtimeEventRepository) DeleteBefore(ctx context.Context, before time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+
+	tag, err := r.db.Exec(ctx, `
+		WITH expired AS (
+			SELECT event_seq
+			FROM realtime_events
+			WHERE emitted_at < $1
+			ORDER BY event_seq ASC
+			LIMIT $2
+		)
+		DELETE FROM realtime_events e
+		USING expired
+		WHERE e.event_seq = expired.event_seq`,
+		before,
+		limit,
+	)
+	return tag.RowsAffected(), translateWriteError(err)
+}
+
 func scanRealtimeEvent(row scanner) (RealtimeEvent, error) {
 	var event RealtimeEvent
 	var seq int64

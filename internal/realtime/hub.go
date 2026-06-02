@@ -33,10 +33,33 @@ type Hub struct {
 	nextConn      atomic.Uint64
 	maxUserEvents int
 
+	memoryReplayRequests      atomic.Uint64
+	memoryReplayEvents        atomic.Uint64
+	memoryReplaySyncRequired  atomic.Uint64
+	durableReplayRequests     atomic.Uint64
+	durableReplayEvents       atomic.Uint64
+	durableReplaySyncRequired atomic.Uint64
+	durableReplayFailures     atomic.Uint64
+
 	mu              sync.Mutex
 	connections     map[string]*Connection
 	userConnections map[string]map[string]*Connection
 	userEvents      map[string][]Event
+}
+
+type HubSnapshot struct {
+	OnlineConnections         int    `json:"onlineConnections"`
+	OnlineUsers               int    `json:"onlineUsers"`
+	BufferedUsers             int    `json:"bufferedUsers"`
+	LatestEventSeq            uint64 `json:"latestEventSeq"`
+	MaxReplayEvents           int    `json:"maxReplayEvents"`
+	MemoryReplayRequests      uint64 `json:"memoryReplayRequests"`
+	MemoryReplayEvents        uint64 `json:"memoryReplayEvents"`
+	MemoryReplaySyncRequired  uint64 `json:"memoryReplaySyncRequired"`
+	DurableReplayRequests     uint64 `json:"durableReplayRequests"`
+	DurableReplayEvents       uint64 `json:"durableReplayEvents"`
+	DurableReplaySyncRequired uint64 `json:"durableReplaySyncRequired"`
+	DurableReplayFailures     uint64 `json:"durableReplayFailures"`
 }
 
 func NewHub() *Hub {
@@ -71,6 +94,7 @@ func (h *Hub) Connect(userID string, sessionID string, deviceID string, lastEven
 	h.userConnections[userID][conn.id] = conn
 	replay, syncRequired := replayEvents(h.userEvents[userID], h.maxUserEvents, lastEventSeq)
 	h.mu.Unlock()
+	h.recordMemoryReplay(len(replay), syncRequired)
 
 	return conn, replay, syncRequired
 }
@@ -158,6 +182,49 @@ func (h *Hub) MaxReplayEvents() int {
 		return 0
 	}
 	return h.maxUserEvents
+}
+
+func (h *Hub) RecordDurableReplay(eventCount int, syncRequired bool, failed bool) {
+	if h == nil {
+		return
+	}
+	h.durableReplayRequests.Add(1)
+	if eventCount > 0 {
+		h.durableReplayEvents.Add(uint64(eventCount))
+	}
+	if syncRequired {
+		h.durableReplaySyncRequired.Add(1)
+	}
+	if failed {
+		h.durableReplayFailures.Add(1)
+	}
+}
+
+func (h *Hub) Snapshot() HubSnapshot {
+	if h == nil {
+		return HubSnapshot{}
+	}
+
+	h.mu.Lock()
+	onlineConnections := len(h.connections)
+	onlineUsers := len(h.userConnections)
+	bufferedUsers := len(h.userEvents)
+	h.mu.Unlock()
+
+	return HubSnapshot{
+		OnlineConnections:         onlineConnections,
+		OnlineUsers:               onlineUsers,
+		BufferedUsers:             bufferedUsers,
+		LatestEventSeq:            h.nextSeq.Load(),
+		MaxReplayEvents:           h.maxUserEvents,
+		MemoryReplayRequests:      h.memoryReplayRequests.Load(),
+		MemoryReplayEvents:        h.memoryReplayEvents.Load(),
+		MemoryReplaySyncRequired:  h.memoryReplaySyncRequired.Load(),
+		DurableReplayRequests:     h.durableReplayRequests.Load(),
+		DurableReplayEvents:       h.durableReplayEvents.Load(),
+		DurableReplaySyncRequired: h.durableReplaySyncRequired.Load(),
+		DurableReplayFailures:     h.durableReplayFailures.Load(),
+	}
 }
 
 func (c *Connection) ID() string {
@@ -256,6 +323,19 @@ func (h *Hub) observeEventSeq(seq uint64) {
 		if current >= seq || h.nextSeq.CompareAndSwap(current, seq) {
 			return
 		}
+	}
+}
+
+func (h *Hub) recordMemoryReplay(eventCount int, syncRequired bool) {
+	if h == nil {
+		return
+	}
+	h.memoryReplayRequests.Add(1)
+	if eventCount > 0 {
+		h.memoryReplayEvents.Add(uint64(eventCount))
+	}
+	if syncRequired {
+		h.memoryReplaySyncRequired.Add(1)
 	}
 }
 

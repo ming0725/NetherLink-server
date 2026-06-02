@@ -12,7 +12,7 @@ Current scope is intentionally small:
 - PostgreSQL repositories for users, user preferences, user sessions, files, chat, friends, groups, and realtime events under `internal/repository`.
 - Shared repository infrastructure: aggregate repository construction, transaction helper, and operation receipt repository for idempotent writes.
 - P0 auth service under `internal/auth`: password hashing, access token signing/validation, refresh token hashing/rotation, PostgreSQL-backed session checks, current-user profile updates, public ID checks/changes, and device session management.
-- Application runtime assembly under `internal/app` for PostgreSQL, Redis, repositories, auth service, and future storage provider injection.
+- Application runtime assembly under `internal/app` for PostgreSQL, Redis, repositories, auth service, file workers, realtime fanout, realtime cleanup, and object storage provider injection.
 - Object storage interface and MinIO/S3 provider under `internal/storage`.
 - PostgreSQL schema bootstrap under `db/`.
 - Redis service bootstrap under `docker-compose.yml`.
@@ -24,8 +24,9 @@ Current scope is intentionally small:
 - File upload completion now queues image, video, and audio processing jobs; the runtime starts a background worker that reads uploaded media from MinIO, extracts backend-side image dimensions, generates 512px JPEG image thumbnails, probes video/audio duration with `ffprobe`, extracts 512px video cover JPEGs with `ffmpeg`, retries stale processing jobs, records derived image/video variants in `file_variants`, and moves file status from `processing` to `ready` or `failed`.
 - File cleanup worker is available for expired upload sessions, unbound files, and files whose `file_usages` are all deleted; it deletes original and variant objects from MinIO and soft-deletes cleaned file metadata.
 - Chat conversation list/open/detail/settings/read/unread endpoints are available, along with message send, history, sender recall, and current-user hidden-history clearing; image attachments require and return `width` and `height` for frontend preview placeholders.
-- WebSocket realtime foundation is available at `GET /api/v1/ws`: access-token auth, per-user connection management, PostgreSQL-backed global event IDs, durable replay, Redis pub/sub fanout, `ping`/`realtime.pong`, `chat.message.created`, `chat.message.recalled`, `chat.conversation.sync.updated`, hidden-history sync, and `chat.message.send`.
-- No group write handlers, post/AI API handlers, realtime cleanup policy, or fanout operational metrics yet.
+- WebSocket realtime foundation is available at `GET /api/v1/ws`: access-token auth, per-user connection management, PostgreSQL-backed global event IDs, durable replay, Redis pub/sub fanout, replay metrics, fanout operational counters, `ping`/`realtime.pong`, `chat.message.created`, `chat.message.recalled`, `chat.conversation.sync.updated`, hidden-history sync, and `chat.message.send`.
+- Realtime event cleanup is available: `realtime_events` are retained for the configured window, old events are deleted in batches, and `/readyz` exposes hub, fanout, and cleanup snapshots.
+- No group write handlers, post API handlers, or AI API handlers yet.
 - Redis is used for auth rate limiting and realtime fanout today. It is not used as the source of truth for users, refresh token sessions, messages, notifications, realtime events, file metadata, or durable business state.
 
 ## Start Local Dependencies
@@ -54,7 +55,7 @@ Default server address:
 - Readiness: `GET /readyz`
 - API root: `GET /api/v1`
 
-`/healthz` only verifies that the process is serving HTTP. `/readyz` pings PostgreSQL and Redis, and returns `503 SERVICE_NOT_READY` until both dependencies are reachable.
+`/healthz` only verifies that the process is serving HTTP. `/readyz` pings PostgreSQL and Redis, returns `503 SERVICE_NOT_READY` until both dependencies are reachable, and includes realtime hub, Redis fanout, replay, and cleanup counters when ready.
 Unknown routes and unsupported methods return the standard JSON error shape with `code`, `message`, and `requestId`.
 
 Auth configuration:
@@ -62,6 +63,12 @@ Auth configuration:
 - `NETHERLINK_AUTH_TOKEN_SECRET`: HMAC signing secret for access tokens. Required; at least 32 characters.
 - `NETHERLINK_AUTH_ACCESS_TOKEN_TTL`: default `15m`.
 - `NETHERLINK_AUTH_REFRESH_TOKEN_TTL`: default `720h`.
+
+Realtime configuration:
+
+- `NETHERLINK_REALTIME_EVENT_RETENTION`: default `168h`.
+- `NETHERLINK_REALTIME_EVENT_CLEANUP_INTERVAL`: default `1h`.
+- `NETHERLINK_REALTIME_EVENT_CLEANUP_BATCH`: default `5000`.
 
 ## API Foundation
 
@@ -161,7 +168,7 @@ Repository infrastructure:
 
 ## Runtime Boundary
 
-`internal/app` owns runtime dependency assembly and lifecycle for PostgreSQL, Redis, repository aggregates, auth service, file service, file processing worker, file cleanup worker, and object storage provider injection. `cmd/nlserver` should stay thin: load configuration, create the runtime, pass dependencies into `server.NewWithDependencies`, and start HTTP serving.
+`internal/app` owns runtime dependency assembly and lifecycle for PostgreSQL, Redis, repository aggregates, auth service, file service, file processing worker, file cleanup worker, realtime hub, Redis fanout, realtime cleanup worker, and object storage provider injection. `cmd/nlserver` should stay thin: load configuration, create the runtime, pass dependencies into `server.NewWithDependencies`, and start HTTP serving.
 
 The MinIO/S3 provider implements object PUT/GET/HEAD/DELETE, presigned GET/PUT URLs, multipart upload creation, part presigning, completion, and abort. File metadata remains in PostgreSQL; public API responses do not expose bucket names or object keys.
 
@@ -179,7 +186,9 @@ Image message attachments must include positive `width` and `height`. The same f
 
 ## Realtime Boundary
 
-`internal/realtime` is the WebSocket hub plus Redis fanout transport. PostgreSQL `realtime_events` assigns globally increasing `evt_N` IDs and stores per-user recipients for durable replay. The in-process hub still tracks online connections by user/session/device and keeps a short per-user replay window as fallback. Connection-control events such as `realtime.ready`, `realtime.pong`, `chat.message.sent`, and `client.error` use `eventSeq: 0` and are not replayed.
+`internal/realtime` is the WebSocket hub plus Redis fanout transport and realtime event cleanup worker. PostgreSQL `realtime_events` assigns globally increasing `evt_N` IDs and stores per-user recipients for durable replay. The in-process hub still tracks online connections by user/session/device and keeps a short per-user replay window as fallback. Connection-control events such as `realtime.ready`, `realtime.pong`, `chat.message.sent`, and `client.error` use `eventSeq: 0` and are not replayed.
+
+The realtime cleanup worker deletes `realtime_events` older than `NETHERLINK_REALTIME_EVENT_RETENTION` in batches of `NETHERLINK_REALTIME_EVENT_CLEANUP_BATCH` every `NETHERLINK_REALTIME_EVENT_CLEANUP_INTERVAL`; recipient rows are removed by cascade. `/readyz` includes hub online counts, memory/durable replay counters, Redis fanout publish/receive/error counters, and cleanup last-run state.
 
 Current pushed events:
 
@@ -214,5 +223,5 @@ The former `internal/database/postgres_test.go` was a single DSN unit test, not 
 
 ## Next Build Steps
 
-1. Add realtime event cleanup policy, replay metrics, and operational health checks for Redis fanout.
-2. Add group write APIs, post APIs, and AI workflows after the chat/file metadata paths settle.
+1. Add group write APIs for create/edit/delete groups, membership management, owner transfer, member settings, and join-request handling.
+2. Add post APIs and AI workflows after group write paths settle.

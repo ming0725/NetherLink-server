@@ -526,6 +526,7 @@ CREATE INDEX idx_group_members_user_id ON group_members(user_id);
 CREATE INDEX idx_conversation_participants_user_id ON conversation_participants(user_id);
 CREATE INDEX idx_messages_conversation_seq ON messages(conversation_id, message_seq DESC);
 CREATE INDEX idx_notifications_user_read ON notifications(user_id, read_at);
+CREATE INDEX idx_realtime_events_emitted_seq ON realtime_events(emitted_at, event_seq);
 CREATE INDEX idx_realtime_event_recipients_user_seq ON realtime_event_recipients(user_id, event_seq DESC);
 CREATE INDEX idx_posts_author_created ON posts(author_id, created_at DESC);
 CREATE INDEX idx_post_comments_post_created ON post_comments(post_id, created_at DESC);

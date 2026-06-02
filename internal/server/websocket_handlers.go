@@ -165,6 +165,7 @@ func (s *Server) loadDurableReplay(ctx context.Context, userID string, lastEvent
 
 	events, hasMore, err := s.repos.RealtimeEvents.ListForUserAfter(ctx, userID, lastEventSeq, s.realtimeHub.MaxReplayEvents())
 	if err != nil {
+		s.realtimeHub.RecordDurableReplay(0, false, true)
 		s.logger.WarnContext(ctx, "failed to load durable realtime replay", "error", err, "user_id", userID)
 		return nil, false, false
 	}
@@ -179,6 +180,7 @@ func (s *Server) loadDurableReplay(ctx context.Context, userID string, lastEvent
 			Payload:   event.Payload,
 		})
 	}
+	s.realtimeHub.RecordDurableReplay(len(replay), hasMore, false)
 	return replay, hasMore, true
 }
 

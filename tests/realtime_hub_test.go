@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"nlserver/internal/realtime"
 )
 
@@ -79,6 +81,54 @@ func TestRealtimeHubPublishesPersistedEvent(t *testing.T) {
 	}
 	if hub.LatestEventSeq() != 42 {
 		t.Fatalf("latest seq = %d, want 42", hub.LatestEventSeq())
+	}
+}
+
+func TestRealtimeHubSnapshotTracksReplayMetrics(t *testing.T) {
+	hub := realtime.NewHub()
+	first := hub.Publish([]string{"user_a"}, "event.first", nil)
+	second := hub.Publish([]string{"user_a"}, "event.second", nil)
+
+	conn, replay, syncRequired := hub.Connect("user_a", "session_a", "device_a", first.EventSeq)
+	defer hub.Disconnect(conn)
+
+	if syncRequired {
+		t.Fatal("syncRequired = true, want false")
+	}
+	if len(replay) != 1 || replay[0].EventSeq != second.EventSeq {
+		t.Fatalf("replay = %+v, want second event", replay)
+	}
+
+	hub.RecordDurableReplay(3, true, false)
+	hub.RecordDurableReplay(0, false, true)
+
+	snapshot := hub.Snapshot()
+	if snapshot.OnlineConnections != 1 || snapshot.OnlineUsers != 1 {
+		t.Fatalf("online snapshot = %+v, want one connection and one user", snapshot)
+	}
+	if snapshot.MemoryReplayRequests != 1 || snapshot.MemoryReplayEvents != 1 {
+		t.Fatalf("memory replay snapshot = %+v, want one request and one event", snapshot)
+	}
+	if snapshot.DurableReplayRequests != 2 || snapshot.DurableReplayEvents != 3 || snapshot.DurableReplaySyncRequired != 1 || snapshot.DurableReplayFailures != 1 {
+		t.Fatalf("durable replay snapshot = %+v, want recorded durable metrics", snapshot)
+	}
+}
+
+func TestRedisFanoutSnapshotReportsConfiguredChannel(t *testing.T) {
+	client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	defer client.Close()
+
+	fanout := realtime.NewRedisFanout(client, realtime.NewHub())
+	snapshot := fanout.Snapshot()
+
+	if !snapshot.Enabled {
+		t.Fatalf("enabled = false, want true")
+	}
+	if snapshot.Channel != "nl:realtime:events" {
+		t.Fatalf("channel = %q, want nl:realtime:events", snapshot.Channel)
+	}
+	if snapshot.NodeID == "" {
+		t.Fatal("node ID is empty")
 	}
 }
 

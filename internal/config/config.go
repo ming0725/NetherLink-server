@@ -14,6 +14,7 @@ type Config struct {
 	Auth     AuthConfig
 	Postgres PostgresConfig
 	Redis    RedisConfig
+	Realtime RealtimeConfig
 	Storage  StorageConfig
 }
 
@@ -42,6 +43,12 @@ type RedisConfig struct {
 	Username string
 	Password string
 	Database int
+}
+
+type RealtimeConfig struct {
+	EventRetention       time.Duration
+	EventCleanupInterval time.Duration
+	EventCleanupBatch    int
 }
 
 type StorageConfig struct {
@@ -90,6 +97,11 @@ func Load() (Config, error) {
 			Username: getEnv("NETHERLINK_REDIS_USERNAME", ""),
 			Password: getEnv("NETHERLINK_REDIS_PASSWORD", ""),
 			Database: getEnvNonNegativeInt(&validationErrors, "NETHERLINK_REDIS_DB", 0),
+		},
+		Realtime: RealtimeConfig{
+			EventRetention:       getEnvDuration(&validationErrors, "NETHERLINK_REALTIME_EVENT_RETENTION", 7*24*time.Hour),
+			EventCleanupInterval: getEnvDuration(&validationErrors, "NETHERLINK_REALTIME_EVENT_CLEANUP_INTERVAL", time.Hour),
+			EventCleanupBatch:    getEnvPositiveInt(&validationErrors, "NETHERLINK_REALTIME_EVENT_CLEANUP_BATCH", 5000),
 		},
 		Storage: StorageConfig{
 			Provider:         getEnv("NETHERLINK_OBJECT_STORAGE_PROVIDER", "minio"),
@@ -150,6 +162,18 @@ func getEnvNonNegativeInt(validationErrors *[]string, key string, fallback int) 
 	}
 	if value < 0 {
 		*validationErrors = append(*validationErrors, key+" must be non-negative")
+		return fallback
+	}
+	return value
+}
+
+func getEnvPositiveInt(validationErrors *[]string, key string, fallback int) int {
+	value, ok := parseEnvInt(validationErrors, key, fallback)
+	if !ok {
+		return fallback
+	}
+	if value < 1 {
+		*validationErrors = append(*validationErrors, key+" must be positive")
 		return fallback
 	}
 	return value

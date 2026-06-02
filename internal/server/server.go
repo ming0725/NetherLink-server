@@ -21,34 +21,36 @@ import (
 )
 
 type Server struct {
-	cfg            config.Config
-	db             *pgxpool.Pool
-	redis          *redis.Client
-	repos          repository.Repositories
-	authService    *authsvc.Service
-	chatService    *chatsvc.Service
-	fileService    *filesvc.Service
-	friendService  *friendsvc.Service
-	realtimeHub    *realtime.Hub
-	realtimeFanout *realtime.RedisFanout
-	storage        storage.ObjectStorageProvider
-	logger         *slog.Logger
-	handler        http.Handler
+	cfg             config.Config
+	db              *pgxpool.Pool
+	redis           *redis.Client
+	repos           repository.Repositories
+	authService     *authsvc.Service
+	chatService     *chatsvc.Service
+	fileService     *filesvc.Service
+	friendService   *friendsvc.Service
+	realtimeHub     *realtime.Hub
+	realtimeFanout  *realtime.RedisFanout
+	realtimeCleanup *realtime.CleanupWorker
+	storage         storage.ObjectStorageProvider
+	logger          *slog.Logger
+	handler         http.Handler
 }
 
 type Dependencies struct {
-	Config         config.Config
-	DB             *pgxpool.Pool
-	Redis          *redis.Client
-	Repos          repository.Repositories
-	AuthService    *authsvc.Service
-	ChatService    *chatsvc.Service
-	FileService    *filesvc.Service
-	FriendService  *friendsvc.Service
-	RealtimeHub    *realtime.Hub
-	RealtimeFanout *realtime.RedisFanout
-	Storage        storage.ObjectStorageProvider
-	Logger         *slog.Logger
+	Config          config.Config
+	DB              *pgxpool.Pool
+	Redis           *redis.Client
+	Repos           repository.Repositories
+	AuthService     *authsvc.Service
+	ChatService     *chatsvc.Service
+	FileService     *filesvc.Service
+	FriendService   *friendsvc.Service
+	RealtimeHub     *realtime.Hub
+	RealtimeFanout  *realtime.RedisFanout
+	RealtimeCleanup *realtime.CleanupWorker
+	Storage         storage.ObjectStorageProvider
+	Logger          *slog.Logger
 }
 
 func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client, logger *slog.Logger) *Server {
@@ -94,18 +96,19 @@ func NewWithDependencies(deps Dependencies) *Server {
 	}
 
 	server := &Server{
-		cfg:            deps.Config,
-		db:             deps.DB,
-		redis:          deps.Redis,
-		repos:          deps.Repos,
-		authService:    deps.AuthService,
-		chatService:    deps.ChatService,
-		fileService:    deps.FileService,
-		friendService:  deps.FriendService,
-		realtimeHub:    deps.RealtimeHub,
-		realtimeFanout: deps.RealtimeFanout,
-		storage:        deps.Storage,
-		logger:         deps.Logger,
+		cfg:             deps.Config,
+		db:              deps.DB,
+		redis:           deps.Redis,
+		repos:           deps.Repos,
+		authService:     deps.AuthService,
+		chatService:     deps.ChatService,
+		fileService:     deps.FileService,
+		friendService:   deps.FriendService,
+		realtimeHub:     deps.RealtimeHub,
+		realtimeFanout:  deps.RealtimeFanout,
+		realtimeCleanup: deps.RealtimeCleanup,
+		storage:         deps.Storage,
+		logger:          deps.Logger,
 	}
 
 	mux := http.NewServeMux()
@@ -240,6 +243,11 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		"status":   "ok",
 		"postgres": "ok",
 		"redis":    "ok",
+		"realtime": map[string]any{
+			"hub":     s.realtimeHub.Snapshot(),
+			"fanout":  s.realtimeFanout.Snapshot(),
+			"cleanup": s.realtimeCleanup.Snapshot(),
+		},
 	})
 }
 

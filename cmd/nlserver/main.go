@@ -35,16 +35,19 @@ func main() {
 	)
 
 	if err := server.NewWithDependencies(server.Dependencies{
-		Config:        runtime.Config,
-		DB:            runtime.DB,
-		Redis:         runtime.Redis,
-		Repos:         runtime.Repos,
-		AuthService:   runtime.AuthService,
-		ChatService:   runtime.ChatService,
-		FileService:   runtime.FileService,
-		FriendService: runtime.FriendService,
-		Storage:       runtime.StorageProvider,
-		Logger:        runtime.Logger,
+		Config:          runtime.Config,
+		DB:              runtime.DB,
+		Redis:           runtime.Redis,
+		Repos:           runtime.Repos,
+		AuthService:     runtime.AuthService,
+		ChatService:     runtime.ChatService,
+		FileService:     runtime.FileService,
+		FriendService:   runtime.FriendService,
+		RealtimeHub:     runtime.RealtimeHub,
+		RealtimeFanout:  runtime.RealtimeFanout,
+		RealtimeCleanup: runtime.RealtimeCleanup,
+		Storage:         runtime.StorageProvider,
+		Logger:          runtime.Logger,
 	}).ListenAndServe(); err != nil {
 		logger.Error("nlserver stopped with error", "error", err)
 		os.Exit(1)
