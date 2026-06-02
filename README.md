@@ -31,7 +31,7 @@ Current scope is intentionally small:
 - Post HTTP handlers are available for feed/detail/create/edit/delete, media binding, likes, follows, comments, replies, comment/reply likes, and comment/reply deletion.
 - Notification HTTP handlers are available for listing notifications, marking all notifications read, and marking one notification read.
 - Operation receipt HTTP handler is available for idempotent client-operation result lookup and creation.
-- AI repositories, service, OpenAI-compatible provider client, and AI HTTP handlers are available for conversations, messages, uploaded-file binding, context metadata, feedback, and title generation. REST message generation is synchronous by default and supports SSE streaming with `Accept: text/event-stream` or `?stream=true`; WebSocket `ai.message.send` streams provider chunks and supports `ai.stream.cancel`. Uploaded text-like AI files are parsed into `ai_file_chunks` and relevant chunks are injected into provider prompts.
+- AI repositories, service, OpenAI-compatible provider client, and AI HTTP handlers are available for conversations, messages, uploaded-file binding, context metadata, feedback, and title generation. REST message generation is synchronous by default and supports SSE streaming with `Accept: text/event-stream` or `?stream=true`; WebSocket `ai.message.send` streams provider chunks and supports `ai.stream.cancel`. Uploaded text-like AI files are parsed into `ai_file_chunks` and relevant chunks are injected into provider prompts. AI files using `retentionPolicy=source_deleted_after_parse` delete the original object and soft-delete source file metadata after successful parsing when no non-AI business reference still needs the file.
 - Redis is used for auth rate limiting and realtime fanout today. It is not used as the source of truth for users, refresh token sessions, messages, notifications, realtime events, file metadata, or durable business state.
 
 ## Start Local Dependencies
@@ -222,11 +222,13 @@ The processing worker supports image metadata and `thumbnail_512` JPEG variants,
 
 AI file binding creates `file_usages(usage_type=ai_upload)` and a pending `file_processing_jobs(job_type=ai_parse)` row. The processing worker now claims `ai_parse` jobs for UTF-8 text-like files such as plain text, Markdown, JSON, CSV, logs, XML, HTML, code, and common config files. It reads the original object, validates text content, stores bounded chunks in `ai_file_chunks`, records job result JSON, and marks `ai_uploaded_files.parse_status` as `ready` or `failed`.
 
+When every active AI binding for the parsed source file uses `retentionPolicy=source_deleted_after_parse`, and repository checks confirm that no avatar, chat, post, group, or other non-AI reference still points at the file, the worker deletes the original MinIO object and soft-deletes the source `files` row after storing chunks. The AI binding and chunks remain available for later messages.
+
 ## AI Boundary
 
 `internal/ai` owns AI conversation service logic and the OpenAI-compatible `/chat/completions` provider client. The service stores user messages before model calls, stores assistant messages after successful provider responses, rejects unparsed AI files with `AI_FILE_NOT_READY`, and maps failed parses to `AI_FILE_PARSE_FAILED`. Provider credentials are read only from `NETHERLINK_AI_API_KEY`; code and docs must not contain real API keys.
 
-REST generation is synchronous by default. `POST /api/v1/ai/conversations/{conversationId}/messages` returns the stored user message, created assistant message ID, an empty `streamId`, and used files. With `Accept: text/event-stream` or `?stream=true`, the same endpoint streams `ai.stream.started`, `ai.stream.chunk`, `ai.stream.done`, `ai.stream.cancelled`, and `client.error` SSE events, stores the final assistant message on successful provider completion, and cancels the provider request when the HTTP client disconnects. WebSocket `ai.message.send` returns `ai.stream.started`, streams `ai.stream.chunk` control events, stores the final assistant message on successful provider completion, and returns `ai.stream.done`; `ai.stream.cancel` cancels an in-flight stream by `streamId` and returns `ai.stream.cancelled`. When `aiFileIds` are supplied, the service rejects pending/failed parses and injects a bounded set of relevant `ai_file_chunks` into the provider prompt.
+REST generation is synchronous by default. `POST /api/v1/ai/conversations/{conversationId}/messages` returns the stored user message, created assistant message ID, an empty `streamId`, and used files. With `Accept: text/event-stream` or `?stream=true`, the same endpoint streams `ai.stream.started`, `ai.stream.chunk`, `ai.stream.done`, `ai.stream.cancelled`, and `client.error` SSE events, stores the final assistant message on successful provider completion, and cancels the provider request when the HTTP client disconnects. WebSocket `ai.message.send` returns `ai.stream.started`, streams `ai.stream.chunk` control events, stores the final assistant message on successful provider completion, and returns `ai.stream.done`; `ai.stream.cancel` cancels an in-flight stream by `streamId` and returns `ai.stream.cancelled`. When `aiFileIds` are supplied, the service rejects pending/failed parses and injects a bounded set of relevant `ai_file_chunks` into the provider prompt. `source_deleted_after_parse` keeps those chunks while removing the original source object after successful parsing, provided the file is not shared with any non-AI business reference.
 
 ## Chat Boundary
 
@@ -289,5 +291,5 @@ The former `internal/database/postgres_test.go` was a single DSN unit test, not 
 
 ## Next Build Steps
 
-1. Add extracted-text object retention policy handling for `source_deleted_after_parse`.
-2. Add richer AI document parsers such as PDF/docx/xlsx and optional embeddings for AI chunk search.
+1. Add richer AI document parsers such as PDF/docx/xlsx and OCR.
+2. Add optional embeddings or a stronger retrieval strategy for AI chunk search.

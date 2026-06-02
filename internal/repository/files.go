@@ -756,6 +756,57 @@ func (r *FileRepository) HasActiveReferences(ctx context.Context, fileID string)
 	return referenced, translateReadError(err)
 }
 
+func (r *FileRepository) CanDeleteAIParseSourceAfterParse(ctx context.Context, fileID string) (bool, error) {
+	var allowed bool
+	err := r.db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM files f
+			WHERE f.id = $1::uuid
+			  AND f.deleted_at IS NULL
+		)
+		AND NOT EXISTS (
+			SELECT 1
+			FROM file_usages fu
+			WHERE fu.file_id = $1::uuid
+			  AND fu.deleted_at IS NULL
+			  AND fu.usage_type <> 'ai_upload'
+		)
+		AND NOT EXISTS (
+			SELECT 1
+			FROM users u
+			WHERE u.avatar_file_id = $1::uuid
+			  AND u.deleted_at IS NULL
+		)
+		AND NOT EXISTS (
+			SELECT 1
+			FROM groups g
+			WHERE g.avatar_file_id = $1::uuid
+			  AND g.deleted_at IS NULL
+		)
+		AND NOT EXISTS (
+			SELECT 1
+			FROM message_attachments ma
+			WHERE ma.file_id = $1::uuid
+		)
+		AND NOT EXISTS (
+			SELECT 1
+			FROM post_media pm
+			WHERE pm.file_id = $1::uuid
+			   OR pm.cover_file_id = $1::uuid
+		)
+		AND NOT EXISTS (
+			SELECT 1
+			FROM ai_uploaded_files auf
+			WHERE auf.file_id = $1::uuid
+			  AND auf.deleted_at IS NULL
+			  AND COALESCE(NULLIF(auf.retention_policy, ''), 'conversation') <> 'source_deleted_after_parse'
+		)`,
+		normalizeText(fileID),
+	).Scan(&allowed)
+	return allowed, translateReadError(err)
+}
+
 func (r *FileRepository) SoftDelete(ctx context.Context, fileID string) error {
 	tag, err := r.db.Exec(ctx, `
 		UPDATE files

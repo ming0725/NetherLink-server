@@ -66,10 +66,11 @@ type audioProcessingResult struct {
 }
 
 type aiParseResult struct {
-	UploadedFileIDs []string `json:"uploadedFileIds"`
-	ChunkCount      int      `json:"chunkCount"`
-	TokenCount      int      `json:"tokenCount"`
-	Truncated       bool     `json:"truncated"`
+	UploadedFileIDs       []string `json:"uploadedFileIds"`
+	ChunkCount            int      `json:"chunkCount"`
+	TokenCount            int      `json:"tokenCount"`
+	Truncated             bool     `json:"truncated"`
+	SourceDeleteRequested bool     `json:"sourceDeleteRequested"`
 }
 
 type ffprobeOutput struct {
@@ -327,12 +328,19 @@ func (w *ProcessingWorker) processAIParse(ctx context.Context, job repository.Fi
 		uploadedFileIDs = append(uploadedFileIDs, uploadedFile.ID)
 	}
 	result := aiParseResult{
-		UploadedFileIDs: uploadedFileIDs,
-		ChunkCount:      len(chunks),
-		TokenCount:      tokenCount,
-		Truncated:       truncated,
+		UploadedFileIDs:       uploadedFileIDs,
+		ChunkCount:            len(chunks),
+		TokenCount:            tokenCount,
+		Truncated:             truncated,
+		SourceDeleteRequested: shouldDeleteAIParseSource(uploadedFiles),
 	}
-	return w.finishAIParseJob(ctx, job, file.ID, uploadedFiles, chunks, result)
+	if err := w.finishAIParseJob(ctx, job, file.ID, uploadedFiles, chunks, result); err != nil {
+		return err
+	}
+	if result.SourceDeleteRequested {
+		w.deleteAIParseSourceAfterSuccess(ctx, file)
+	}
+	return nil
 }
 
 func (w *ProcessingWorker) createImageThumbnail(ctx context.Context, file repository.File, width int, height int) (repository.FileVariant, error) {
@@ -606,6 +614,32 @@ func (w *ProcessingWorker) failJob(ctx context.Context, job repository.FileProce
 	})
 }
 
+func (w *ProcessingWorker) deleteAIParseSourceAfterSuccess(ctx context.Context, file repository.File) {
+	allowed, err := w.repos.Files.CanDeleteAIParseSourceAfterParse(ctx, file.ID)
+	if err != nil {
+		w.logger.Error("AI parse source delete eligibility check failed", "file_id", file.ID, "error", err)
+		return
+	}
+	if !allowed {
+		w.logger.Info("AI parse source delete skipped because source still has retained references", "file_id", file.ID)
+		return
+	}
+
+	if err := w.storage.DeleteObject(ctx, storage.DeleteObjectInput{
+		Bucket:    file.Bucket,
+		ObjectKey: file.ObjectKey,
+	}); err != nil {
+		w.logger.Error("AI parse source object delete failed", "file_id", file.ID, "error", err)
+		return
+	}
+	if err := w.repos.Files.SoftDelete(ctx, file.ID); err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return
+		}
+		w.logger.Error("AI parse source metadata soft delete failed", "file_id", file.ID, "error", err)
+	}
+}
+
 func (w *ProcessingWorker) readObjectBytesLimited(ctx context.Context, file repository.File, maxBytes int64) ([]byte, error) {
 	reader, err := w.storage.GetObject(ctx, storage.GetObjectInput{
 		Bucket:    file.Bucket,
@@ -736,6 +770,18 @@ func videoCoverObjectKey(sourceObjectKey string) string {
 		dir = "variants"
 	}
 	return strings.TrimRight(dir, "/") + "/video_cover_512.jpg"
+}
+
+func shouldDeleteAIParseSource(uploadedFiles []repository.AIUploadedFile) bool {
+	if len(uploadedFiles) == 0 {
+		return false
+	}
+	for _, uploadedFile := range uploadedFiles {
+		if uploadedFile.RetentionPolicy == nil || strings.TrimSpace(*uploadedFile.RetentionPolicy) != "source_deleted_after_parse" {
+			return false
+		}
+	}
+	return true
 }
 
 func extractAIText(file repository.File, data []byte) (string, error) {

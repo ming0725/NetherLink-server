@@ -17,7 +17,7 @@ docker compose up -d postgres redis
 docker compose ps
 ```
 
-The API server reads the same `NETHERLINK_POSTGRES_*` variables:
+The API server reads the same `NETHERLINK_POSTGRES_*` variables from the same local `.env` file:
 
 ```sh
 set -a

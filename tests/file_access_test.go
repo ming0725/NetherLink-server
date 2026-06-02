@@ -45,6 +45,23 @@ func TestFileAccessBusinessReferences(t *testing.T) {
 	assertFileAccess(t, repos, userOutsider, filePublicPostCover, true, "public post exposes cover media")
 }
 
+func TestAIParseSourceDeleteEligibility(t *testing.T) {
+	pool := newPostgresIntegrationPool(t)
+	repos := repository.New(pool)
+	ctx := context.Background()
+
+	seedAIParseSourceRetentionFixtures(t, pool)
+
+	assertAIParseSourceDeleteAllowed(t, repos, aiSourceDeleteFile, true, "source_deleted_after_parse-only AI source can be deleted")
+	assertAIParseSourceDeleteAllowed(t, repos, aiConversationRetainedFile, false, "default conversation retention keeps AI source")
+	assertAIParseSourceDeleteAllowed(t, repos, aiSharedChatFile, false, "non-AI business references keep AI source")
+
+	if err := repos.Files.SoftDelete(ctx, aiSourceDeleteFile); err != nil {
+		t.Fatalf("soft delete AI source: %v", err)
+	}
+	assertAIParseSourceDeleteAllowed(t, repos, aiSourceDeleteFile, false, "already deleted source is not eligible")
+}
+
 func newPostgresIntegrationPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
@@ -126,6 +143,18 @@ func assertFileAccess(t *testing.T, repos repository.Repositories, userID string
 	}
 }
 
+func assertAIParseSourceDeleteAllowed(t *testing.T, repos repository.Repositories, fileID string, want bool, label string) {
+	t.Helper()
+
+	got, err := repos.Files.CanDeleteAIParseSourceAfterParse(context.Background(), fileID)
+	if err != nil {
+		t.Fatalf("%s: CanDeleteAIParseSourceAfterParse() error = %v", label, err)
+	}
+	if got != want {
+		t.Fatalf("%s: allowed = %v, want %v", label, got, want)
+	}
+}
+
 func seedFileAccessFixtures(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 
@@ -191,6 +220,56 @@ func seedFileAccessFixtures(t *testing.T, pool *pgxpool.Pool) {
 	}
 }
 
+func seedAIParseSourceRetentionFixtures(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+
+	ctx := context.Background()
+	_, err := pool.Exec(ctx, `
+		INSERT INTO users (id, public_id, email, password_hash, nick)
+		VALUES ($1::uuid, 'ai_owner', 'ai-owner@example.test', 'hash', 'AI Owner');
+
+		INSERT INTO files (id, owner_user_id, original_file_name, bucket, object_key, mime_type, size_bytes, storage_status, visibility)
+		VALUES
+		  ($2::uuid, $1::uuid, 'delete-me.txt', 'netherlink-private', 'delete-me.txt', 'text/plain', 10, 'ready', 'private'),
+		  ($3::uuid, $1::uuid, 'keep-me.txt', 'netherlink-private', 'keep-me.txt', 'text/plain', 10, 'ready', 'private'),
+		  ($4::uuid, $1::uuid, 'shared.txt', 'netherlink-private', 'shared.txt', 'text/plain', 10, 'ready', 'private');
+
+		INSERT INTO ai_conversations (id, user_id, title)
+		VALUES ($5::uuid, $1::uuid, 'AI');
+		INSERT INTO ai_uploaded_files (id, conversation_id, file_id, purpose, parse_status, retention_policy)
+		VALUES
+		  ($6::uuid, $5::uuid, $2::uuid, 'reference', 'ready', 'source_deleted_after_parse'),
+		  ($7::uuid, $5::uuid, $3::uuid, 'reference', 'ready', 'conversation'),
+		  ($8::uuid, $5::uuid, $4::uuid, 'reference', 'ready', 'source_deleted_after_parse');
+		INSERT INTO file_usages (file_id, usage_type, business_id, owner_user_id, visibility)
+		VALUES
+		  ($2::uuid, 'ai_upload', $6::uuid, $1::uuid, 'private'),
+		  ($3::uuid, 'ai_upload', $7::uuid, $1::uuid, 'private'),
+		  ($4::uuid, 'ai_upload', $8::uuid, $1::uuid, 'private');
+
+		INSERT INTO conversations (id, type)
+		VALUES ($9::uuid, 'direct');
+		INSERT INTO messages (id, conversation_id, sender_id, message_seq, type, client_message_id)
+		VALUES ($10::uuid, $9::uuid, $1::uuid, 1, 'file', 'client-shared-ai-source');
+		INSERT INTO message_attachments (message_id, file_id, display_name)
+		VALUES ($10::uuid, $4::uuid, 'shared.txt');
+		`,
+		aiOwnerID,
+		aiSourceDeleteFile,
+		aiConversationRetainedFile,
+		aiSharedChatFile,
+		aiConversationID,
+		aiSourceDeleteUploadID,
+		aiConversationRetainedUploadID,
+		aiSharedChatUploadID,
+		aiSharedConversationID,
+		aiSharedMessageID,
+	)
+	if err != nil {
+		t.Fatalf("seed AI parse source retention fixtures: %v", err)
+	}
+}
+
 const (
 	userOwner    = "00000000-0000-0000-0000-000000000001"
 	userMember   = "00000000-0000-0000-0000-000000000002"
@@ -210,4 +289,15 @@ const (
 	publicPostID       = "40000000-0000-0000-0000-000000000002"
 	privatePostMediaID = "50000000-0000-0000-0000-000000000001"
 	publicPostMediaID  = "50000000-0000-0000-0000-000000000002"
+
+	aiOwnerID                      = "60000000-0000-0000-0000-000000000001"
+	aiSourceDeleteFile             = "61000000-0000-0000-0000-000000000001"
+	aiConversationRetainedFile     = "61000000-0000-0000-0000-000000000002"
+	aiSharedChatFile               = "61000000-0000-0000-0000-000000000003"
+	aiConversationID               = "62000000-0000-0000-0000-000000000001"
+	aiSourceDeleteUploadID         = "63000000-0000-0000-0000-000000000001"
+	aiConversationRetainedUploadID = "63000000-0000-0000-0000-000000000002"
+	aiSharedChatUploadID           = "63000000-0000-0000-0000-000000000003"
+	aiSharedConversationID         = "64000000-0000-0000-0000-000000000001"
+	aiSharedMessageID              = "64000000-0000-0000-0000-000000000002"
 )
