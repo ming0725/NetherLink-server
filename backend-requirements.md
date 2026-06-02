@@ -4,9 +4,9 @@
 
 ## 0. 当前实现状态
 
-当前代码库已完成后端基础骨架：正式环境配置校验、PostgreSQL 连接池、Redis 客户端基础设施、users / user_preferences / user_sessions / friends / groups repository、数据库 schema 初始化、MinIO bucket 初始化脚本、对象存储接口定义、HTTP 服务、`GET /healthz`、`GET /readyz`、`GET /api/v1`、请求 ID、panic recovery、结构化访问日志、JSON 404/405、JSON 请求体解析辅助函数，以及 Bearer access token 校验。
+当前代码库已完成后端基础骨架：正式环境配置校验、PostgreSQL 连接池、Redis 客户端基础设施、users / user_preferences / user_sessions / files / chat / friends / groups / operation_receipts repository、repository 聚合构造、事务辅助函数、应用 runtime 依赖组装、数据库 schema 初始化、MinIO bucket 初始化脚本、对象存储接口定义、MinIO/S3 provider、HTTP 服务、可注入 server dependencies、`GET /healthz`、`GET /readyz`、`GET /api/v1`、请求 ID、panic recovery、结构化访问日志、JSON 404/405、JSON 请求体解析辅助函数，以及 Bearer access token 校验。
 
-已实现 P0 Auth：注册、登录、refresh token 轮换、登出、`GET /auth/sessions`、`POST /auth/sessions/{sessionId}/revoke`、`GET /me`、`PATCH /me`、`GET /me/user-id/check`、`PATCH /me/user-id`、`GET /me/preferences`、`PATCH /me/preferences`、密码哈希、access token 签名与校验、refresh token hash 存储、公开 ID 格式校验、公开 ID 修改历史和 30 天冷却。已实现用户/好友/群只读 API：`GET /users`、`GET /users/{userUuid}`、`GET /users/by-id/{userId}`、`POST /users/batch`、`GET /friends`、`GET /friend-groups`、`GET /groups`、`GET /groups/{groupId}`、`GET /groups/{groupId}/members`。尚未实现 MinIO SDK provider、文件处理 worker、好友/群写接口、聊天/帖子/AI API、WebSocket 和实时事件。
+已实现 P0 Auth：注册、登录、refresh token 轮换、登出、`GET /auth/sessions`、`POST /auth/sessions/{sessionId}/revoke`、`GET /me`、`PATCH /me`、`GET /me/user-id/check`、`PATCH /me/user-id`、`GET /me/preferences`、`PATCH /me/preferences`、密码哈希、access token 签名与校验、refresh token hash 存储、公开 ID 格式校验、公开 ID 修改历史和 30 天冷却。已实现用户/好友/群 API：`GET /users`、`GET /users/{userUuid}`、`GET /users/by-id/{userId}`、`POST /users/batch`、`GET /friends`、`PATCH /friends/{friendUserUuid}`、`DELETE /friends/{friendUserUuid}`、`GET /friend-groups`、`POST /friend-groups`、`POST /friend-requests`、`GET /friend-requests`、`POST /friend-requests/{requestId}/accept`、`POST /friend-requests/{requestId}/reject`、`GET /groups`、`GET /groups/{groupId}`、`GET /groups/{groupId}/members`。已实现文件上传会话 API：创建上传会话、查询上传状态、分片 URL 签发、完成上传、取消上传。已实现 Chat 的 `POST /conversations/{conversationId}/messages` 和 `GET /conversations/{conversationId}/messages`，图片附件要求并返回 `width` / `height`，供前端预览占位。尚未实现文件处理 worker、会话创建/设置/已读未读/撤回/清空、群写接口、帖子/AI API、WebSocket 和实时事件。
 
 Redis 当前仅用于 auth 登录/注册限流，key 命名空间为 `nl:rate:auth:*` 且带 TTL；后续仍只允许用于短时验证码或流程状态、WebSocket 在线状态、事件扇出和 token/session 加速。PostgreSQL 仍然是用户、refresh token 会话、偏好、消息、通知和文件元数据等持久业务数据的权威来源。
 
@@ -158,8 +158,8 @@ Redis 当前仅用于 auth 登录/注册限流，key 命名空间为 `nl:rate:au
 | PATCH | `/conversations/{conversationId}/settings` | `isPinned`, `isDnd`, `hidden` | `ConversationSyncState` | 置顶、免打扰、移除会话。 |
 | POST | `/conversations/{conversationId}/read` | `lastReadMessageId`, `lastReadAt?` | `ConversationSyncState`，`unreadCount=0` | 标记已读；服务端按 `lastReadMessageId` 对齐。 |
 | POST | `/conversations/{conversationId}/unread` | `lastReadMessageId?`, `unreadCount?` | `ConversationSyncState` | 手动标未读。 |
-| GET | `/conversations/{conversationId}/messages` | `beforeMessageId?`, `afterMessageId?`, `aroundMessageId?`, `beforeMessageSeq?`, `afterMessageSeq?`, `limit` | `messages[]`, `hasMoreBefore`, `hasMoreAfter`, `syncCursor` | 历史消息分页、断线补偿和定位引用消息。 |
-| POST | `/conversations/{conversationId}/messages` | `clientMessageId`, `clientSentAt?`, `type`, `content`, `attachments`, `referencedMessageId` | `message` | 发送消息；服务端落库后分配 `messageSeq` 和服务端时间。 |
+| GET | `/conversations/{conversationId}/messages` | `beforeMessageId?`, `afterMessageId?`, `aroundMessageId?`, `beforeMessageSeq?`, `afterMessageSeq?`, `limit` | `messages[]`, `hasMoreBefore`, `hasMoreAfter`, `syncCursor` | 历史消息分页、断线补偿和定位引用消息；当前实现支持 `beforeMessageSeq` / `afterMessageSeq`。 |
+| POST | `/conversations/{conversationId}/messages` | `clientMessageId`, `clientSentAt?`, `type`, `content`, `attachments`, `referencedMessageId` | `message` | 发送消息；服务端落库后分配 `messageSeq` 和服务端时间；图片附件必须带 `width` / `height`。 |
 | POST | `/conversations/{conversationId}/messages/{messageId}/recall` | - | `message` | 撤回消息。 |
 | DELETE | `/conversations/{conversationId}/messages` | - | `ok` | 清空当前用户视角的会话记录或隐藏会话历史。 |
 
@@ -169,6 +169,7 @@ Redis 当前仅用于 auth 登录/注册限流，key 命名空间为 `nl:rate:au
 - 消息完整历史以后端为准。服务端必须保证同一会话内 `message_seq` 单调递增，并支持通过 `messageSeq` / `messageId` 补齐缺口。
 - WebSocket 正常在线时推送 `chat.message.created`；断线恢复优先用 `lastEventId` 补事件，超出事件保留窗口时返回 `sync.required`，调用方再用 REST 分页补偿。
 - 消息正式时间以后端接收、校验、幂等去重并成功落库后的时间为准。`clientSentAt` 只用于诊断和排查，不参与最终排序和未读计算。
+- 图片、视频等媒体消息的附件宽高保存在 `message_attachments.width` / `message_attachments.height`。发送图片消息时服务端要求客户端提供正数宽高；后续文件处理 worker 可通过解析 MinIO 对象回填或校正这些字段，并生成 `file_variants` 缩略图。
 
 ### 3.6 Post / Comment
 

@@ -64,6 +64,7 @@ type StorageBuckets struct {
 
 func Load() (Config, error) {
 	var validationErrors []string
+	storageEndpoint := getEnv("NETHERLINK_OBJECT_STORAGE_ENDPOINT", "http://localhost:9000")
 
 	cfg := Config{
 		Env: getEnv("NETHERLINK_ENV", "local"),
@@ -92,8 +93,8 @@ func Load() (Config, error) {
 		},
 		Storage: StorageConfig{
 			Provider:         getEnv("NETHERLINK_OBJECT_STORAGE_PROVIDER", "minio"),
-			Endpoint:         getEnv("NETHERLINK_OBJECT_STORAGE_ENDPOINT", "http://localhost:9000"),
-			InternalEndpoint: getEnv("NETHERLINK_OBJECT_STORAGE_INTERNAL_ENDPOINT", "http://minio:9000"),
+			Endpoint:         storageEndpoint,
+			InternalEndpoint: getEnv("NETHERLINK_OBJECT_STORAGE_INTERNAL_ENDPOINT", storageEndpoint),
 			AccessKey:        requiredEnv(&validationErrors, "NETHERLINK_OBJECT_STORAGE_ACCESS_KEY"),
 			SecretKey:        requiredEnv(&validationErrors, "NETHERLINK_OBJECT_STORAGE_SECRET_KEY"),
 			UseSSL:           getEnvBool(&validationErrors, "NETHERLINK_OBJECT_STORAGE_USE_SSL", false),

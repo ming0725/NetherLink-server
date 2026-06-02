@@ -5,9 +5,9 @@ import (
 	"log/slog"
 	"os"
 
+	"nlserver/internal/app"
 	"nlserver/internal/cache"
 	"nlserver/internal/config"
-	"nlserver/internal/database"
 	"nlserver/internal/server"
 )
 
@@ -19,15 +19,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	db, err := database.OpenPostgres(context.Background(), cfg.Postgres)
+	runtime, err := app.NewRuntime(context.Background(), cfg, logger)
 	if err != nil {
-		logger.Error("failed to configure postgres connection pool", "error", err)
+		logger.Error("failed to initialize runtime", "error", err)
 		os.Exit(1)
 	}
-	defer db.Close()
-
-	redisClient := cache.NewRedisClient(cfg.Redis)
-	defer redisClient.Close()
+	defer runtime.Close()
 
 	logger.Info("nlserver starting",
 		"env", cfg.Env,
@@ -37,7 +34,18 @@ func main() {
 		"minio_endpoint", cfg.Storage.Endpoint,
 	)
 
-	if err := server.New(cfg, db, redisClient, logger).ListenAndServe(); err != nil {
+	if err := server.NewWithDependencies(server.Dependencies{
+		Config:        runtime.Config,
+		DB:            runtime.DB,
+		Redis:         runtime.Redis,
+		Repos:         runtime.Repos,
+		AuthService:   runtime.AuthService,
+		ChatService:   runtime.ChatService,
+		FileService:   runtime.FileService,
+		FriendService: runtime.FriendService,
+		Storage:       runtime.StorageProvider,
+		Logger:        runtime.Logger,
+	}).ListenAndServe(); err != nil {
 		logger.Error("nlserver stopped with error", "error", err)
 		os.Exit(1)
 	}

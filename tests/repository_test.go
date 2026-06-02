@@ -18,10 +18,19 @@ func TestRepositoryAggregateConstructor(t *testing.T) {
 	if repositories.Sessions == nil {
 		t.Fatal("Sessions repository is nil")
 	}
+	if repositories.Files == nil {
+		t.Fatal("Files repository is nil")
+	}
+	if repositories.Chat == nil {
+		t.Fatal("Chat repository is nil")
+	}
 	if repositories.Friends == nil {
 		t.Fatal("Friends repository is nil")
 	}
 	if repositories.Groups == nil {
 		t.Fatal("Groups repository is nil")
+	}
+	if repositories.OperationReceipts == nil {
+		t.Fatal("OperationReceipts repository is nil")
 	}
 }

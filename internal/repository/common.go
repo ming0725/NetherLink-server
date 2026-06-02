@@ -23,20 +23,26 @@ type DBTX interface {
 }
 
 type Repositories struct {
-	Users       *UserRepository
-	Preferences *UserPreferenceRepository
-	Sessions    *UserSessionRepository
-	Friends     *FriendRepository
-	Groups      *GroupRepository
+	Users             *UserRepository
+	Preferences       *UserPreferenceRepository
+	Sessions          *UserSessionRepository
+	Files             *FileRepository
+	Chat              *ChatRepository
+	Friends           *FriendRepository
+	Groups            *GroupRepository
+	OperationReceipts *OperationReceiptRepository
 }
 
 func New(db DBTX) Repositories {
 	return Repositories{
-		Users:       NewUserRepository(db),
-		Preferences: NewUserPreferenceRepository(db),
-		Sessions:    NewUserSessionRepository(db),
-		Friends:     NewFriendRepository(db),
-		Groups:      NewGroupRepository(db),
+		Users:             NewUserRepository(db),
+		Preferences:       NewUserPreferenceRepository(db),
+		Sessions:          NewUserSessionRepository(db),
+		Files:             NewFileRepository(db),
+		Chat:              NewChatRepository(db),
+		Friends:           NewFriendRepository(db),
+		Groups:            NewGroupRepository(db),
+		OperationReceipts: NewOperationReceiptRepository(db),
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	friendsvc "nlserver/internal/friend"
 	"nlserver/internal/repository"
 )
 
@@ -13,6 +14,30 @@ const maxBatchUsers = 100
 
 type batchUsersRequest struct {
 	UserUUIDs []string `json:"userUuids"`
+}
+
+type createFriendGroupRequest struct {
+	Name      string `json:"name"`
+	SortOrder int    `json:"sortOrder"`
+}
+
+type patchFriendRequest struct {
+	Remark  *string `json:"remark"`
+	GroupID *string `json:"groupId"`
+	IsDND   *bool   `json:"isDnd"`
+}
+
+type createFriendRequestRequest struct {
+	ToUserUUID       string  `json:"toUserUuid"`
+	Message          *string `json:"message"`
+	SourceType       *string `json:"sourceType"`
+	SourceGroupID    *string `json:"sourceGroupId"`
+	SourceFriendUUID *string `json:"sourceFriendUuid"`
+}
+
+type acceptFriendRequestRequest struct {
+	Remark  *string `json:"remark"`
+	GroupID *string `json:"groupId"`
 }
 
 type usersListResponse struct {
@@ -41,6 +66,10 @@ type friendGroupsResponse struct {
 	Groups []friendGroupResponse `json:"groups"`
 }
 
+type friendGroupDetailResponse struct {
+	Group friendGroupResponse `json:"group"`
+}
+
 type friendGroupResponse struct {
 	GroupID   string    `json:"groupId"`
 	Name      string    `json:"name"`
@@ -54,6 +83,10 @@ type friendsResponse struct {
 	Total   int              `json:"total"`
 }
 
+type friendshipResponse struct {
+	Friendship friendResponse `json:"friendship"`
+}
+
 type friendResponse struct {
 	User          userResponse `json:"user"`
 	Remark        *string      `json:"remark"`
@@ -62,6 +95,30 @@ type friendResponse struct {
 	Version       int          `json:"version"`
 	CreatedAt     time.Time    `json:"createdAt"`
 	UpdatedAt     time.Time    `json:"updatedAt"`
+}
+
+type friendRequestsResponse struct {
+	Requests    []friendRequestResponse `json:"requests"`
+	Total       int                     `json:"total"`
+	UnreadCount int                     `json:"unreadCount"`
+}
+
+type friendRequestDetailResponse struct {
+	Request friendRequestResponse `json:"request"`
+}
+
+type friendRequestResponse struct {
+	RequestID      string       `json:"requestId"`
+	FromUser       userResponse `json:"fromUser"`
+	ToUser         userResponse `json:"toUser"`
+	Message        *string      `json:"message"`
+	SourceType     *string      `json:"sourceType"`
+	SourceGroupID  *string      `json:"sourceGroupId"`
+	SourceFriendID *string      `json:"sourceFriendUuid"`
+	Status         string       `json:"status"`
+	HandledAt      *time.Time   `json:"handledAt"`
+	CreatedAt      time.Time    `json:"createdAt"`
+	UpdatedAt      time.Time    `json:"updatedAt"`
 }
 
 type groupsResponse struct {
@@ -224,6 +281,35 @@ func (s *Server) handleFriendGroups(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, friendGroupsResponse{Groups: makeFriendGroupResponses(groups)})
 }
 
+func (s *Server) handleCreateFriendGroup(w http.ResponseWriter, r *http.Request) {
+	if !s.requireFriendService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	var req createFriendGroupRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+
+	group, err := s.friendService.CreateGroup(r.Context(), friendsvc.CreateGroupInput{
+		UserID:    principal.UserID,
+		Name:      req.Name,
+		SortOrder: req.SortOrder,
+	})
+	if err != nil {
+		writeFriendServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, friendGroupDetailResponse{Group: makeFriendGroupResponse(group)})
+}
+
 func (s *Server) handleFriends(w http.ResponseWriter, r *http.Request) {
 	principal, ok := authPrincipalFromContext(r.Context())
 	if !ok {
@@ -255,6 +341,224 @@ func (s *Server) handleFriends(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, friendsResponse{Friends: makeFriendResponses(friends), Total: total})
+}
+
+func (s *Server) handlePatchFriend(w http.ResponseWriter, r *http.Request) {
+	if !s.requireFriendService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	friendUserID := r.PathValue("friendUserUuid")
+	if reqErr := validateUUID(friendUserID, "friendUserUuid"); reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+
+	var req patchFriendRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	if req.GroupID != nil {
+		if reqErr := validateOptionalUUID(*req.GroupID, "groupId"); reqErr != nil {
+			writeRequestError(w, r, reqErr)
+			return
+		}
+	}
+
+	friend, err := s.friendService.UpdateFriend(r.Context(), friendsvc.UpdateFriendInput{
+		UserID:       principal.UserID,
+		FriendUserID: friendUserID,
+		RemarkSet:    req.Remark != nil,
+		Remark:       req.Remark,
+		GroupIDSet:   req.GroupID != nil,
+		GroupID:      req.GroupID,
+		IsDND:        req.IsDND,
+	})
+	if err != nil {
+		writeFriendServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, friendshipResponse{Friendship: makeFriendResponse(friend)})
+}
+
+func (s *Server) handleDeleteFriend(w http.ResponseWriter, r *http.Request) {
+	if !s.requireFriendService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	friendUserID := r.PathValue("friendUserUuid")
+	if reqErr := validateUUID(friendUserID, "friendUserUuid"); reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+
+	if err := s.friendService.DeleteFriend(r.Context(), principal.UserID, friendUserID); err != nil {
+		writeFriendServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleCreateFriendRequest(w http.ResponseWriter, r *http.Request) {
+	if !s.requireFriendService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	var req createFriendRequestRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	if reqErr := validateUUID(req.ToUserUUID, "toUserUuid"); reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+	if req.SourceGroupID != nil {
+		if reqErr := validateOptionalUUID(*req.SourceGroupID, "sourceGroupId"); reqErr != nil {
+			writeRequestError(w, r, reqErr)
+			return
+		}
+	}
+	if req.SourceFriendUUID != nil {
+		if reqErr := validateOptionalUUID(*req.SourceFriendUUID, "sourceFriendUuid"); reqErr != nil {
+			writeRequestError(w, r, reqErr)
+			return
+		}
+	}
+
+	request, err := s.friendService.CreateRequest(r.Context(), friendsvc.CreateRequestInput{
+		FromUserID:     principal.UserID,
+		ToUserID:       req.ToUserUUID,
+		Message:        req.Message,
+		SourceType:     req.SourceType,
+		SourceGroupID:  req.SourceGroupID,
+		SourceFriendID: req.SourceFriendUUID,
+	})
+	if err != nil {
+		writeFriendServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, friendRequestDetailResponse{Request: makeFriendRequestResponse(request)})
+}
+
+func (s *Server) handleFriendRequests(w http.ResponseWriter, r *http.Request) {
+	if !s.requireFriendService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	limit, offset, reqErr := parsePagination(r)
+	if reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+
+	requests, total, unread, err := s.friendService.ListRequests(r.Context(), friendsvc.ListRequestsInput{
+		UserID: principal.UserID,
+		Status: r.URL.Query().Get("status"),
+		Limit:  limit,
+		Offset: offset,
+	})
+	if err != nil {
+		writeFriendServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, friendRequestsResponse{
+		Requests:    makeFriendRequestResponses(requests),
+		Total:       total,
+		UnreadCount: unread,
+	})
+}
+
+func (s *Server) handleAcceptFriendRequest(w http.ResponseWriter, r *http.Request) {
+	if !s.requireFriendService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	requestID := r.PathValue("requestId")
+	if reqErr := validateUUID(requestID, "requestId"); reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+
+	var req acceptFriendRequestRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	if req.GroupID != nil {
+		if reqErr := validateOptionalUUID(*req.GroupID, "groupId"); reqErr != nil {
+			writeRequestError(w, r, reqErr)
+			return
+		}
+	}
+
+	friend, err := s.friendService.AcceptRequest(r.Context(), friendsvc.AcceptRequestInput{
+		UserID:    principal.UserID,
+		RequestID: requestID,
+		Remark:    req.Remark,
+		GroupID:   req.GroupID,
+	})
+	if err != nil {
+		writeFriendServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, friendshipResponse{Friendship: makeFriendResponse(friend)})
+}
+
+func (s *Server) handleRejectFriendRequest(w http.ResponseWriter, r *http.Request) {
+	if !s.requireFriendService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	requestID := r.PathValue("requestId")
+	if reqErr := validateUUID(requestID, "requestId"); reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+
+	request, err := s.friendService.RejectRequest(r.Context(), principal.UserID, requestID)
+	if err != nil {
+		writeFriendServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, friendRequestDetailResponse{Request: makeFriendRequestResponse(request)})
 }
 
 func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
@@ -393,31 +697,63 @@ func makePublicUserResponses(users []repository.User) []userResponse {
 func makeFriendGroupResponses(groups []repository.FriendGroup) []friendGroupResponse {
 	responses := make([]friendGroupResponse, 0, len(groups))
 	for _, group := range groups {
-		responses = append(responses, friendGroupResponse{
-			GroupID:   group.ID,
-			Name:      group.Name,
-			SortOrder: group.SortOrder,
-			CreatedAt: group.CreatedAt,
-			UpdatedAt: group.UpdatedAt,
-		})
+		responses = append(responses, makeFriendGroupResponse(group))
 	}
 	return responses
+}
+
+func makeFriendGroupResponse(group repository.FriendGroup) friendGroupResponse {
+	return friendGroupResponse{
+		GroupID:   group.ID,
+		Name:      group.Name,
+		SortOrder: group.SortOrder,
+		CreatedAt: group.CreatedAt,
+		UpdatedAt: group.UpdatedAt,
+	}
 }
 
 func makeFriendResponses(friends []repository.Friend) []friendResponse {
 	responses := make([]friendResponse, 0, len(friends))
 	for _, friend := range friends {
-		responses = append(responses, friendResponse{
-			User:          makePublicUserResponse(friend.User),
-			Remark:        friend.Remark,
-			FriendGroupID: friend.FriendGroupID,
-			IsDND:         friend.IsDND,
-			Version:       friend.Version,
-			CreatedAt:     friend.CreatedAt,
-			UpdatedAt:     friend.UpdatedAt,
-		})
+		responses = append(responses, makeFriendResponse(friend))
 	}
 	return responses
+}
+
+func makeFriendResponse(friend repository.Friend) friendResponse {
+	return friendResponse{
+		User:          makePublicUserResponse(friend.User),
+		Remark:        friend.Remark,
+		FriendGroupID: friend.FriendGroupID,
+		IsDND:         friend.IsDND,
+		Version:       friend.Version,
+		CreatedAt:     friend.CreatedAt,
+		UpdatedAt:     friend.UpdatedAt,
+	}
+}
+
+func makeFriendRequestResponses(requests []repository.FriendRequest) []friendRequestResponse {
+	responses := make([]friendRequestResponse, 0, len(requests))
+	for _, request := range requests {
+		responses = append(responses, makeFriendRequestResponse(request))
+	}
+	return responses
+}
+
+func makeFriendRequestResponse(request repository.FriendRequest) friendRequestResponse {
+	return friendRequestResponse{
+		RequestID:      request.ID,
+		FromUser:       makePublicUserResponse(request.FromUser),
+		ToUser:         makePublicUserResponse(request.ToUser),
+		Message:        request.Message,
+		SourceType:     request.SourceType,
+		SourceGroupID:  request.SourceGroupID,
+		SourceFriendID: request.SourceFriendID,
+		Status:         request.Status,
+		HandledAt:      request.HandledAt,
+		CreatedAt:      request.CreatedAt,
+		UpdatedAt:      request.UpdatedAt,
+	}
 }
 
 func makeGroupResponses(groups []repository.GroupListEntry) []groupResponse {
@@ -465,4 +801,29 @@ func makeGroupMemberResponses(members []repository.GroupMember) []groupMemberRes
 		})
 	}
 	return responses
+}
+
+func (s *Server) requireFriendService(w http.ResponseWriter, r *http.Request) bool {
+	if s.friendService != nil {
+		return true
+	}
+	writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "Friend service is not configured")
+	return false
+}
+
+func writeFriendServiceError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, friendsvc.ErrValidation):
+		writeError(w, r, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid friend request")
+	case errors.Is(err, friendsvc.ErrConflict):
+		writeError(w, r, http.StatusConflict, "CONFLICT", "Friend resource conflict")
+	case errors.Is(err, friendsvc.ErrForbidden):
+		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Forbidden")
+	case errors.Is(err, friendsvc.ErrUnavailable):
+		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "Friend service is not ready")
+	case errors.Is(err, repository.ErrNotFound):
+		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "Resource not found")
+	default:
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error")
+	}
 }

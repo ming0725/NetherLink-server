@@ -118,6 +118,7 @@ CREATE TABLE file_usages (
 CREATE TABLE file_upload_sessions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  file_id UUID NOT NULL REFERENCES files(id) ON DELETE CASCADE,
   target_type TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'created',
   upload_mode TEXT NOT NULL DEFAULT 'auto',

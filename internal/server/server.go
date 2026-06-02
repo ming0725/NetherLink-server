@@ -11,30 +11,87 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	authsvc "nlserver/internal/auth"
+	chatsvc "nlserver/internal/chat"
 	"nlserver/internal/config"
+	filesvc "nlserver/internal/files"
+	friendsvc "nlserver/internal/friend"
 	"nlserver/internal/repository"
+	"nlserver/internal/storage"
 )
 
 type Server struct {
-	cfg         config.Config
-	db          *pgxpool.Pool
-	redis       *redis.Client
-	repos       repository.Repositories
-	authService *authsvc.Service
-	logger      *slog.Logger
-	handler     http.Handler
+	cfg           config.Config
+	db            *pgxpool.Pool
+	redis         *redis.Client
+	repos         repository.Repositories
+	authService   *authsvc.Service
+	chatService   *chatsvc.Service
+	fileService   *filesvc.Service
+	friendService *friendsvc.Service
+	storage       storage.ObjectStorageProvider
+	logger        *slog.Logger
+	handler       http.Handler
+}
+
+type Dependencies struct {
+	Config        config.Config
+	DB            *pgxpool.Pool
+	Redis         *redis.Client
+	Repos         repository.Repositories
+	AuthService   *authsvc.Service
+	ChatService   *chatsvc.Service
+	FileService   *filesvc.Service
+	FriendService *friendsvc.Service
+	Storage       storage.ObjectStorageProvider
+	Logger        *slog.Logger
 }
 
 func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client, logger *slog.Logger) *Server {
-	server := &Server{
-		cfg:    cfg,
-		db:     db,
-		redis:  redisClient,
-		logger: logger,
+	deps := Dependencies{
+		Config: cfg,
+		DB:     db,
+		Redis:  redisClient,
+		Logger: logger,
 	}
 	if db != nil {
-		server.repos = repository.New(db)
-		server.authService = authsvc.NewService(cfg.Auth, server.repos)
+		deps.Repos = repository.New(db)
+		deps.AuthService = authsvc.NewService(cfg.Auth, deps.Repos)
+	}
+
+	return NewWithDependencies(deps)
+}
+
+func NewWithDependencies(deps Dependencies) *Server {
+	if deps.Logger == nil {
+		deps.Logger = slog.Default()
+	}
+	if !repositoriesConfigured(deps.Repos) && deps.DB != nil {
+		deps.Repos = repository.New(deps.DB)
+	}
+	if deps.AuthService == nil && deps.Repos.Users != nil && deps.Repos.Sessions != nil {
+		deps.AuthService = authsvc.NewService(deps.Config.Auth, deps.Repos)
+	}
+	if deps.ChatService == nil && deps.Repos.Chat != nil {
+		deps.ChatService = chatsvc.NewService(deps.Repos, deps.DB)
+	}
+	if deps.FriendService == nil && deps.Repos.Users != nil && deps.Repos.Friends != nil {
+		deps.FriendService = friendsvc.NewService(deps.Repos, deps.DB)
+	}
+	if deps.FileService == nil && deps.Repos.Files != nil {
+		deps.FileService = filesvc.NewService(deps.Config.Storage, deps.Repos, deps.DB, deps.Storage)
+	}
+
+	server := &Server{
+		cfg:           deps.Config,
+		db:            deps.DB,
+		redis:         deps.Redis,
+		repos:         deps.Repos,
+		authService:   deps.AuthService,
+		chatService:   deps.ChatService,
+		fileService:   deps.FileService,
+		friendService: deps.FriendService,
+		storage:       deps.Storage,
+		logger:        deps.Logger,
 	}
 
 	mux := http.NewServeMux()
@@ -42,6 +99,17 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client, logger 
 
 	server.handler = withRequestID(server.withAccessLog(server.withRecover(withJSONFallbacks(mux))))
 	return server
+}
+
+func repositoriesConfigured(repos repository.Repositories) bool {
+	return repos.Users != nil ||
+		repos.Preferences != nil ||
+		repos.Sessions != nil ||
+		repos.Files != nil ||
+		repos.Chat != nil ||
+		repos.Friends != nil ||
+		repos.Groups != nil ||
+		repos.OperationReceipts != nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -89,10 +157,24 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /api/v1/users/{userUuid}", s.withAuthRequired(http.HandlerFunc(s.handleUserByUUID)))
 	mux.Handle("POST /api/v1/users/batch", s.withAuthRequired(http.HandlerFunc(s.handleUsersBatch)))
 	mux.Handle("GET /api/v1/friends", s.withAuthRequired(http.HandlerFunc(s.handleFriends)))
+	mux.Handle("PATCH /api/v1/friends/{friendUserUuid}", s.withAuthRequired(http.HandlerFunc(s.handlePatchFriend)))
+	mux.Handle("DELETE /api/v1/friends/{friendUserUuid}", s.withAuthRequired(http.HandlerFunc(s.handleDeleteFriend)))
 	mux.Handle("GET /api/v1/friend-groups", s.withAuthRequired(http.HandlerFunc(s.handleFriendGroups)))
+	mux.Handle("POST /api/v1/friend-groups", s.withAuthRequired(http.HandlerFunc(s.handleCreateFriendGroup)))
+	mux.Handle("POST /api/v1/friend-requests", s.withAuthRequired(http.HandlerFunc(s.handleCreateFriendRequest)))
+	mux.Handle("GET /api/v1/friend-requests", s.withAuthRequired(http.HandlerFunc(s.handleFriendRequests)))
+	mux.Handle("POST /api/v1/friend-requests/{requestId}/accept", s.withAuthRequired(http.HandlerFunc(s.handleAcceptFriendRequest)))
+	mux.Handle("POST /api/v1/friend-requests/{requestId}/reject", s.withAuthRequired(http.HandlerFunc(s.handleRejectFriendRequest)))
 	mux.Handle("GET /api/v1/groups", s.withAuthRequired(http.HandlerFunc(s.handleGroups)))
 	mux.Handle("GET /api/v1/groups/{groupId}", s.withAuthRequired(http.HandlerFunc(s.handleGroupDetail)))
 	mux.Handle("GET /api/v1/groups/{groupId}/members", s.withAuthRequired(http.HandlerFunc(s.handleGroupMembers)))
+	mux.Handle("POST /api/v1/files/upload-session", s.withAuthRequired(http.HandlerFunc(s.handleCreateUploadSession)))
+	mux.Handle("GET /api/v1/files/upload-session/{uploadSessionId}", s.withAuthRequired(http.HandlerFunc(s.handleGetUploadSession)))
+	mux.Handle("POST /api/v1/files/upload-session/{uploadSessionId}/parts", s.withAuthRequired(http.HandlerFunc(s.handlePresignUploadParts)))
+	mux.Handle("POST /api/v1/files/upload-session/{uploadSessionId}/complete", s.withAuthRequired(http.HandlerFunc(s.handleCompleteUploadSession)))
+	mux.Handle("POST /api/v1/files/upload-session/{uploadSessionId}/abort", s.withAuthRequired(http.HandlerFunc(s.handleAbortUploadSession)))
+	mux.Handle("GET /api/v1/conversations/{conversationId}/messages", s.withAuthRequired(http.HandlerFunc(s.handleListMessages)))
+	mux.Handle("POST /api/v1/conversations/{conversationId}/messages", s.withAuthRequired(http.HandlerFunc(s.handleSendMessage)))
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
