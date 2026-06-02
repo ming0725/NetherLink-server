@@ -33,7 +33,7 @@ func (w *bufferedResponseWriter) Write(data []byte) (int, error) {
 
 func withJSONFallbacks(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isWebSocketUpgrade(r) {
+		if isWebSocketUpgrade(r) || isEventStreamRequest(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -57,6 +57,22 @@ func withJSONFallbacks(next http.Handler) http.Handler {
 		w.WriteHeader(buffer.status)
 		_, _ = buffer.body.WriteTo(w)
 	})
+}
+
+func isEventStreamRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("stream")), "true") {
+		return true
+	}
+	for _, part := range strings.Split(r.Header.Get("Accept"), ",") {
+		mediaType := strings.TrimSpace(strings.SplitN(part, ";", 2)[0])
+		if strings.EqualFold(mediaType, "text/event-stream") {
+			return true
+		}
+	}
+	return false
 }
 
 func isWebSocketUpgrade(r *http.Request) bool {

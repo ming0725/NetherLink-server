@@ -1,8 +1,12 @@
 package server
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	aisvc "nlserver/internal/ai"
@@ -76,6 +80,36 @@ type aiMessageDetailResponse struct {
 
 type aiTitleResponse struct {
 	Title string `json:"title"`
+}
+
+type aiStreamStartedResponse struct {
+	StreamID        string `json:"streamId"`
+	ConversationID  string `json:"conversationId"`
+	ClientMessageID string `json:"clientMessageId,omitempty"`
+}
+
+type aiStreamChunkResponse struct {
+	StreamID string `json:"streamId"`
+	Delta    string `json:"delta"`
+}
+
+type aiStreamDoneResponse struct {
+	StreamID         string                   `json:"streamId"`
+	UserMessage      aiMessageResponse        `json:"userMessage"`
+	AssistantMessage aiMessageResponse        `json:"assistantMessage"`
+	UsedFiles        []aiUploadedFileResponse `json:"usedFiles"`
+	FinishReason     string                   `json:"finishReason,omitempty"`
+}
+
+type aiStreamCancelledResponse struct {
+	StreamID string `json:"streamId"`
+}
+
+type aiStreamErrorResponse struct {
+	RequestType string `json:"requestType"`
+	Code        string `json:"code"`
+	Message     string `json:"message"`
+	RequestID   string `json:"requestId"`
 }
 
 type aiConversationResponse struct {
@@ -211,6 +245,10 @@ func (s *Server) handleAISendMessage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if wantsAISSE(r) {
+		s.handleAISendMessageStream(w, r, principal, conversationID, req)
+		return
+	}
 	result, err := s.aiService.SendMessage(r.Context(), aisvc.SendMessageInput{
 		UserID:          principal.UserID,
 		ConversationID:  conversationID,
@@ -227,6 +265,81 @@ func (s *Server) handleAISendMessage(w http.ResponseWriter, r *http.Request) {
 		AssistantMessageID: result.AssistantMessageID,
 		StreamID:           result.StreamID,
 		UsedFiles:          makeAIUploadedFileResponses(result.UsedFiles),
+	})
+}
+
+func (s *Server) handleAISendMessageStream(w http.ResponseWriter, r *http.Request, principal AuthPrincipal, conversationID string, req aiSendMessageRequest) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, r, http.StatusInternalServerError, "STREAM_UNAVAILABLE", "Streaming response is unavailable")
+		return
+	}
+	if s.aiStreams == nil {
+		s.aiStreams = newAIStreamRegistry()
+	}
+	streamCtx, cancel := context.WithCancel(r.Context())
+	streamID := s.aiStreams.Add(principal.UserID, "http", cancel)
+	if streamID == "" {
+		cancel()
+		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "AI stream registry is not configured")
+		return
+	}
+	defer s.aiStreams.Remove(streamID)
+	defer cancel()
+
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	if err := writeSSE(w, flusher, "ai.stream.started", aiStreamStartedResponse{
+		StreamID:        streamID,
+		ConversationID:  conversationID,
+		ClientMessageID: req.ClientMessageID,
+	}); err != nil {
+		return
+	}
+
+	result, err := s.aiService.StreamMessage(streamCtx, aisvc.StreamMessageInput{
+		SendMessageInput: aisvc.SendMessageInput{
+			UserID:          principal.UserID,
+			ConversationID:  conversationID,
+			Message:         req.Message,
+			ClientMessageID: req.ClientMessageID,
+			AIFileIDs:       req.AIFileIDs,
+		},
+		OnDelta: func(delta aisvc.StreamMessageDelta) error {
+			select {
+			case <-streamCtx.Done():
+				return context.Canceled
+			default:
+			}
+			return writeSSE(w, flusher, "ai.stream.chunk", aiStreamChunkResponse{
+				StreamID: streamID,
+				Delta:    delta.Content,
+			})
+		},
+	})
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			_ = writeSSE(w, flusher, "ai.stream.cancelled", aiStreamCancelledResponse{StreamID: streamID})
+			return
+		}
+		code, message := aiErrorCodeAndMessage(err)
+		_ = writeSSE(w, flusher, "client.error", aiStreamErrorResponse{
+			RequestType: "ai.message.send",
+			Code:        code,
+			Message:     message,
+			RequestID:   requestIDFromContext(r.Context()),
+		})
+		return
+	}
+	_ = writeSSE(w, flusher, "ai.stream.done", aiStreamDoneResponse{
+		StreamID:         streamID,
+		UserMessage:      makeAIMessageResponse(result.UserMessage),
+		AssistantMessage: makeAIMessageResponse(result.AssistantMessage),
+		UsedFiles:        makeAIUploadedFileResponses(result.UsedFiles),
+		FinishReason:     result.FinishReason,
 	})
 }
 
@@ -453,6 +566,32 @@ func writeAIServiceError(w http.ResponseWriter, r *http.Request, err error) {
 	default:
 		writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error")
 	}
+}
+
+func wantsAISSE(r *http.Request) bool {
+	return isEventStreamRequest(r)
+}
+
+func writeSSE(w http.ResponseWriter, flusher http.Flusher, event string, payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if event != "" {
+		if _, err := fmt.Fprintf(w, "event: %s\n", event); err != nil {
+			return err
+		}
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if _, err := fmt.Fprintf(w, "data: %s\n", line); err != nil {
+			return err
+		}
+	}
+	if _, err := fmt.Fprint(w, "\n"); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
 }
 
 func makeAIConversationResponses(conversations []repository.AIConversation) []aiConversationResponse {
