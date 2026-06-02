@@ -16,6 +16,7 @@ import (
 	filesvc "nlserver/internal/files"
 	friendsvc "nlserver/internal/friend"
 	groupsvc "nlserver/internal/group"
+	postsvc "nlserver/internal/post"
 	"nlserver/internal/realtime"
 	"nlserver/internal/repository"
 	"nlserver/internal/storage"
@@ -31,6 +32,7 @@ type Server struct {
 	fileService     *filesvc.Service
 	friendService   *friendsvc.Service
 	groupService    *groupsvc.Service
+	postService     *postsvc.Service
 	realtimeHub     *realtime.Hub
 	realtimeFanout  *realtime.RedisFanout
 	realtimeCleanup *realtime.CleanupWorker
@@ -49,6 +51,7 @@ type Dependencies struct {
 	FileService     *filesvc.Service
 	FriendService   *friendsvc.Service
 	GroupService    *groupsvc.Service
+	PostService     *postsvc.Service
 	RealtimeHub     *realtime.Hub
 	RealtimeFanout  *realtime.RedisFanout
 	RealtimeCleanup *realtime.CleanupWorker
@@ -90,6 +93,9 @@ func NewWithDependencies(deps Dependencies) *Server {
 	if deps.GroupService == nil && deps.Repos.Users != nil && deps.Repos.Groups != nil {
 		deps.GroupService = groupsvc.NewService(deps.Repos, deps.DB)
 	}
+	if deps.PostService == nil && deps.Repos.Users != nil && deps.Repos.Files != nil && deps.Repos.Posts != nil {
+		deps.PostService = postsvc.NewService(deps.Repos, deps.DB)
+	}
 	if deps.FileService == nil && deps.Repos.Files != nil {
 		deps.FileService = filesvc.NewService(deps.Config.Storage, deps.Repos, deps.DB, deps.Storage)
 	}
@@ -111,6 +117,7 @@ func NewWithDependencies(deps Dependencies) *Server {
 		fileService:     deps.FileService,
 		friendService:   deps.FriendService,
 		groupService:    deps.GroupService,
+		postService:     deps.PostService,
 		realtimeHub:     deps.RealtimeHub,
 		realtimeFanout:  deps.RealtimeFanout,
 		realtimeCleanup: deps.RealtimeCleanup,
@@ -133,6 +140,7 @@ func repositoriesConfigured(repos repository.Repositories) bool {
 		repos.Chat != nil ||
 		repos.Friends != nil ||
 		repos.Groups != nil ||
+		repos.Posts != nil ||
 		repos.RealtimeEvents != nil ||
 		repos.OperationReceipts != nil
 }
@@ -182,6 +190,7 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /api/v1/users/by-id/{userId}", s.withAuthRequired(http.HandlerFunc(s.handleUserByPublicID)))
 	mux.Handle("GET /api/v1/users/{userUuid}", s.withAuthRequired(http.HandlerFunc(s.handleUserByUUID)))
 	mux.Handle("POST /api/v1/users/batch", s.withAuthRequired(http.HandlerFunc(s.handleUsersBatch)))
+	mux.Handle("POST /api/v1/users/{authorUuid}/follow", s.withAuthRequired(http.HandlerFunc(s.handleSetAuthorFollow)))
 	mux.Handle("GET /api/v1/friends", s.withAuthRequired(http.HandlerFunc(s.handleFriends)))
 	mux.Handle("PATCH /api/v1/friends/{friendUserUuid}", s.withAuthRequired(http.HandlerFunc(s.handlePatchFriend)))
 	mux.Handle("DELETE /api/v1/friends/{friendUserUuid}", s.withAuthRequired(http.HandlerFunc(s.handleDeleteFriend)))
@@ -211,6 +220,19 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/v1/files/upload-session/{uploadSessionId}/parts", s.withAuthRequired(http.HandlerFunc(s.handlePresignUploadParts)))
 	mux.Handle("POST /api/v1/files/upload-session/{uploadSessionId}/complete", s.withAuthRequired(http.HandlerFunc(s.handleCompleteUploadSession)))
 	mux.Handle("POST /api/v1/files/upload-session/{uploadSessionId}/abort", s.withAuthRequired(http.HandlerFunc(s.handleAbortUploadSession)))
+	mux.Handle("GET /api/v1/posts", s.withAuthRequired(http.HandlerFunc(s.handleListPosts)))
+	mux.Handle("POST /api/v1/posts", s.withAuthRequired(http.HandlerFunc(s.handleCreatePost)))
+	mux.Handle("GET /api/v1/posts/{postId}", s.withAuthRequired(http.HandlerFunc(s.handleGetPost)))
+	mux.Handle("PATCH /api/v1/posts/{postId}", s.withAuthRequired(http.HandlerFunc(s.handlePatchPost)))
+	mux.Handle("DELETE /api/v1/posts/{postId}", s.withAuthRequired(http.HandlerFunc(s.handleDeletePost)))
+	mux.Handle("POST /api/v1/posts/{postId}/like", s.withAuthRequired(http.HandlerFunc(s.handleSetPostLike)))
+	mux.Handle("GET /api/v1/posts/{postId}/comments", s.withAuthRequired(http.HandlerFunc(s.handleListPostComments)))
+	mux.Handle("POST /api/v1/posts/{postId}/comments", s.withAuthRequired(http.HandlerFunc(s.handleCreatePostComment)))
+	mux.Handle("POST /api/v1/comments/{commentId}/like", s.withAuthRequired(http.HandlerFunc(s.handleSetCommentLike)))
+	mux.Handle("POST /api/v1/comments/{commentId}/replies", s.withAuthRequired(http.HandlerFunc(s.handleCreateCommentReply)))
+	mux.Handle("DELETE /api/v1/comments/{commentId}", s.withAuthRequired(http.HandlerFunc(s.handleDeleteComment)))
+	mux.Handle("POST /api/v1/replies/{replyId}/like", s.withAuthRequired(http.HandlerFunc(s.handleSetReplyLike)))
+	mux.Handle("DELETE /api/v1/replies/{replyId}", s.withAuthRequired(http.HandlerFunc(s.handleDeleteReply)))
 	mux.Handle("GET /api/v1/conversations", s.withAuthRequired(http.HandlerFunc(s.handleListConversations)))
 	mux.Handle("POST /api/v1/conversations/direct", s.withAuthRequired(http.HandlerFunc(s.handleOpenDirectConversation)))
 	mux.Handle("POST /api/v1/conversations/group", s.withAuthRequired(http.HandlerFunc(s.handleOpenGroupConversation)))

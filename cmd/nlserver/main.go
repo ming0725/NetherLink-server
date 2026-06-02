@@ -44,6 +44,7 @@ func main() {
 		FileService:     runtime.FileService,
 		FriendService:   runtime.FriendService,
 		GroupService:    runtime.GroupService,
+		PostService:     runtime.PostService,
 		RealtimeHub:     runtime.RealtimeHub,
 		RealtimeFanout:  runtime.RealtimeFanout,
 		RealtimeCleanup: runtime.RealtimeCleanup,

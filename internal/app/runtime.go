@@ -17,6 +17,7 @@ import (
 	filesvc "nlserver/internal/files"
 	friendsvc "nlserver/internal/friend"
 	groupsvc "nlserver/internal/group"
+	postsvc "nlserver/internal/post"
 	"nlserver/internal/realtime"
 	"nlserver/internal/repository"
 	"nlserver/internal/storage"
@@ -34,6 +35,7 @@ type Runtime struct {
 	FileCleanup         *filesvc.CleanupWorker
 	FriendService       *friendsvc.Service
 	GroupService        *groupsvc.Service
+	PostService         *postsvc.Service
 	RealtimeHub         *realtime.Hub
 	RealtimeFanout      *realtime.RedisFanout
 	RealtimeCleanup     *realtime.CleanupWorker
@@ -69,6 +71,7 @@ func NewRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*R
 		FileService:   filesvc.NewService(cfg.Storage, repos, db, nil),
 		FriendService: friendsvc.NewService(repos, db),
 		GroupService:  groupsvc.NewService(repos, db),
+		PostService:   postsvc.NewService(repos, db),
 		RealtimeHub:   realtime.NewHub(),
 		Logger:        logger,
 		cancel:        cancel,

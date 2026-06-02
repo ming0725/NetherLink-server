@@ -26,7 +26,8 @@ Current scope is intentionally small:
 - Chat conversation list/open/detail/settings/read/unread endpoints are available, along with message send, history, sender recall, and current-user hidden-history clearing; image attachments require and return `width` and `height` for frontend preview placeholders.
 - WebSocket realtime foundation is available at `GET /api/v1/ws`: access-token auth, per-user connection management, PostgreSQL-backed global event IDs, durable replay, Redis pub/sub fanout, replay metrics, fanout operational counters, `ping`/`realtime.pong`, `chat.message.created`, `chat.message.recalled`, `chat.conversation.sync.updated`, hidden-history sync, and `chat.message.send`.
 - Realtime event cleanup is available: `realtime_events` are retained for the configured window, old events are deleted in batches, and `/readyz` exposes hub, fanout, and cleanup snapshots.
-- No post API handlers or AI API handlers yet.
+- Post HTTP handlers are available for feed/detail/create/edit/delete, media binding, likes, follows, comments, replies, comment/reply likes, and comment/reply deletion.
+- No AI API handlers yet.
 - Redis is used for auth rate limiting and realtime fanout today. It is not used as the source of truth for users, refresh token sessions, messages, notifications, realtime events, file metadata, or durable business state.
 
 ## Start Local Dependencies
@@ -88,6 +89,7 @@ The current API foundation includes:
 - File endpoints: `POST /api/v1/files/upload-session`, `GET /api/v1/files/upload-session/{uploadSessionId}`, `POST /api/v1/files/upload-session/{uploadSessionId}/parts`, `POST /api/v1/files/upload-session/{uploadSessionId}/complete`, and `POST /api/v1/files/upload-session/{uploadSessionId}/abort`.
 - File upload completion returns `processingStatus` from the file storage status. Image, video, and audio uploads enter `processing` until the background worker records metadata and any supported variants; other file types move directly to `ready` for now.
 - Chat endpoints: `GET /api/v1/conversations`, `POST /api/v1/conversations/direct`, `POST /api/v1/conversations/group`, `GET /api/v1/conversations/{conversationId}`, `PATCH /api/v1/conversations/{conversationId}/settings`, `POST /api/v1/conversations/{conversationId}/read`, `POST /api/v1/conversations/{conversationId}/unread`, `POST /api/v1/conversations/{conversationId}/messages`, `GET /api/v1/conversations/{conversationId}/messages`, `POST /api/v1/conversations/{conversationId}/messages/{messageId}/recall`, and `DELETE /api/v1/conversations/{conversationId}/messages`. Image messages must include attachment `width` and `height`; message responses include those fields on each attachment.
+- Post endpoints: `GET /api/v1/posts`, `POST /api/v1/posts`, `GET /api/v1/posts/{postId}`, `PATCH /api/v1/posts/{postId}`, `DELETE /api/v1/posts/{postId}`, `POST /api/v1/posts/{postId}/like`, `POST /api/v1/users/{authorUuid}/follow`, `GET /api/v1/posts/{postId}/comments`, `POST /api/v1/posts/{postId}/comments`, `POST /api/v1/comments/{commentId}/like`, `POST /api/v1/comments/{commentId}/replies`, `POST /api/v1/replies/{replyId}/like`, `DELETE /api/v1/comments/{commentId}`, and `DELETE /api/v1/replies/{replyId}`.
 
 PostgreSQL:
 
@@ -156,6 +158,7 @@ The first PostgreSQL repositories cover:
 - `chat`: list/open/read/update conversations, persist participant sync state, persist messages, assign per-conversation `message_seq`, persist message attachments, recall sender messages, hide current-user history with `hidden_at`, return attachment file metadata, and preserve image `width` and `height`.
 - `friends`: create and list current-user friend groups, list active friends with keyword/group filters, read current-user friendship relation metadata, update/delete friendship settings, create/list/accept/reject friend requests, and upsert bidirectional friendships when accepting requests.
 - `groups`: list current-user groups with keyword/category filters, read group details only for members, page group members only when the viewer belongs to the group, create/update/soft-delete groups, add/remove/update members, transfer ownership, upsert current-user group settings, create/list/accept/reject join requests, and record group events.
+- `posts`: list feed entries with viewer state, read post details, create/update/soft-delete posts, replace post media, record `file_usages` for post media and cover files, set post likes, set follows, list/create/delete comments and replies, and maintain persisted like/comment/reply counts.
 - `realtime_events`: persist globally sequenced WebSocket business events, record per-user recipients, list durable replay events after a client cursor, and report the latest sequence.
 - `operation_receipts`: record and replay idempotent operation results by `user_id + client_operation_id + operation_type`.
 
@@ -168,7 +171,7 @@ Repository infrastructure:
 
 ## Runtime Boundary
 
-`internal/app` owns runtime dependency assembly and lifecycle for PostgreSQL, Redis, repository aggregates, auth service, friend service, group service, file service, file processing worker, file cleanup worker, realtime hub, Redis fanout, realtime cleanup worker, and object storage provider injection. `cmd/nlserver` should stay thin: load configuration, create the runtime, pass dependencies into `server.NewWithDependencies`, and start HTTP serving.
+`internal/app` owns runtime dependency assembly and lifecycle for PostgreSQL, Redis, repository aggregates, auth service, friend service, group service, post service, file service, file processing worker, file cleanup worker, realtime hub, Redis fanout, realtime cleanup worker, and object storage provider injection. `cmd/nlserver` should stay thin: load configuration, create the runtime, pass dependencies into `server.NewWithDependencies`, and start HTTP serving.
 
 The MinIO/S3 provider implements object PUT/GET/HEAD/DELETE, presigned GET/PUT URLs, multipart upload creation, part presigning, completion, and abort. File metadata remains in PostgreSQL; public API responses do not expose bucket names or object keys.
 
@@ -223,5 +226,5 @@ The former `internal/database/postgres_test.go` was a single DSN unit test, not 
 
 ## Next Build Steps
 
-1. Add post APIs for post feed/detail, media binding, likes, follows, comments, replies, and deletion.
-2. Add AI workflows after post paths settle.
+1. Add AI conversation, message, file binding, parse-status, context, feedback, and title-generation workflows.
+2. Add realtime post events after client notification semantics are finalized.
