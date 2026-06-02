@@ -304,14 +304,15 @@ func (s *Server) handleCompleteUploadSession(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	writeJSON(w, http.StatusOK, completeUploadSessionResponse{
+	response := completeUploadSessionResponse{
 		FileID:           result.FileID,
 		URL:              result.URL,
 		ETag:             result.ETag,
 		ContentHash:      result.ContentHash,
 		Version:          result.Version,
 		ProcessingStatus: result.ProcessingStatus,
-	})
+	}
+	writeJSONWithETag(w, r, http.StatusOK, resourceETag("file", result.FileID, result.Version), response)
 }
 
 func (s *Server) handleAbortUploadSession(w http.ResponseWriter, r *http.Request) {
@@ -385,7 +386,8 @@ func (s *Server) handleUploadFile(w http.ResponseWriter, r *http.Request) {
 		writeFileError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, makeFileResponse(result))
+	response := makeFileResponse(result)
+	writeJSONWithETag(w, r, http.StatusCreated, resourceETag("file", result.FileID, result.Version), response)
 }
 
 func (s *Server) handleUploadMeAvatar(w http.ResponseWriter, r *http.Request) {
@@ -415,6 +417,21 @@ func (s *Server) handleUploadMeAvatar(w http.ResponseWriter, r *http.Request) {
 	if value := strings.TrimSpace(r.FormValue("contentHash")); value != "" {
 		contentHash = &value
 	}
+	expectedVersion, reqErr := expectedVersionFromQuery(r)
+	if reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+	if expectedVersion != nil {
+		current, err := s.repos.Users.GetByID(r.Context(), principal.UserID)
+		if err != nil {
+			writeRepositoryError(w, r, err)
+			return
+		}
+		if !checkResourceVersion(w, r, resourceETag("user", current.ID, current.Version), current.Version, expectedVersion) {
+			return
+		}
+	}
 
 	result, err := s.fileService.UploadAvatar(r.Context(), filesvc.StoreFileRequest{
 		UserID:      principal.UserID,
@@ -440,7 +457,7 @@ func (s *Server) handleUploadMeAvatar(w http.ResponseWriter, r *http.Request) {
 		"reason": "avatar.updated",
 		"avatar": response,
 	})
-	writeJSON(w, http.StatusCreated, response)
+	writeJSONWithETag(w, r, http.StatusCreated, resourceETag("user", principal.UserID, result.AvatarVersion), response)
 }
 
 func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
@@ -464,7 +481,8 @@ func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 		writeFileError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, makeFileResponse(result))
+	response := makeFileResponse(result)
+	writeJSONWithETag(w, r, http.StatusOK, resourceETag("file", result.FileID, result.Version), response)
 }
 
 func (s *Server) handleGetFileDownloadURL(w http.ResponseWriter, r *http.Request) {
@@ -508,6 +526,19 @@ func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
 	fileID := r.PathValue("fileId")
 	if err := validateUUID(fileID, "fileId"); err != nil {
 		writeRequestError(w, r, err)
+		return
+	}
+	expectedVersion, reqErr := expectedVersionFromQuery(r)
+	if reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+	current, err := s.fileService.GetFile(r.Context(), principal.UserID, fileID)
+	if err != nil {
+		writeFileError(w, r, err)
+		return
+	}
+	if !checkResourceVersion(w, r, resourceETag("file", current.FileID, current.Version), current.Version, expectedVersion) {
 		return
 	}
 

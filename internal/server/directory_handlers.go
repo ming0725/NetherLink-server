@@ -48,10 +48,11 @@ type createGroupRequest struct {
 }
 
 type patchGroupRequest struct {
-	Name         *string `json:"name"`
-	Introduction *string `json:"introduction"`
-	Announcement *string `json:"announcement"`
-	AvatarFileID *string `json:"avatarFileId"`
+	Name            *string `json:"name"`
+	Introduction    *string `json:"introduction"`
+	Announcement    *string `json:"announcement"`
+	AvatarFileID    *string `json:"avatarFileId"`
+	ExpectedVersion *int    `json:"expectedVersion"`
 }
 
 type addGroupMembersRequest struct {
@@ -192,6 +193,7 @@ type groupResponse struct {
 	ListGroupID       *string   `json:"listGroupId"`
 	ListGroupName     *string   `json:"listGroupName"`
 	Version           int       `json:"version"`
+	ETag              string    `json:"etag"`
 	CreatedAt         time.Time `json:"createdAt"`
 	UpdatedAt         time.Time `json:"updatedAt"`
 }
@@ -290,7 +292,7 @@ func (s *Server) handleUserByUUID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, response)
+	writeJSONWithETag(w, r, http.StatusOK, response.User.ETag, response)
 }
 
 func (s *Server) handleUserByPublicID(w http.ResponseWriter, r *http.Request) {
@@ -312,7 +314,7 @@ func (s *Server) handleUserByPublicID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, response)
+	writeJSONWithETag(w, r, http.StatusOK, response.User.ETag, response)
 }
 
 func (s *Server) handleUsersBatch(w http.ResponseWriter, r *http.Request) {
@@ -729,7 +731,7 @@ func (s *Server) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
 
 	response := groupDetailResponse{Group: makeGroupResponse(group)}
 	s.publishGroupRealtimeEvent(r.Context(), group.Group.ID, "group.created", response)
-	writeJSON(w, http.StatusCreated, response)
+	writeJSONWithETag(w, r, http.StatusCreated, response.Group.ETag, response)
 }
 
 func (s *Server) handleGroupDetail(w http.ResponseWriter, r *http.Request) {
@@ -751,7 +753,8 @@ func (s *Server) handleGroupDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, groupDetailResponse{Group: makeGroupResponse(group)})
+	response := groupDetailResponse{Group: makeGroupResponse(group)}
+	writeJSONWithETag(w, r, http.StatusOK, response.Group.ETag, response)
 }
 
 func (s *Server) handlePatchGroup(w http.ResponseWriter, r *http.Request) {
@@ -780,6 +783,14 @@ func (s *Server) handlePatchGroup(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	current, err := s.repos.Groups.GetForUser(r.Context(), principal.UserID, groupID)
+	if err != nil {
+		writeRepositoryError(w, r, err)
+		return
+	}
+	if !checkResourceVersion(w, r, resourceETag("group", current.Group.ID, current.Group.Version), current.Group.Version, req.ExpectedVersion) {
+		return
+	}
 
 	group, err := s.groupService.UpdateGroup(r.Context(), groupsvc.UpdateGroupInput{
 		UserID:          principal.UserID,
@@ -797,7 +808,7 @@ func (s *Server) handlePatchGroup(w http.ResponseWriter, r *http.Request) {
 
 	response := groupDetailResponse{Group: makeGroupResponse(group)}
 	s.publishGroupRealtimeEvent(r.Context(), groupID, "group.updated", response)
-	writeJSON(w, http.StatusOK, response)
+	writeJSONWithETag(w, r, http.StatusOK, response.Group.ETag, response)
 }
 
 func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
@@ -812,6 +823,19 @@ func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
 	groupID := r.PathValue("groupId")
 	if err := validateUUID(groupID, "groupId"); err != nil {
 		writeRequestError(w, r, err)
+		return
+	}
+	expectedVersion, reqErr := expectedVersionFromQuery(r)
+	if reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+	current, err := s.repos.Groups.GetForUser(r.Context(), principal.UserID, groupID)
+	if err != nil {
+		writeRepositoryError(w, r, err)
+		return
+	}
+	if !checkResourceVersion(w, r, resourceETag("group", current.Group.ID, current.Group.Version), current.Group.Version, expectedVersion) {
 		return
 	}
 
@@ -1364,6 +1388,7 @@ func makeGroupResponse(entry repository.GroupListEntry) groupResponse {
 		ListGroupID:       entry.ListGroupID,
 		ListGroupName:     entry.ListGroupName,
 		Version:           entry.Group.Version,
+		ETag:              resourceETag("group", entry.Group.ID, entry.Group.Version),
 		CreatedAt:         entry.Group.CreatedAt,
 		UpdatedAt:         entry.Group.UpdatedAt,
 	}

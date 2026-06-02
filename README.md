@@ -25,6 +25,7 @@ Current scope is intentionally small:
 - File cleanup worker is available for expired upload sessions, unbound files, and files whose `file_usages` are all deleted; it deletes original and variant objects from MinIO and soft-deletes cleaned file metadata.
 - File metadata and download URLs now enforce business-aware access checks: chat attachments require visible conversation participation, group avatars require group membership or upload ownership, and post media follows public/author visibility.
 - Chat conversation list/open/detail/settings/read/unread endpoints are available, along with message send, history, sender recall, and current-user hidden-history clearing; image attachments require and return `width` and `height` for frontend preview placeholders.
+- Profile, preference, group, file, and post detail resources now return HTTP `ETag` headers; GET detail endpoints honor `If-None-Match` with `304 Not Modified`, and mutable profile/group/file/post writes can reject stale `If-Match` or `expectedVersion` inputs with `409 VERSION_CONFLICT`.
 - WebSocket realtime foundation is available at `GET /api/v1/ws`: access-token auth, per-user connection management, PostgreSQL-backed global event IDs, durable replay, Redis pub/sub fanout, replay metrics, fanout operational counters, `ping`/`realtime.pong`, chat events, notification read sync, friend/group change events, profile/preference change events, post count/version update events, hidden-history sync, and `chat.message.send`.
 - Realtime event cleanup is available: `realtime_events` are retained for the configured window, old events are deleted in batches, and `/readyz` exposes hub, fanout, and cleanup snapshots.
 - Post HTTP handlers are available for feed/detail/create/edit/delete, media binding, likes, follows, comments, replies, comment/reply likes, and comment/reply deletion.
@@ -85,6 +86,7 @@ The current API foundation includes:
 - JSON `NOT_FOUND` and `METHOD_NOT_ALLOWED` fallback responses.
 - JSON body decoding helpers with unknown-field rejection and a 1 MiB request body limit.
 - Bearer auth middleware validates access token signature, expiry, active PostgreSQL session, active user status, and `tokenVersion`.
+- Detail resources use version-based HTTP `ETag` headers. `GET /me`, `GET /me/preferences`, `GET /users/{userUuid}`, `GET /users/by-id/{userId}`, `GET /groups/{groupId}`, `GET /files/{fileId}`, and `GET /posts/{postId}` return `304 Not Modified` when `If-None-Match` matches the current resource version. Mutable profile, preference, group, file delete, and post update/delete requests accept `If-Match`; JSON PATCH bodies also accept `expectedVersion`, while DELETE/avatar upload accept `expectedVersion` as a query parameter.
 - WebSocket endpoint: `GET /api/v1/ws` accepts `Authorization: Bearer <access_token>`, `?accessToken=`, or `?token=`; optional `lastEventSeq` / `lastEventId=evt_N` enables durable replay when PostgreSQL is available.
 - WebSocket command: send `{"type":"chat.message.send","payload":{...}}` with `conversationId` plus the same message fields as REST `POST /conversations/{conversationId}/messages`; success emits durable `chat.message.created` plus non-durable `chat.message.sent` ACK to the sender.
 - Auth endpoints: `POST /api/v1/auth/register`, `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/sessions`, `POST /api/v1/auth/sessions/{sessionId}/revoke`, `GET /api/v1/me`, `PATCH /api/v1/me`, `GET /api/v1/me/user-id/check`, `PATCH /api/v1/me/user-id`, `POST /api/v1/me/avatar`, `GET /api/v1/me/preferences`, and `PATCH /api/v1/me/preferences`.
@@ -237,5 +239,5 @@ The former `internal/database/postgres_test.go` was a single DSN unit test, not 
 
 ## Next Build Steps
 
-1. Add full ETag / `If-None-Match` handling and version-conflict checks across profile, group, file, and post resources.
-2. Add automated coverage around business-aware file access for chat attachments, group avatars, and post media.
+1. Add automated coverage around business-aware file access for chat attachments, group avatars, and post media.
+2. Add AI provider/model runtime configuration before implementing the paused AI API handlers.

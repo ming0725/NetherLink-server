@@ -33,10 +33,11 @@ type createPostRequest struct {
 }
 
 type patchPostRequest struct {
-	Title      *string             `json:"title"`
-	Content    *string             `json:"content"`
-	Visibility *string             `json:"visibility"`
-	Media      *[]postMediaRequest `json:"media"`
+	Title           *string             `json:"title"`
+	Content         *string             `json:"content"`
+	Visibility      *string             `json:"visibility"`
+	Media           *[]postMediaRequest `json:"media"`
+	ExpectedVersion *int                `json:"expectedVersion"`
 }
 
 type setLikedRequest struct {
@@ -80,6 +81,7 @@ type postResponse struct {
 	Visibility       string              `json:"visibility"`
 	Viewer           postViewerResponse  `json:"viewer"`
 	Version          int                 `json:"version"`
+	ETag             string              `json:"etag"`
 	CreatedAt        time.Time           `json:"createdAt"`
 	UpdatedAt        time.Time           `json:"updatedAt"`
 }
@@ -219,7 +221,7 @@ func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) {
 	}
 	response := postDetailResponse{Post: makePostResponse(post, true)}
 	s.publishRealtimeEvent(r.Context(), []string{principal.UserID}, "post.created", response)
-	writeJSON(w, http.StatusCreated, response)
+	writeJSONWithETag(w, r, http.StatusCreated, response.Post.ETag, response)
 }
 
 func (s *Server) handleGetPost(w http.ResponseWriter, r *http.Request) {
@@ -238,7 +240,8 @@ func (s *Server) handleGetPost(w http.ResponseWriter, r *http.Request) {
 		writeRepositoryError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, postDetailResponse{Post: makePostResponse(post, true)})
+	response := postDetailResponse{Post: makePostResponse(post, true)}
+	writeJSONWithETag(w, r, http.StatusOK, response.Post.ETag, response)
 }
 
 func (s *Server) handlePatchPost(w http.ResponseWriter, r *http.Request) {
@@ -268,6 +271,14 @@ func (s *Server) handlePatchPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	current, err := s.repos.Posts.GetPost(r.Context(), principal.UserID, postID)
+	if err != nil {
+		writeRepositoryError(w, r, err)
+		return
+	}
+	if !checkResourceVersion(w, r, resourceETag("post", current.Post.ID, current.Post.Version), current.Post.Version, req.ExpectedVersion) {
+		return
+	}
 	content := ""
 	if req.Content != nil {
 		content = *req.Content
@@ -289,7 +300,7 @@ func (s *Server) handlePatchPost(w http.ResponseWriter, r *http.Request) {
 	}
 	response := postDetailResponse{Post: makePostResponse(post, true)}
 	s.publishRealtimeEvent(r.Context(), []string{principal.UserID, post.Post.AuthorID}, "post.updated", response)
-	writeJSON(w, http.StatusOK, response)
+	writeJSONWithETag(w, r, http.StatusOK, response.Post.ETag, response)
 }
 
 func (s *Server) handleDeletePost(w http.ResponseWriter, r *http.Request) {
@@ -306,9 +317,17 @@ func (s *Server) handleDeletePost(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, r, reqErr)
 		return
 	}
+	expectedVersion, reqErr := expectedVersionFromQuery(r)
+	if reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
 	post, err := s.repos.Posts.GetPost(r.Context(), principal.UserID, postID)
 	if err != nil {
 		writeRepositoryError(w, r, err)
+		return
+	}
+	if !checkResourceVersion(w, r, resourceETag("post", post.Post.ID, post.Post.Version), post.Post.Version, expectedVersion) {
 		return
 	}
 	if err := s.postService.DeletePost(r.Context(), postID, principal.UserID); err != nil {
@@ -665,6 +684,7 @@ func makePostResponse(entry repository.PostEntry, includeFullMedia bool) postRes
 			IsFollowedAuthor: entry.Viewer.IsFollowedAuthor,
 		},
 		Version:   entry.Post.Version,
+		ETag:      resourceETag("post", entry.Post.ID, entry.Post.Version),
 		CreatedAt: entry.Post.CreatedAt,
 		UpdatedAt: entry.Post.UpdatedAt,
 	}

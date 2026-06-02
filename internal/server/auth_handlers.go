@@ -42,24 +42,27 @@ type authLogoutRequest struct {
 }
 
 type patchMeRequest struct {
-	NickName     *string `json:"nickName"`
-	Signature    *string `json:"signature"`
-	Region       *string `json:"region"`
-	Status       *string `json:"status"`
-	Gender       *string `json:"gender"`
-	GenderCustom *string `json:"genderCustom"`
+	NickName        *string `json:"nickName"`
+	Signature       *string `json:"signature"`
+	Region          *string `json:"region"`
+	Status          *string `json:"status"`
+	Gender          *string `json:"gender"`
+	GenderCustom    *string `json:"genderCustom"`
+	ExpectedVersion *int    `json:"expectedVersion"`
 }
 
 type patchUserIDRequest struct {
 	UserID            string `json:"userId"`
 	ClientOperationID string `json:"clientOperationId"`
+	ExpectedVersion   *int   `json:"expectedVersion"`
 }
 
 type patchPreferencesRequest struct {
-	ThemeColor   *string         `json:"themeColor"`
-	FontMode     *string         `json:"fontMode"`
-	InputEffects json.RawMessage `json:"inputEffects"`
-	Settings     json.RawMessage `json:"settings"`
+	ThemeColor      *string         `json:"themeColor"`
+	FontMode        *string         `json:"fontMode"`
+	InputEffects    json.RawMessage `json:"inputEffects"`
+	Settings        json.RawMessage `json:"settings"`
+	ExpectedVersion *int            `json:"expectedVersion"`
 }
 
 type authResponse struct {
@@ -92,6 +95,7 @@ type userResponse struct {
 	Region            *string    `json:"region"`
 	LastSeenAt        *time.Time `json:"lastSeenAt"`
 	Version           int        `json:"version"`
+	ETag              string     `json:"etag"`
 	UpdatedAt         time.Time  `json:"updatedAt"`
 }
 
@@ -101,6 +105,7 @@ type preferencesResponse struct {
 	InputEffects json.RawMessage `json:"inputEffects"`
 	Settings     json.RawMessage `json:"settings"`
 	Version      int             `json:"version"`
+	ETag         string          `json:"etag"`
 	UpdatedAt    time.Time       `json:"updatedAt"`
 }
 
@@ -257,11 +262,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := makeUserResponse(user)
-	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, map[string]any{
-		"reason": "profile.updated",
-		"user":   response,
-	})
-	writeJSON(w, http.StatusOK, response)
+	writeJSONWithETag(w, r, http.StatusOK, response.ETag, response)
 }
 
 func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
@@ -274,6 +275,14 @@ func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
 	var req patchMeRequest
 	if err := decodeJSONBody(r, &req); err != nil {
 		writeRequestError(w, r, err)
+		return
+	}
+	current, err := s.repos.Users.GetByID(r.Context(), principal.UserID)
+	if err != nil {
+		writeRepositoryError(w, r, err)
+		return
+	}
+	if !checkResourceVersion(w, r, resourceETag("user", current.ID, current.Version), current.Version, req.ExpectedVersion) {
 		return
 	}
 
@@ -293,10 +302,10 @@ func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
 
 	response := makeUserResponse(user)
 	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, map[string]any{
-		"reason": "public_id.updated",
+		"reason": "profile.updated",
 		"user":   response,
 	})
-	writeJSON(w, http.StatusOK, response)
+	writeJSONWithETag(w, r, http.StatusOK, response.ETag, response)
 }
 
 func (s *Server) handleCheckMeUserID(w http.ResponseWriter, r *http.Request) {
@@ -330,6 +339,14 @@ func (s *Server) handlePatchMeUserID(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, r, err)
 		return
 	}
+	current, err := s.repos.Users.GetByID(r.Context(), principal.UserID)
+	if err != nil {
+		writeRepositoryError(w, r, err)
+		return
+	}
+	if !checkResourceVersion(w, r, resourceETag("user", current.ID, current.Version), current.Version, req.ExpectedVersion) {
+		return
+	}
 
 	user, err := s.authService.ChangePublicID(r.Context(), authsvc.ChangePublicIDInput{
 		UserID:            principal.UserID,
@@ -341,7 +358,12 @@ func (s *Server) handlePatchMeUserID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, makeUserResponse(user))
+	response := makeUserResponse(user)
+	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, map[string]any{
+		"reason": "public_id.updated",
+		"user":   response,
+	})
+	writeJSONWithETag(w, r, http.StatusOK, response.ETag, response)
 }
 
 func (s *Server) handleAuthSessions(w http.ResponseWriter, r *http.Request) {
@@ -395,7 +417,7 @@ func (s *Server) handleGetMePreferences(w http.ResponseWriter, r *http.Request) 
 		"reason":      "preferences.updated",
 		"preferences": response,
 	})
-	writeJSON(w, http.StatusOK, response)
+	writeJSONWithETag(w, r, http.StatusOK, response.ETag, response)
 }
 
 func (s *Server) handlePatchMePreferences(w http.ResponseWriter, r *http.Request) {
@@ -408,6 +430,14 @@ func (s *Server) handlePatchMePreferences(w http.ResponseWriter, r *http.Request
 	var req patchPreferencesRequest
 	if err := decodeJSONBody(r, &req); err != nil {
 		writeRequestError(w, r, err)
+		return
+	}
+	current, err := s.repos.Preferences.EnsureDefault(r.Context(), principal.UserID)
+	if err != nil {
+		writeRepositoryError(w, r, err)
+		return
+	}
+	if !checkResourceVersion(w, r, resourceETag("preference", principal.UserID, current.Version), current.Version, req.ExpectedVersion) {
 		return
 	}
 
@@ -423,7 +453,8 @@ func (s *Server) handlePatchMePreferences(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	writeJSON(w, http.StatusOK, makePreferencesResponse(preferences))
+	response := makePreferencesResponse(preferences)
+	writeJSONWithETag(w, r, http.StatusOK, response.ETag, response)
 }
 
 func (s *Server) requireAuthService(w http.ResponseWriter, r *http.Request) bool {
@@ -476,6 +507,7 @@ func makeUserResponse(user repository.User) userResponse {
 		Region:            user.Region,
 		LastSeenAt:        user.LastSeenAt,
 		Version:           user.Version,
+		ETag:              resourceETag("user", user.ID, user.Version),
 		UpdatedAt:         user.UpdatedAt,
 	}
 }
@@ -487,6 +519,7 @@ func makePreferencesResponse(preferences repository.UserPreference) preferencesR
 		InputEffects: preferences.InputEffects,
 		Settings:     preferences.Settings,
 		Version:      preferences.Version,
+		ETag:         resourceETag("preference", preferences.UserID, preferences.Version),
 		UpdatedAt:    preferences.UpdatedAt,
 	}
 }
