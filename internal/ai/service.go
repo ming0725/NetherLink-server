@@ -53,6 +53,22 @@ type SendMessageResult struct {
 	UsedFiles          []repository.AIUploadedFile
 }
 
+type StreamMessageInput struct {
+	SendMessageInput
+	OnDelta func(StreamMessageDelta) error
+}
+
+type StreamMessageDelta struct {
+	Content string
+}
+
+type StreamMessageResult struct {
+	UserMessage      repository.AIMessage
+	AssistantMessage repository.AIMessage
+	UsedFiles        []repository.AIUploadedFile
+	FinishReason     string
+}
+
 type BindFileInput struct {
 	UserID          string
 	ConversationID  string
@@ -146,64 +162,15 @@ func (s *Service) ListMessages(ctx context.Context, userID string, conversationI
 }
 
 func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (SendMessageResult, error) {
-	if s.repos.AI == nil {
-		return SendMessageResult{}, ErrUnavailable
-	}
-	if s.client == nil {
-		return SendMessageResult{}, ErrUnavailable
-	}
-	text := strings.TrimSpace(input.Message)
-	if input.UserID == "" || input.ConversationID == "" || text == "" || len(text) > maxAIMessageLength {
-		return SendMessageResult{}, ErrValidation
-	}
-	conversation, err := s.repos.AI.GetConversation(ctx, input.UserID, input.ConversationID)
+	prepared, err := s.prepareMessageCompletion(ctx, input)
 	if err != nil {
-		return SendMessageResult{}, mapRepositoryError(err)
-	}
-	usedFiles, err := s.repos.AI.ListUploadedFilesByIDs(ctx, input.UserID, input.ConversationID, input.AIFileIDs)
-	if err != nil {
-		return SendMessageResult{}, mapRepositoryError(err)
-	}
-	if len(usedFiles) != len(uniqueStrings(input.AIFileIDs)) {
-		return SendMessageResult{}, repository.ErrNotFound
-	}
-	for _, file := range usedFiles {
-		switch file.ParseStatus {
-		case "ready":
-		case "failed":
-			return SendMessageResult{}, ErrParseFailed
-		default:
-			return SendMessageResult{}, ErrNotReady
-		}
-	}
-	contextChunks, err := s.selectFileContext(ctx, input.UserID, conversation.ID, usedFiles, text)
-	if err != nil {
-		return SendMessageResult{}, mapRepositoryError(err)
-	}
-
-	userMessage, err := s.repos.AI.CreateMessage(ctx, repository.CreateAIMessageParams{
-		ConversationID: conversation.ID,
-		Role:           "user",
-		Text:           text,
-		TokenCount:     roughTokenCount(text),
-	})
-	if err != nil {
-		return SendMessageResult{}, mapRepositoryError(err)
-	}
-
-	history, err := s.repos.AI.ListMessages(ctx, input.UserID, conversation.ID)
-	if err != nil {
-		return SendMessageResult{}, mapRepositoryError(err)
-	}
-	model := s.cfg.DefaultModel
-	if conversation.Model != nil && strings.TrimSpace(*conversation.Model) != "" {
-		model = strings.TrimSpace(*conversation.Model)
+		return SendMessageResult{}, err
 	}
 	providerCtx, cancel := timeoutContext(ctx, s.cfg.RequestTimeout)
 	defer cancel()
 	completion, err := s.client.Complete(providerCtx, CompletionRequest{
-		Model:           model,
-		Messages:        makeCompletionMessages(history, contextChunks),
+		Model:           prepared.model,
+		Messages:        prepared.messages,
 		ThinkingType:    s.cfg.ThinkingType,
 		ReasoningEffort: s.cfg.ReasoningEffort,
 	})
@@ -211,7 +178,7 @@ func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (Send
 		return SendMessageResult{}, err
 	}
 	assistantMessage, err := s.repos.AI.CreateMessage(ctx, repository.CreateAIMessageParams{
-		ConversationID: conversation.ID,
+		ConversationID: prepared.conversation.ID,
 		Role:           "assistant",
 		Text:           strings.TrimSpace(completion.Content),
 		TokenCount:     completion.TokenCount,
@@ -221,10 +188,124 @@ func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (Send
 	}
 
 	return SendMessageResult{
-		UserMessage:        userMessage,
+		UserMessage:        prepared.userMessage,
 		AssistantMessageID: assistantMessage.ID,
 		StreamID:           "",
-		UsedFiles:          usedFiles,
+		UsedFiles:          prepared.usedFiles,
+	}, nil
+}
+
+func (s *Service) StreamMessage(ctx context.Context, input StreamMessageInput) (StreamMessageResult, error) {
+	prepared, err := s.prepareMessageCompletion(ctx, input.SendMessageInput)
+	if err != nil {
+		return StreamMessageResult{}, err
+	}
+	providerCtx, cancel := timeoutContext(ctx, s.cfg.RequestTimeout)
+	defer cancel()
+	completion, err := s.client.Stream(providerCtx, CompletionRequest{
+		Model:           prepared.model,
+		Messages:        prepared.messages,
+		ThinkingType:    s.cfg.ThinkingType,
+		ReasoningEffort: s.cfg.ReasoningEffort,
+	}, func(delta CompletionStreamDelta) error {
+		if input.OnDelta == nil || delta.Content == "" {
+			return nil
+		}
+		return input.OnDelta(StreamMessageDelta{Content: delta.Content})
+	})
+	if err != nil {
+		return StreamMessageResult{}, err
+	}
+	content := strings.TrimSpace(completion.Content)
+	tokenCount := completion.TokenCount
+	if tokenCount == 0 {
+		tokenCount = roughTokenCount(content)
+	}
+	assistantMessage, err := s.repos.AI.CreateMessage(ctx, repository.CreateAIMessageParams{
+		ConversationID: prepared.conversation.ID,
+		Role:           "assistant",
+		Text:           content,
+		TokenCount:     tokenCount,
+	})
+	if err != nil {
+		return StreamMessageResult{}, mapRepositoryError(err)
+	}
+	return StreamMessageResult{
+		UserMessage:      prepared.userMessage,
+		AssistantMessage: assistantMessage,
+		UsedFiles:        prepared.usedFiles,
+		FinishReason:     completion.FinishReason,
+	}, nil
+}
+
+type preparedMessageCompletion struct {
+	conversation repository.AIConversation
+	userMessage  repository.AIMessage
+	usedFiles    []repository.AIUploadedFile
+	model        string
+	messages     []ChatMessage
+}
+
+func (s *Service) prepareMessageCompletion(ctx context.Context, input SendMessageInput) (preparedMessageCompletion, error) {
+	if s.repos.AI == nil {
+		return preparedMessageCompletion{}, ErrUnavailable
+	}
+	if s.client == nil {
+		return preparedMessageCompletion{}, ErrUnavailable
+	}
+	text := strings.TrimSpace(input.Message)
+	if input.UserID == "" || input.ConversationID == "" || text == "" || len(text) > maxAIMessageLength {
+		return preparedMessageCompletion{}, ErrValidation
+	}
+	conversation, err := s.repos.AI.GetConversation(ctx, input.UserID, input.ConversationID)
+	if err != nil {
+		return preparedMessageCompletion{}, mapRepositoryError(err)
+	}
+	usedFiles, err := s.repos.AI.ListUploadedFilesByIDs(ctx, input.UserID, input.ConversationID, input.AIFileIDs)
+	if err != nil {
+		return preparedMessageCompletion{}, mapRepositoryError(err)
+	}
+	if len(usedFiles) != len(uniqueStrings(input.AIFileIDs)) {
+		return preparedMessageCompletion{}, repository.ErrNotFound
+	}
+	for _, file := range usedFiles {
+		switch file.ParseStatus {
+		case "ready":
+		case "failed":
+			return preparedMessageCompletion{}, ErrParseFailed
+		default:
+			return preparedMessageCompletion{}, ErrNotReady
+		}
+	}
+	contextChunks, err := s.selectFileContext(ctx, input.UserID, conversation.ID, usedFiles, text)
+	if err != nil {
+		return preparedMessageCompletion{}, mapRepositoryError(err)
+	}
+
+	userMessage, err := s.repos.AI.CreateMessage(ctx, repository.CreateAIMessageParams{
+		ConversationID: conversation.ID,
+		Role:           "user",
+		Text:           text,
+		TokenCount:     roughTokenCount(text),
+	})
+	if err != nil {
+		return preparedMessageCompletion{}, mapRepositoryError(err)
+	}
+
+	history, err := s.repos.AI.ListMessages(ctx, input.UserID, conversation.ID)
+	if err != nil {
+		return preparedMessageCompletion{}, mapRepositoryError(err)
+	}
+	model := s.cfg.DefaultModel
+	if conversation.Model != nil && strings.TrimSpace(*conversation.Model) != "" {
+		model = strings.TrimSpace(*conversation.Model)
+	}
+	return preparedMessageCompletion{
+		conversation: conversation,
+		userMessage:  userMessage,
+		usedFiles:    usedFiles,
+		model:        model,
+		messages:     makeCompletionMessages(history, contextChunks),
 	}, nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,5 +92,60 @@ func TestOpenAICompatibleClientCompleteSendsInputAndParsesOutput(t *testing.T) {
 	}
 	if captured["reasoning_effort"] != "high" {
 		t.Fatalf("reasoning_effort = %v, want high", captured["reasoning_effort"])
+	}
+}
+
+func TestOpenAICompatibleClientStreamParsesSSEChunks(t *testing.T) {
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept"); got != "text/event-stream" {
+			t.Fatalf("Accept = %q, want text/event-stream", got)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"total_tokens\":9}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	client, err := ai.NewChatClient(config.AIConfig{
+		Provider:       "openai-compatible",
+		APIKey:         "test-key",
+		BaseURL:        server.URL,
+		RequestTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewChatClient() error = %v", err)
+	}
+
+	var chunks []string
+	output, err := client.Stream(context.Background(), ai.CompletionRequest{
+		Model:    "mock-model",
+		Messages: []ai.ChatMessage{{Role: "user", Content: "stream"}},
+	}, func(delta ai.CompletionStreamDelta) error {
+		chunks = append(chunks, delta.Content)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+
+	if output.Content != "hello world" {
+		t.Fatalf("Content = %q, want hello world", output.Content)
+	}
+	if strings.Join(chunks, "") != "hello world" {
+		t.Fatalf("chunks = %#v, want hello world", chunks)
+	}
+	if output.TokenCount != 9 {
+		t.Fatalf("TokenCount = %d, want 9", output.TokenCount)
+	}
+	if output.FinishReason != "stop" {
+		t.Fatalf("FinishReason = %q, want stop", output.FinishReason)
+	}
+	if captured["stream"] != true {
+		t.Fatalf("stream = %v, want true", captured["stream"])
 	}
 }

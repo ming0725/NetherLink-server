@@ -38,6 +38,7 @@ type Server struct {
 	realtimeHub     *realtime.Hub
 	realtimeFanout  *realtime.RedisFanout
 	realtimeCleanup *realtime.CleanupWorker
+	aiStreams       *aiStreamRegistry
 	storage         storage.ObjectStorageProvider
 	logger          *slog.Logger
 	handler         http.Handler
@@ -132,6 +133,7 @@ func NewWithDependencies(deps Dependencies) *Server {
 		realtimeHub:     deps.RealtimeHub,
 		realtimeFanout:  deps.RealtimeFanout,
 		realtimeCleanup: deps.RealtimeCleanup,
+		aiStreams:       newAIStreamRegistry(),
 		storage:         deps.Storage,
 		logger:          deps.Logger,
 	}

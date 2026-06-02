@@ -11,9 +11,11 @@ import (
 
 	"golang.org/x/net/websocket"
 
+	aisvc "nlserver/internal/ai"
 	authsvc "nlserver/internal/auth"
 	chatsvc "nlserver/internal/chat"
 	"nlserver/internal/realtime"
+	"nlserver/internal/repository"
 )
 
 type websocketClientMessage struct {
@@ -49,6 +51,40 @@ type websocketSendMessagePayload struct {
 type websocketMessageSentPayload struct {
 	ClientMessageID string          `json:"clientMessageId"`
 	Message         messageResponse `json:"message"`
+}
+
+type websocketAIMessagePayload struct {
+	ConversationID  string   `json:"conversationId"`
+	Message         string   `json:"message"`
+	ClientMessageID string   `json:"clientMessageId"`
+	AIFileIDs       []string `json:"aiFileIds"`
+}
+
+type websocketAIStreamCancelPayload struct {
+	StreamID string `json:"streamId"`
+}
+
+type websocketAIStreamStartedPayload struct {
+	StreamID        string `json:"streamId"`
+	ConversationID  string `json:"conversationId"`
+	ClientMessageID string `json:"clientMessageId,omitempty"`
+}
+
+type websocketAIStreamChunkPayload struct {
+	StreamID string `json:"streamId"`
+	Delta    string `json:"delta"`
+}
+
+type websocketAIStreamDonePayload struct {
+	StreamID         string                   `json:"streamId"`
+	UserMessage      aiMessageResponse        `json:"userMessage"`
+	AssistantMessage aiMessageResponse        `json:"assistantMessage"`
+	UsedFiles        []aiUploadedFileResponse `json:"usedFiles"`
+	FinishReason     string                   `json:"finishReason,omitempty"`
+}
+
+type websocketAIStreamCancelledPayload struct {
+	StreamID string `json:"streamId"`
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -95,7 +131,12 @@ func (s *Server) serveWebSocket(ctx context.Context, conn *websocket.Conn, princ
 	if connection == nil {
 		return
 	}
-	defer s.realtimeHub.Disconnect(connection)
+	defer func() {
+		if s.aiStreams != nil {
+			s.aiStreams.CancelConnection(connection.ID())
+		}
+		s.realtimeHub.Disconnect(connection)
+	}()
 
 	if durableReplay, durableSyncRequired, ok := s.loadDurableReplay(ctx, principal.UserID, lastEventSeq); ok {
 		replay = durableReplay
@@ -147,6 +188,10 @@ func (s *Server) serveWebSocket(ctx context.Context, conn *websocket.Conn, princ
 			})
 		case "chat.message.send":
 			s.handleWebSocketSendMessage(ctx, connection, principal, message.Payload)
+		case "ai.message.send":
+			s.handleWebSocketAIMessageSend(ctx, connection, principal, message.Payload)
+		case "ai.stream.cancel":
+			s.handleWebSocketAIStreamCancel(connection, principal, message.Payload)
 		default:
 			s.sendWebSocketError(connection, message.Type, "UNKNOWN_MESSAGE_TYPE", "Unsupported WebSocket message type")
 		}
@@ -257,6 +302,124 @@ func (s *Server) sendWebSocketError(conn *realtime.Connection, requestType strin
 		Code:        code,
 		Message:     message,
 	})
+}
+
+func (s *Server) handleWebSocketAIMessageSend(ctx context.Context, conn *realtime.Connection, principal AuthPrincipal, payload json.RawMessage) {
+	if s.aiService == nil {
+		s.sendWebSocketError(conn, "ai.message.send", "SERVICE_NOT_READY", "AI service is not configured")
+		return
+	}
+	var req websocketAIMessagePayload
+	if err := json.Unmarshal(payload, &req); err != nil {
+		s.sendWebSocketError(conn, "ai.message.send", "VALIDATION_ERROR", "Invalid AI message payload")
+		return
+	}
+	if err := validateUUID(req.ConversationID, "conversationId"); err != nil {
+		s.sendWebSocketError(conn, "ai.message.send", err.Code, err.Message)
+		return
+	}
+	for _, aiFileID := range req.AIFileIDs {
+		if err := validateUUID(aiFileID, "aiFileId"); err != nil {
+			s.sendWebSocketError(conn, "ai.message.send", err.Code, err.Message)
+			return
+		}
+	}
+
+	if s.aiStreams == nil {
+		s.aiStreams = newAIStreamRegistry()
+	}
+	streamCtx, cancel := context.WithCancel(ctx)
+	streamID := s.aiStreams.Add(principal.UserID, conn.ID(), cancel)
+	if streamID == "" {
+		cancel()
+		s.sendWebSocketError(conn, "ai.message.send", "SERVICE_NOT_READY", "AI stream registry is not configured")
+		return
+	}
+	s.realtimeHub.Send(conn, "ai.stream.started", websocketAIStreamStartedPayload{
+		StreamID:        streamID,
+		ConversationID:  req.ConversationID,
+		ClientMessageID: req.ClientMessageID,
+	})
+
+	go s.runWebSocketAIStream(streamCtx, conn, principal, streamID, req)
+}
+
+func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connection, principal AuthPrincipal, streamID string, req websocketAIMessagePayload) {
+	defer func() {
+		if s.aiStreams != nil {
+			s.aiStreams.Remove(streamID)
+		}
+	}()
+	result, err := s.aiService.StreamMessage(ctx, aisvc.StreamMessageInput{
+		SendMessageInput: aisvc.SendMessageInput{
+			UserID:          principal.UserID,
+			ConversationID:  req.ConversationID,
+			Message:         req.Message,
+			ClientMessageID: req.ClientMessageID,
+			AIFileIDs:       req.AIFileIDs,
+		},
+		OnDelta: func(delta aisvc.StreamMessageDelta) error {
+			select {
+			case <-conn.Done():
+				return context.Canceled
+			default:
+			}
+			s.realtimeHub.Send(conn, "ai.stream.chunk", websocketAIStreamChunkPayload{
+				StreamID: streamID,
+				Delta:    delta.Content,
+			})
+			return nil
+		},
+	})
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			s.realtimeHub.Send(conn, "ai.stream.cancelled", websocketAIStreamCancelledPayload{StreamID: streamID})
+			return
+		}
+		code, message := aiErrorCodeAndMessage(err)
+		s.sendWebSocketError(conn, "ai.message.send", code, message)
+		return
+	}
+	s.realtimeHub.Send(conn, "ai.stream.done", websocketAIStreamDonePayload{
+		StreamID:         streamID,
+		UserMessage:      makeAIMessageResponse(result.UserMessage),
+		AssistantMessage: makeAIMessageResponse(result.AssistantMessage),
+		UsedFiles:        makeAIUploadedFileResponses(result.UsedFiles),
+		FinishReason:     result.FinishReason,
+	})
+}
+
+func (s *Server) handleWebSocketAIStreamCancel(conn *realtime.Connection, principal AuthPrincipal, payload json.RawMessage) {
+	var req websocketAIStreamCancelPayload
+	if err := json.Unmarshal(payload, &req); err != nil {
+		s.sendWebSocketError(conn, "ai.stream.cancel", "VALIDATION_ERROR", "Invalid AI stream cancel payload")
+		return
+	}
+	if !s.aiStreams.Cancel(req.StreamID, principal.UserID) {
+		s.sendWebSocketError(conn, "ai.stream.cancel", "NOT_FOUND", "AI stream not found")
+		return
+	}
+}
+
+func aiErrorCodeAndMessage(err error) (string, string) {
+	switch {
+	case errors.Is(err, aisvc.ErrValidation):
+		return "VALIDATION_ERROR", "Invalid AI request"
+	case errors.Is(err, aisvc.ErrForbidden):
+		return "FORBIDDEN", "Forbidden"
+	case errors.Is(err, aisvc.ErrNotReady):
+		return "AI_FILE_NOT_READY", "AI file is not ready"
+	case errors.Is(err, aisvc.ErrParseFailed):
+		return "AI_FILE_PARSE_FAILED", "AI file parse failed"
+	case errors.Is(err, aisvc.ErrUnavailable):
+		return "SERVICE_NOT_READY", "AI service is not configured"
+	case errors.Is(err, repository.ErrNotFound):
+		return "NOT_FOUND", "Resource not found"
+	case errors.Is(err, repository.ErrConflict):
+		return "CONFLICT", "Resource conflict"
+	default:
+		return "INTERNAL_ERROR", "Internal server error"
+	}
 }
 
 func webSocketAccessToken(r *http.Request) string {
