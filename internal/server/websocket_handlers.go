@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"golang.org/x/net/websocket"
 
 	authsvc "nlserver/internal/auth"
+	chatsvc "nlserver/internal/chat"
 	"nlserver/internal/realtime"
 )
 
@@ -31,6 +33,22 @@ type websocketReadyPayload struct {
 type websocketSyncRequiredPayload struct {
 	Reason       string `json:"reason"`
 	LastEventSeq uint64 `json:"lastEventSeq"`
+}
+
+type websocketErrorPayload struct {
+	RequestType string `json:"requestType"`
+	Code        string `json:"code"`
+	Message     string `json:"message"`
+}
+
+type websocketSendMessagePayload struct {
+	ConversationID string `json:"conversationId"`
+	sendMessageRequest
+}
+
+type websocketMessageSentPayload struct {
+	ClientMessageID string          `json:"clientMessageId"`
+	Message         messageResponse `json:"message"`
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -61,7 +79,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	lastEventSeq := parseLastEventSeq(r)
 	websocket.Handler(func(conn *websocket.Conn) {
-		s.serveWebSocket(conn, AuthPrincipal{
+		s.serveWebSocket(r.Context(), conn, AuthPrincipal{
 			AccessToken: token,
 			UserID:      principal.UserID,
 			SessionID:   principal.SessionID,
@@ -70,7 +88,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}).ServeHTTP(w, r)
 }
 
-func (s *Server) serveWebSocket(conn *websocket.Conn, principal AuthPrincipal, lastEventSeq uint64) {
+func (s *Server) serveWebSocket(ctx context.Context, conn *websocket.Conn, principal AuthPrincipal, lastEventSeq uint64) {
 	defer conn.Close()
 
 	connection, replay, syncRequired := s.realtimeHub.Connect(principal.UserID, principal.SessionID, principal.DeviceID, lastEventSeq)
@@ -79,12 +97,17 @@ func (s *Server) serveWebSocket(conn *websocket.Conn, principal AuthPrincipal, l
 	}
 	defer s.realtimeHub.Disconnect(connection)
 
+	if durableReplay, durableSyncRequired, ok := s.loadDurableReplay(ctx, principal.UserID, lastEventSeq); ok {
+		replay = durableReplay
+		syncRequired = durableSyncRequired
+	}
+
 	s.realtimeHub.Send(connection, "realtime.ready", websocketReadyPayload{
 		ConnectionID: connection.ID(),
 		UserUUID:     principal.UserID,
 		SessionID:    principal.SessionID,
 		DeviceID:     principal.DeviceID,
-		LastEventSeq: s.realtimeHub.LatestEventSeq(),
+		LastEventSeq: s.latestRealtimeEventSeq(ctx),
 		ConnectedAt:  connection.CreatedAt(),
 	})
 	if syncRequired {
@@ -117,10 +140,15 @@ func (s *Server) serveWebSocket(conn *websocket.Conn, principal AuthPrincipal, l
 		if err := websocket.JSON.Receive(conn, &message); err != nil {
 			return
 		}
-		if strings.EqualFold(strings.TrimSpace(message.Type), "ping") {
+		switch strings.ToLower(strings.TrimSpace(message.Type)) {
+		case "ping":
 			s.realtimeHub.Send(connection, "realtime.pong", map[string]any{
 				"receivedAt": time.Now().UTC(),
 			})
+		case "chat.message.send":
+			s.handleWebSocketSendMessage(ctx, connection, principal, message.Payload)
+		default:
+			s.sendWebSocketError(connection, message.Type, "UNKNOWN_MESSAGE_TYPE", "Unsupported WebSocket message type")
 		}
 		select {
 		case <-writerDone:
@@ -128,6 +156,105 @@ func (s *Server) serveWebSocket(conn *websocket.Conn, principal AuthPrincipal, l
 		default:
 		}
 	}
+}
+
+func (s *Server) loadDurableReplay(ctx context.Context, userID string, lastEventSeq uint64) ([]realtime.Event, bool, bool) {
+	if s.repos.RealtimeEvents == nil || lastEventSeq == 0 {
+		return nil, false, false
+	}
+
+	events, hasMore, err := s.repos.RealtimeEvents.ListForUserAfter(ctx, userID, lastEventSeq, s.realtimeHub.MaxReplayEvents())
+	if err != nil {
+		s.logger.WarnContext(ctx, "failed to load durable realtime replay", "error", err, "user_id", userID)
+		return nil, false, false
+	}
+
+	replay := make([]realtime.Event, 0, len(events))
+	for _, event := range events {
+		replay = append(replay, realtime.Event{
+			EventID:   event.EventID,
+			EventSeq:  event.EventSeq,
+			Type:      event.Type,
+			EmittedAt: event.EmittedAt,
+			Payload:   event.Payload,
+		})
+	}
+	return replay, hasMore, true
+}
+
+func (s *Server) latestRealtimeEventSeq(ctx context.Context) uint64 {
+	if s.repos.RealtimeEvents != nil {
+		latest, err := s.repos.RealtimeEvents.LatestSeq(ctx)
+		if err == nil {
+			return latest
+		}
+		s.logger.WarnContext(ctx, "failed to load latest realtime event seq", "error", err)
+	}
+	return s.realtimeHub.LatestEventSeq()
+}
+
+func (s *Server) handleWebSocketSendMessage(ctx context.Context, conn *realtime.Connection, principal AuthPrincipal, payload json.RawMessage) {
+	if s.chatService == nil {
+		s.sendWebSocketError(conn, "chat.message.send", "SERVICE_NOT_READY", "Chat service is not configured")
+		return
+	}
+
+	var req websocketSendMessagePayload
+	if err := json.Unmarshal(payload, &req); err != nil {
+		s.sendWebSocketError(conn, "chat.message.send", "VALIDATION_ERROR", "Invalid message payload")
+		return
+	}
+	if err := validateUUID(req.ConversationID, "conversationId"); err != nil {
+		s.sendWebSocketError(conn, "chat.message.send", err.Code, err.Message)
+		return
+	}
+	if err := validateSendMessageRequest(req.sendMessageRequest); err != nil {
+		s.sendWebSocketError(conn, "chat.message.send", err.Code, err.Message)
+		return
+	}
+
+	attachments := make([]chatsvc.AttachmentInput, 0, len(req.Attachments))
+	for _, attachment := range req.Attachments {
+		attachments = append(attachments, chatsvc.AttachmentInput(attachment))
+	}
+
+	message, err := s.chatService.SendMessage(ctx, chatsvc.SendMessageInput{
+		UserID:              principal.UserID,
+		ConversationID:      req.ConversationID,
+		ClientMessageID:     req.ClientMessageID,
+		ClientSentAt:        req.ClientSentAt,
+		Type:                req.Type,
+		Content:             req.Content,
+		Attachments:         attachments,
+		ReferencedMessageID: req.ReferencedMessageID,
+	})
+	if err != nil {
+		code, message := chatErrorCodeAndMessage(err)
+		s.sendWebSocketError(conn, "chat.message.send", code, message)
+		return
+	}
+
+	response, err := s.makeMessageResponseFromContext(ctx, message)
+	if err != nil {
+		s.logger.WarnContext(ctx, "failed to build websocket message response", "error", err)
+		s.sendWebSocketError(conn, "chat.message.send", "INTERNAL_ERROR", "Internal server error")
+		return
+	}
+
+	s.publishConversationMessage(ctx, req.ConversationID, "chat.message.created", response)
+	s.publishAllConversationSyncStates(ctx, req.ConversationID, "message.created")
+	s.realtimeHub.Send(conn, "chat.message.sent", websocketMessageSentPayload{
+		ClientMessageID: req.ClientMessageID,
+		Message:         response,
+	})
+}
+
+func (s *Server) sendWebSocketError(conn *realtime.Connection, requestType string, code string, message string) {
+	s.realtimeHub.Send(conn, "client.error", websocketErrorPayload{
+		RequestType: requestType,
+		Code:        code,
+		Message:     message,
+	})
 }
 
 func webSocketAccessToken(r *http.Request) string {
@@ -163,8 +290,27 @@ func parseEventSeq(value string) uint64 {
 	return parsed
 }
 
-func publishRealtimeEvent(hub *realtime.Hub, userIDs []string, eventType string, payload any) {
-	if hub != nil {
-		hub.Publish(userIDs, eventType, payload)
+func (s *Server) publishRealtimeEvent(ctx context.Context, userIDs []string, eventType string, payload any) realtime.Event {
+	if s.realtimeHub == nil {
+		return realtime.Event{}
 	}
+	if s.repos.RealtimeEvents != nil {
+		event, err := s.repos.RealtimeEvents.Create(ctx, userIDs, eventType, realtime.MarshalPayload(payload))
+		if err == nil {
+			realtimeEvent := realtime.Event{
+				EventID:   event.EventID,
+				EventSeq:  event.EventSeq,
+				Type:      event.Type,
+				EmittedAt: event.EmittedAt,
+				Payload:   event.Payload,
+			}
+			s.realtimeHub.PublishEvent(userIDs, realtimeEvent)
+			if err := s.realtimeFanout.Publish(ctx, userIDs, realtimeEvent); err != nil {
+				s.logger.WarnContext(ctx, "failed to publish realtime redis fanout", "error", err, "event_type", eventType)
+			}
+			return realtimeEvent
+		}
+		s.logger.WarnContext(ctx, "failed to persist realtime event; falling back to memory", "error", err, "event_type", eventType)
+	}
+	return s.realtimeHub.Publish(userIDs, eventType, payload)
 }

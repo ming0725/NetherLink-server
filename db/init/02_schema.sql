@@ -330,6 +330,20 @@ CREATE TABLE notifications (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE realtime_events (
+  event_seq BIGSERIAL PRIMARY KEY,
+  type TEXT NOT NULL,
+  payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  emitted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE realtime_event_recipients (
+  event_seq BIGINT NOT NULL REFERENCES realtime_events(event_seq) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (event_seq, user_id)
+);
+
 CREATE TABLE posts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -507,6 +521,7 @@ CREATE INDEX idx_group_members_user_id ON group_members(user_id);
 CREATE INDEX idx_conversation_participants_user_id ON conversation_participants(user_id);
 CREATE INDEX idx_messages_conversation_seq ON messages(conversation_id, message_seq DESC);
 CREATE INDEX idx_notifications_user_read ON notifications(user_id, read_at);
+CREATE INDEX idx_realtime_event_recipients_user_seq ON realtime_event_recipients(user_id, event_seq DESC);
 CREATE INDEX idx_posts_author_created ON posts(author_id, created_at DESC);
 CREATE INDEX idx_post_comments_post_created ON post_comments(post_id, created_at DESC);
 CREATE INDEX idx_post_replies_comment_created ON post_comment_replies(comment_id, created_at ASC);

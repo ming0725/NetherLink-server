@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -365,7 +366,7 @@ func (s *Server) handleUpdateConversationSettings(w http.ResponseWriter, r *http
 		return
 	}
 	response := conversationSettingsResponse{SyncState: makeConversationSyncStateResponse(participant)}
-	s.publishConversationSyncState(r, participant, "settings.updated")
+	s.publishConversationSyncState(r.Context(), participant, "settings.updated")
 	writeJSON(w, http.StatusOK, response)
 }
 
@@ -407,7 +408,7 @@ func (s *Server) handleMarkConversationRead(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	response := conversationSettingsResponse{SyncState: makeConversationSyncStateResponse(participant)}
-	s.publishConversationSyncState(r, participant, "read")
+	s.publishConversationSyncState(r.Context(), participant, "read")
 	writeJSON(w, http.StatusOK, response)
 }
 
@@ -453,7 +454,7 @@ func (s *Server) handleMarkConversationUnread(w http.ResponseWriter, r *http.Req
 		return
 	}
 	response := conversationSettingsResponse{SyncState: makeConversationSyncStateResponse(participant)}
-	s.publishConversationSyncState(r, participant, "unread")
+	s.publishConversationSyncState(r.Context(), participant, "unread")
 	writeJSON(w, http.StatusOK, response)
 }
 
@@ -493,7 +494,7 @@ func (s *Server) handleRecallMessage(w http.ResponseWriter, r *http.Request) {
 		writeChatError(w, r, err)
 		return
 	}
-	s.publishConversationMessage(r, conversationID, "chat.message.recalled", response)
+	s.publishConversationMessage(r.Context(), conversationID, "chat.message.recalled", response)
 	writeJSON(w, http.StatusOK, messageDetailResponse{Message: response})
 }
 
@@ -522,7 +523,7 @@ func (s *Server) handleHideConversationHistory(w http.ResponseWriter, r *http.Re
 		writeChatError(w, r, err)
 		return
 	}
-	s.publishConversationSyncState(r, participant, "history.hidden")
+	s.publishConversationSyncState(r.Context(), participant, "history.hidden")
 	writeJSON(w, http.StatusOK, okResponse{OK: true})
 }
 
@@ -578,8 +579,8 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		writeChatError(w, r, err)
 		return
 	}
-	s.publishConversationMessage(r, conversationID, "chat.message.created", response)
-	s.publishAllConversationSyncStates(r, conversationID, "message.created")
+	s.publishConversationMessage(r.Context(), conversationID, "chat.message.created", response)
+	s.publishAllConversationSyncStates(r.Context(), conversationID, "message.created")
 	writeJSON(w, http.StatusCreated, messageDetailResponse{Message: response})
 }
 
@@ -783,10 +784,14 @@ func makeConversationSyncStateResponse(participant repository.ConversationPartic
 }
 
 func (s *Server) makeMessageResponse(r *http.Request, message repository.Message) (messageResponse, error) {
+	return s.makeMessageResponseFromContext(r.Context(), message)
+}
+
+func (s *Server) makeMessageResponseFromContext(ctx context.Context, message repository.Message) (messageResponse, error) {
 	attachments := make([]messageAttachmentResponse, 0, len(message.Attachments))
 	if message.RecalledAt == nil {
 		for _, attachment := range message.Attachments {
-			url, err := s.presignMessageAttachmentURL(r, attachment.File)
+			url, err := s.presignMessageAttachmentURL(ctx, attachment.File)
 			if err != nil {
 				return messageResponse{}, err
 			}
@@ -833,11 +838,11 @@ func (s *Server) makeMessageResponse(r *http.Request, message repository.Message
 	}, nil
 }
 
-func (s *Server) presignMessageAttachmentURL(r *http.Request, file repository.File) (*string, error) {
+func (s *Server) presignMessageAttachmentURL(ctx context.Context, file repository.File) (*string, error) {
 	if s.storage == nil {
 		return nil, nil
 	}
-	signed, err := s.storage.PresignGetObject(r.Context(), storage.PresignObjectInput{
+	signed, err := s.storage.PresignGetObject(ctx, storage.PresignObjectInput{
 		Bucket:    file.Bucket,
 		ObjectKey: file.ObjectKey,
 		ExpiresIn: s.cfg.Storage.PresignTTL,
@@ -860,20 +865,20 @@ func makeMessageSyncCursor(messages []repository.Message) *messageSyncCursor {
 	}
 }
 
-func (s *Server) publishConversationMessage(r *http.Request, conversationID string, eventType string, message messageResponse) {
+func (s *Server) publishConversationMessage(ctx context.Context, conversationID string, eventType string, message messageResponse) {
 	if s.realtimeHub == nil || s.repos.Chat == nil {
 		return
 	}
-	userIDs, err := s.repos.Chat.ListConversationParticipantUserIDs(r.Context(), conversationID)
+	userIDs, err := s.repos.Chat.ListConversationParticipantUserIDs(ctx, conversationID)
 	if err != nil {
-		s.logger.WarnContext(r.Context(), "failed to list realtime message recipients", "error", err, "conversation_id", conversationID)
+		s.logger.WarnContext(ctx, "failed to list realtime message recipients", "error", err, "conversation_id", conversationID)
 		return
 	}
-	publishRealtimeEvent(s.realtimeHub, userIDs, eventType, realtimeMessagePayload{Message: message})
+	s.publishRealtimeEvent(ctx, userIDs, eventType, realtimeMessagePayload{Message: message})
 }
 
-func (s *Server) publishConversationSyncState(r *http.Request, participant repository.ConversationParticipant, reason string) {
-	publishRealtimeEvent(s.realtimeHub, []string{participant.UserID}, "chat.conversation.sync.updated", realtimeConversationSyncPayload{
+func (s *Server) publishConversationSyncState(ctx context.Context, participant repository.ConversationParticipant, reason string) {
+	s.publishRealtimeEvent(ctx, []string{participant.UserID}, "chat.conversation.sync.updated", realtimeConversationSyncPayload{
 		ConversationID: participant.ConversationID,
 		UserUUID:       participant.UserID,
 		Reason:         reason,
@@ -881,31 +886,47 @@ func (s *Server) publishConversationSyncState(r *http.Request, participant repos
 	})
 }
 
-func (s *Server) publishAllConversationSyncStates(r *http.Request, conversationID string, reason string) {
+func (s *Server) publishAllConversationSyncStates(ctx context.Context, conversationID string, reason string) {
 	if s.realtimeHub == nil || s.repos.Chat == nil {
 		return
 	}
-	participants, err := s.repos.Chat.ListConversationParticipants(r.Context(), conversationID)
+	participants, err := s.repos.Chat.ListConversationParticipants(ctx, conversationID)
 	if err != nil {
-		s.logger.WarnContext(r.Context(), "failed to list realtime sync recipients", "error", err, "conversation_id", conversationID)
+		s.logger.WarnContext(ctx, "failed to list realtime sync recipients", "error", err, "conversation_id", conversationID)
 		return
 	}
 	for _, participant := range participants {
-		s.publishConversationSyncState(r, participant, reason)
+		s.publishConversationSyncState(ctx, participant, reason)
+	}
+}
+
+func chatErrorCodeAndMessage(err error) (string, string) {
+	switch {
+	case errors.Is(err, chatsvc.ErrValidation):
+		return "VALIDATION_ERROR", "Invalid chat request"
+	case errors.Is(err, chatsvc.ErrForbidden):
+		return "FORBIDDEN", "Forbidden"
+	case errors.Is(err, chatsvc.ErrUnavailable):
+		return "SERVICE_NOT_READY", "Chat service is not configured"
+	case errors.Is(err, repository.ErrConflict):
+		return "CONFLICT", "Chat resource conflict"
+	default:
+		return "INTERNAL_ERROR", "Internal server error"
 	}
 }
 
 func writeChatError(w http.ResponseWriter, r *http.Request, err error) {
-	switch {
-	case errors.Is(err, chatsvc.ErrValidation):
-		writeError(w, r, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid chat request")
-	case errors.Is(err, chatsvc.ErrForbidden):
-		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Forbidden")
-	case errors.Is(err, chatsvc.ErrUnavailable):
-		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "Chat service is not configured")
-	case errors.Is(err, repository.ErrConflict):
-		writeError(w, r, http.StatusConflict, "CONFLICT", "Chat resource conflict")
+	code, message := chatErrorCodeAndMessage(err)
+	switch code {
+	case "VALIDATION_ERROR":
+		writeError(w, r, http.StatusBadRequest, code, message)
+	case "FORBIDDEN":
+		writeError(w, r, http.StatusForbidden, code, message)
+	case "SERVICE_NOT_READY":
+		writeError(w, r, http.StatusServiceUnavailable, code, message)
+	case "CONFLICT":
+		writeError(w, r, http.StatusConflict, code, message)
 	default:
-		writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error")
+		writeError(w, r, http.StatusInternalServerError, code, message)
 	}
 }

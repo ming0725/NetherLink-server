@@ -3,6 +3,7 @@ package tests
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"nlserver/internal/realtime"
 )
@@ -57,6 +58,27 @@ func TestRealtimeHubReplaysUserEventsAfterLastEventSeq(t *testing.T) {
 	}
 	if payload["ok"] != "true" {
 		t.Fatalf("payload = %#v, want ok=true", payload)
+	}
+}
+
+func TestRealtimeHubPublishesPersistedEvent(t *testing.T) {
+	hub := realtime.NewHub()
+	conn, _, _ := hub.Connect("user_a", "session_a", "device_a", 0)
+	defer hub.Disconnect(conn)
+
+	hub.PublishEvent([]string{"user_a"}, realtime.Event{
+		EventSeq:  42,
+		Type:      "chat.message.created",
+		EmittedAt: time.Now().UTC(),
+		Payload:   realtime.MarshalPayload(map[string]string{"messageId": "message_42"}),
+	})
+
+	event := receiveHubEvent(t, conn)
+	if event.EventSeq != 42 || event.EventID != "evt_42" {
+		t.Fatalf("event id/seq = %q/%d, want evt_42/42", event.EventID, event.EventSeq)
+	}
+	if hub.LatestEventSeq() != 42 {
+		t.Fatalf("latest seq = %d, want 42", hub.LatestEventSeq())
 	}
 }
 

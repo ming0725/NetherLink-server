@@ -30,6 +30,9 @@ func TestRepositoryAggregateConstructor(t *testing.T) {
 	if repositories.Groups == nil {
 		t.Fatal("Groups repository is nil")
 	}
+	if repositories.RealtimeEvents == nil {
+		t.Fatal("RealtimeEvents repository is nil")
+	}
 	if repositories.OperationReceipts == nil {
 		t.Fatal("OperationReceipts repository is nil")
 	}

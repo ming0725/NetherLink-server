@@ -96,9 +96,18 @@ func (h *Hub) Disconnect(conn *Connection) {
 
 func (h *Hub) Publish(userIDs []string, eventType string, payload any) Event {
 	event := h.newEvent(eventType, payload)
+	h.PublishEvent(userIDs, event)
+	return event
+}
+
+func (h *Hub) PublishEvent(userIDs []string, event Event) {
 	if h == nil || len(userIDs) == 0 {
-		return event
+		return
 	}
+	if event.EventSeq > 0 && event.EventID == "" {
+		event.EventID = fmt.Sprintf("evt_%d", event.EventSeq)
+	}
+	h.observeEventSeq(event.EventSeq)
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -118,8 +127,6 @@ func (h *Hub) Publish(userIDs []string, eventType string, payload any) Event {
 			conn.deliver(event)
 		}
 	}
-
-	return event
 }
 
 func (h *Hub) Send(conn *Connection, eventType string, payload any) Event {
@@ -144,6 +151,13 @@ func (h *Hub) LatestEventSeq() uint64 {
 		return 0
 	}
 	return h.nextSeq.Load()
+}
+
+func (h *Hub) MaxReplayEvents() int {
+	if h == nil {
+		return 0
+	}
+	return h.maxUserEvents
 }
 
 func (c *Connection) ID() string {
@@ -231,6 +245,22 @@ func (h *Hub) newControlEvent(eventType string, payload any) Event {
 		EmittedAt: time.Now().UTC(),
 		Payload:   marshalPayload(payload),
 	}
+}
+
+func (h *Hub) observeEventSeq(seq uint64) {
+	if h == nil || seq == 0 {
+		return
+	}
+	for {
+		current := h.nextSeq.Load()
+		if current >= seq || h.nextSeq.CompareAndSwap(current, seq) {
+			return
+		}
+	}
+}
+
+func MarshalPayload(payload any) json.RawMessage {
+	return marshalPayload(payload)
 }
 
 func appendTrimmed(events []Event, event Event, maxEvents int) []Event {

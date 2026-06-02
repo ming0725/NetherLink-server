@@ -21,32 +21,34 @@ import (
 )
 
 type Server struct {
-	cfg           config.Config
-	db            *pgxpool.Pool
-	redis         *redis.Client
-	repos         repository.Repositories
-	authService   *authsvc.Service
-	chatService   *chatsvc.Service
-	fileService   *filesvc.Service
-	friendService *friendsvc.Service
-	realtimeHub   *realtime.Hub
-	storage       storage.ObjectStorageProvider
-	logger        *slog.Logger
-	handler       http.Handler
+	cfg            config.Config
+	db             *pgxpool.Pool
+	redis          *redis.Client
+	repos          repository.Repositories
+	authService    *authsvc.Service
+	chatService    *chatsvc.Service
+	fileService    *filesvc.Service
+	friendService  *friendsvc.Service
+	realtimeHub    *realtime.Hub
+	realtimeFanout *realtime.RedisFanout
+	storage        storage.ObjectStorageProvider
+	logger         *slog.Logger
+	handler        http.Handler
 }
 
 type Dependencies struct {
-	Config        config.Config
-	DB            *pgxpool.Pool
-	Redis         *redis.Client
-	Repos         repository.Repositories
-	AuthService   *authsvc.Service
-	ChatService   *chatsvc.Service
-	FileService   *filesvc.Service
-	FriendService *friendsvc.Service
-	RealtimeHub   *realtime.Hub
-	Storage       storage.ObjectStorageProvider
-	Logger        *slog.Logger
+	Config         config.Config
+	DB             *pgxpool.Pool
+	Redis          *redis.Client
+	Repos          repository.Repositories
+	AuthService    *authsvc.Service
+	ChatService    *chatsvc.Service
+	FileService    *filesvc.Service
+	FriendService  *friendsvc.Service
+	RealtimeHub    *realtime.Hub
+	RealtimeFanout *realtime.RedisFanout
+	Storage        storage.ObjectStorageProvider
+	Logger         *slog.Logger
 }
 
 func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client, logger *slog.Logger) *Server {
@@ -86,19 +88,24 @@ func NewWithDependencies(deps Dependencies) *Server {
 	if deps.RealtimeHub == nil {
 		deps.RealtimeHub = realtime.NewHub()
 	}
+	if deps.RealtimeFanout == nil && deps.Redis != nil && deps.RealtimeHub != nil {
+		deps.RealtimeFanout = realtime.NewRedisFanout(deps.Redis, deps.RealtimeHub)
+		deps.RealtimeFanout.Start(context.Background(), deps.Logger)
+	}
 
 	server := &Server{
-		cfg:           deps.Config,
-		db:            deps.DB,
-		redis:         deps.Redis,
-		repos:         deps.Repos,
-		authService:   deps.AuthService,
-		chatService:   deps.ChatService,
-		fileService:   deps.FileService,
-		friendService: deps.FriendService,
-		realtimeHub:   deps.RealtimeHub,
-		storage:       deps.Storage,
-		logger:        deps.Logger,
+		cfg:            deps.Config,
+		db:             deps.DB,
+		redis:          deps.Redis,
+		repos:          deps.Repos,
+		authService:    deps.AuthService,
+		chatService:    deps.ChatService,
+		fileService:    deps.FileService,
+		friendService:  deps.FriendService,
+		realtimeHub:    deps.RealtimeHub,
+		realtimeFanout: deps.RealtimeFanout,
+		storage:        deps.Storage,
+		logger:         deps.Logger,
 	}
 
 	mux := http.NewServeMux()
@@ -116,6 +123,7 @@ func repositoriesConfigured(repos repository.Repositories) bool {
 		repos.Chat != nil ||
 		repos.Friends != nil ||
 		repos.Groups != nil ||
+		repos.RealtimeEvents != nil ||
 		repos.OperationReceipts != nil
 }
 
