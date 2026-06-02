@@ -3,6 +3,7 @@ package ai
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"nlserver/internal/config"
@@ -20,6 +21,8 @@ var (
 const (
 	maxAIMessageLength = 20000
 	maxAITitleLength   = 120
+	maxAIContextChunks = 8
+	maxAIContextChars  = 12000
 )
 
 type Service struct {
@@ -173,6 +176,10 @@ func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (Send
 			return SendMessageResult{}, ErrNotReady
 		}
 	}
+	contextChunks, err := s.selectFileContext(ctx, input.UserID, conversation.ID, usedFiles, text)
+	if err != nil {
+		return SendMessageResult{}, mapRepositoryError(err)
+	}
 
 	userMessage, err := s.repos.AI.CreateMessage(ctx, repository.CreateAIMessageParams{
 		ConversationID: conversation.ID,
@@ -196,7 +203,7 @@ func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (Send
 	defer cancel()
 	completion, err := s.client.Complete(providerCtx, CompletionRequest{
 		Model:           model,
-		Messages:        makeCompletionMessages(history),
+		Messages:        makeCompletionMessages(history, contextChunks),
 		ThinkingType:    s.cfg.ThinkingType,
 		ReasoningEffort: s.cfg.ReasoningEffort,
 	})
@@ -317,6 +324,21 @@ func (s *Service) BindFile(ctx context.Context, input BindFileInput) (repository
 	return uploadedFile, nil
 }
 
+func (s *Service) selectFileContext(ctx context.Context, userID string, conversationID string, usedFiles []repository.AIUploadedFile, userMessage string) ([]repository.AIFileChunk, error) {
+	if len(usedFiles) == 0 {
+		return []repository.AIFileChunk{}, nil
+	}
+	ids := make([]string, 0, len(usedFiles))
+	for _, file := range usedFiles {
+		ids = append(ids, file.ID)
+	}
+	chunks, err := s.repos.AI.ListFileChunksByUploadedFileIDs(ctx, userID, conversationID, ids)
+	if err != nil {
+		return nil, err
+	}
+	return selectRelevantChunks(userMessage, chunks), nil
+}
+
 func (s *Service) GenerateTitle(ctx context.Context, firstUserMessage string) (string, error) {
 	if s.client == nil {
 		return "", ErrUnavailable
@@ -363,8 +385,14 @@ func mapRepositoryError(err error) error {
 	}
 }
 
-func makeCompletionMessages(messages []repository.AIMessage) []ChatMessage {
+func makeCompletionMessages(messages []repository.AIMessage, chunks []repository.AIFileChunk) []ChatMessage {
 	result := []ChatMessage{{Role: "system", Content: "You are a helpful assistant."}}
+	if len(chunks) > 0 {
+		result = append(result, ChatMessage{
+			Role:    "system",
+			Content: formatAIFileContext(chunks),
+		})
+	}
 	for _, message := range messages {
 		if message.Role != "user" && message.Role != "assistant" && message.Role != "system" {
 			continue
@@ -372,6 +400,88 @@ func makeCompletionMessages(messages []repository.AIMessage) []ChatMessage {
 		result = append(result, ChatMessage{Role: message.Role, Content: message.Text})
 	}
 	return result
+}
+
+func selectRelevantChunks(query string, chunks []repository.AIFileChunk) []repository.AIFileChunk {
+	if len(chunks) <= maxAIContextChunks {
+		return trimChunksToContext(chunks)
+	}
+	keywords := queryKeywords(query)
+	type scoredChunk struct {
+		chunk repository.AIFileChunk
+		score int
+		index int
+	}
+	scored := make([]scoredChunk, 0, len(chunks))
+	for index, chunk := range chunks {
+		content := strings.ToLower(chunk.Content)
+		score := 0
+		for _, keyword := range keywords {
+			if strings.Contains(content, keyword) {
+				score++
+			}
+		}
+		scored = append(scored, scoredChunk{chunk: chunk, score: score, index: index})
+	}
+	for i := 1; i < len(scored); i++ {
+		current := scored[i]
+		j := i - 1
+		for ; j >= 0 && (scored[j].score < current.score || (scored[j].score == current.score && scored[j].index > current.index)); j-- {
+			scored[j+1] = scored[j]
+		}
+		scored[j+1] = current
+	}
+	selected := make([]repository.AIFileChunk, 0, maxAIContextChunks)
+	for _, item := range scored {
+		if len(selected) >= maxAIContextChunks {
+			break
+		}
+		selected = append(selected, item.chunk)
+	}
+	return trimChunksToContext(selected)
+}
+
+func trimChunksToContext(chunks []repository.AIFileChunk) []repository.AIFileChunk {
+	selected := []repository.AIFileChunk{}
+	used := 0
+	for _, chunk := range chunks {
+		contentLength := len([]rune(chunk.Content))
+		if contentLength == 0 {
+			continue
+		}
+		if used+contentLength > maxAIContextChars && len(selected) > 0 {
+			break
+		}
+		selected = append(selected, chunk)
+		used += contentLength
+		if len(selected) >= maxAIContextChunks {
+			break
+		}
+	}
+	return selected
+}
+
+func queryKeywords(query string) []string {
+	seen := map[string]bool{}
+	result := []string{}
+	for _, part := range strings.Fields(strings.ToLower(query)) {
+		keyword := strings.Trim(part, " \t\r\n.,;:!?()[]{}\"'")
+		if len([]rune(keyword)) < 2 || seen[keyword] {
+			continue
+		}
+		seen[keyword] = true
+		result = append(result, keyword)
+	}
+	return result
+}
+
+func formatAIFileContext(chunks []repository.AIFileChunk) string {
+	var builder strings.Builder
+	builder.WriteString("Use these uploaded-file excerpts as reference context when relevant. If they do not answer the user, say so and answer from general knowledge.\n")
+	for _, chunk := range chunks {
+		builder.WriteString(fmt.Sprintf("\n[aiFileId=%s chunk=%d]\n%s\n", chunk.AIFileID, chunk.ChunkIndex, strings.TrimSpace(chunk.Content)))
+	}
+	return builder.String()
 }
 
 func normalizeOptionalTitle(title *string) *string {

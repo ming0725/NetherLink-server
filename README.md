@@ -31,7 +31,7 @@ Current scope is intentionally small:
 - Post HTTP handlers are available for feed/detail/create/edit/delete, media binding, likes, follows, comments, replies, comment/reply likes, and comment/reply deletion.
 - Notification HTTP handlers are available for listing notifications, marking all notifications read, and marking one notification read.
 - Operation receipt HTTP handler is available for idempotent client-operation result lookup and creation.
-- AI repositories, service, OpenAI-compatible provider client, and AI HTTP handlers are available for conversations, messages, uploaded-file binding, context metadata, feedback, and title generation. Message generation is currently non-streaming; SSE/WS streaming and AI file parsing workers remain next steps.
+- AI repositories, service, OpenAI-compatible provider client, and AI HTTP handlers are available for conversations, messages, uploaded-file binding, context metadata, feedback, and title generation. Message generation is currently non-streaming; uploaded text-like AI files are parsed into `ai_file_chunks` and relevant chunks are injected into provider prompts.
 - Redis is used for auth rate limiting and realtime fanout today. It is not used as the source of truth for users, refresh token sessions, messages, notifications, realtime events, file metadata, or durable business state.
 
 ## Start Local Dependencies
@@ -59,6 +59,8 @@ Default server address:
 - Liveness: `GET /healthz`
 - Readiness: `GET /readyz`
 - API root: `GET /api/v1`
+
+`.env` is the local file that supplies environment variables to Docker Compose and the API server. `NETHERLINK_ENV` is only one variable inside that file; it selects the runtime mode, defaults to `local`, and enables stricter validation when set to `production`.
 
 `/healthz` only verifies that the process is serving HTTP. `/readyz` pings PostgreSQL and Redis, returns `503 SERVICE_NOT_READY` until both dependencies are reachable, and includes realtime hub, Redis fanout, replay, and cleanup counters when ready.
 Unknown routes and unsupported methods return the standard JSON error shape with `code`, `message`, and `requestId`.
@@ -122,7 +124,7 @@ The current API foundation includes:
 - Chat endpoints: `GET /api/v1/conversations`, `POST /api/v1/conversations/direct`, `POST /api/v1/conversations/group`, `GET /api/v1/conversations/{conversationId}`, `PATCH /api/v1/conversations/{conversationId}/settings`, `POST /api/v1/conversations/{conversationId}/read`, `POST /api/v1/conversations/{conversationId}/unread`, `POST /api/v1/conversations/{conversationId}/messages`, `GET /api/v1/conversations/{conversationId}/messages`, `POST /api/v1/conversations/{conversationId}/messages/{messageId}/recall`, and `DELETE /api/v1/conversations/{conversationId}/messages`. Image messages must include attachment `width` and `height`; message responses include those fields on each attachment.
 - Post endpoints: `GET /api/v1/posts`, `POST /api/v1/posts`, `GET /api/v1/posts/{postId}`, `PATCH /api/v1/posts/{postId}`, `DELETE /api/v1/posts/{postId}`, `POST /api/v1/posts/{postId}/like`, `POST /api/v1/users/{authorUuid}/follow`, `GET /api/v1/posts/{postId}/comments`, `POST /api/v1/posts/{postId}/comments`, `POST /api/v1/comments/{commentId}/like`, `POST /api/v1/comments/{commentId}/replies`, `POST /api/v1/replies/{replyId}/like`, `DELETE /api/v1/comments/{commentId}`, and `DELETE /api/v1/replies/{replyId}`.
 - Notification and operation endpoints: `GET /api/v1/notifications`, `POST /api/v1/notifications/read-all`, `POST /api/v1/notifications/{notificationId}/read`, and `POST /api/v1/operations/receipt`.
-- AI endpoints: `GET /api/v1/ai/conversations`, `POST /api/v1/ai/conversations`, `GET /api/v1/ai/conversations/{conversationId}/messages`, `POST /api/v1/ai/conversations/{conversationId}/messages`, `POST /api/v1/ai/conversations/{conversationId}/files`, `GET /api/v1/ai/conversations/{conversationId}/files`, `GET /api/v1/ai/files/{aiFileId}`, `DELETE /api/v1/ai/files/{aiFileId}`, `GET /api/v1/ai/conversations/{conversationId}/context`, `POST /api/v1/ai/messages/{messageId}/feedback`, and `POST /api/v1/ai/title`. Message generation uses the configured provider synchronously for now; file binding creates `ai_parse` jobs, but parsing workers are not implemented yet.
+- AI endpoints: `GET /api/v1/ai/conversations`, `POST /api/v1/ai/conversations`, `GET /api/v1/ai/conversations/{conversationId}/messages`, `POST /api/v1/ai/conversations/{conversationId}/messages`, `POST /api/v1/ai/conversations/{conversationId}/files`, `GET /api/v1/ai/conversations/{conversationId}/files`, `GET /api/v1/ai/files/{aiFileId}`, `DELETE /api/v1/ai/files/{aiFileId}`, `GET /api/v1/ai/conversations/{conversationId}/context`, `POST /api/v1/ai/messages/{messageId}/feedback`, and `POST /api/v1/ai/title`. Message generation uses the configured provider synchronously for now; file binding creates `ai_parse` jobs for text-like files, the worker writes `ai_file_chunks`, and message sending selects relevant chunks for the model input.
 
 PostgreSQL:
 
@@ -148,6 +150,7 @@ MinIO:
 
 Project-level configuration uses the `NETHERLINK_` prefix, for example `NETHERLINK_POSTGRES_PASSWORD` and `NETHERLINK_OBJECT_STORAGE_SECRET_KEY`.
 Docker Compose maps those values to the official container variables required by PostgreSQL and MinIO.
+The project has one environment-variable namespace. `.env` is a local values file for that namespace; `NETHERLINK_ENV` is the runtime-mode value within it, not a separate environment file or duplicate configuration source.
 
 ## Configuration And Secrets
 
@@ -217,13 +220,13 @@ The MinIO/S3 provider implements object PUT/GET/HEAD/DELETE, presigned GET/PUT U
 
 The processing worker supports image metadata and `thumbnail_512` JPEG variants, video metadata plus `video_cover_512` JPEG variants through `ffprobe` / `ffmpeg`, and audio duration probing through `ffprobe`. The cleanup worker claims expired upload sessions and unused files with `FOR UPDATE SKIP LOCKED`, aborts stale multipart uploads, deletes original and variant objects, and marks cleaned file metadata as `deleted`.
 
-AI file binding creates `file_usages(usage_type=ai_upload)` and a pending `file_processing_jobs(job_type=ai_parse)` row. The current processing worker does not yet claim `ai_parse`; the next worker should parse supported document/text formats, write chunks or extracted text metadata, and mark `ai_uploaded_files.parse_status` as `ready` or `failed`.
+AI file binding creates `file_usages(usage_type=ai_upload)` and a pending `file_processing_jobs(job_type=ai_parse)` row. The processing worker now claims `ai_parse` jobs for UTF-8 text-like files such as plain text, Markdown, JSON, CSV, logs, XML, HTML, code, and common config files. It reads the original object, validates text content, stores bounded chunks in `ai_file_chunks`, records job result JSON, and marks `ai_uploaded_files.parse_status` as `ready` or `failed`.
 
 ## AI Boundary
 
 `internal/ai` owns AI conversation service logic and the OpenAI-compatible `/chat/completions` provider client. The service stores user messages before model calls, stores assistant messages after successful provider responses, rejects unparsed AI files with `AI_FILE_NOT_READY`, and maps failed parses to `AI_FILE_PARSE_FAILED`. Provider credentials are read only from `NETHERLINK_AI_API_KEY`; code and docs must not contain real API keys.
 
-Current generation is synchronous and non-streaming. `POST /api/v1/ai/conversations/{conversationId}/messages` returns the stored user message, created assistant message ID, an empty `streamId`, and used files. Streaming chunks, cancellation, WebSocket `ai.message.send`, and retrieval-augmented context selection remain future work.
+Current generation is synchronous and non-streaming. `POST /api/v1/ai/conversations/{conversationId}/messages` returns the stored user message, created assistant message ID, an empty `streamId`, and used files. When `aiFileIds` are supplied, the service rejects pending/failed parses and injects a bounded set of relevant `ai_file_chunks` into the provider prompt. Streaming chunks, cancellation, and WebSocket `ai.message.send` remain future work.
 
 ## Chat Boundary
 
@@ -283,5 +286,5 @@ The former `internal/database/postgres_test.go` was a single DSN unit test, not 
 
 ## Next Build Steps
 
-1. Add AI file parsing worker support for `ai_parse` jobs, parsed chunk storage, extracted text retention policy handling, and parse-status transitions.
+1. Add extracted-text object retention policy handling for `source_deleted_after_parse`, richer document parsers such as PDF/docx/xlsx, and optional embeddings for AI chunk search.
 2. Add SSE/WS streaming runtime, `ai.message.send`, `ai.stream.cancel`, and provider response cancellation.

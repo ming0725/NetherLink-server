@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"nlserver/internal/repository"
 	"nlserver/internal/storage"
@@ -30,6 +31,10 @@ const (
 	maxMediaProbeSourceBytes      = 256 * 1024 * 1024
 	mediaCommandTimeout           = 45 * time.Second
 	staleProcessingJobAge         = 15 * time.Minute
+	maxAIParseSourceBytes         = 4 * 1024 * 1024
+	aiParseChunkRunes             = 2400
+	aiParseChunkOverlapRunes      = 200
+	maxAIParseChunks              = 80
 )
 
 type ProcessingWorker struct {
@@ -58,6 +63,13 @@ type videoProcessingResult struct {
 type audioProcessingResult struct {
 	DurationMS *int   `json:"durationMs,omitempty"`
 	FormatName string `json:"formatName,omitempty"`
+}
+
+type aiParseResult struct {
+	UploadedFileIDs []string `json:"uploadedFileIds"`
+	ChunkCount      int      `json:"chunkCount"`
+	TokenCount      int      `json:"tokenCount"`
+	Truncated       bool     `json:"truncated"`
 }
 
 type ffprobeOutput struct {
@@ -159,6 +171,8 @@ func (w *ProcessingWorker) processJob(ctx context.Context, job repository.FilePr
 		return w.processVideo(ctx, job, file)
 	case fileProcessingJobAudio:
 		return w.processAudio(ctx, job, file)
+	case "ai_parse":
+		return w.processAIParse(ctx, job, file)
 	default:
 		return w.failJob(ctx, job, "UNSUPPORTED_JOB_TYPE", map[string]string{"jobType": job.JobType}, false)
 	}
@@ -278,6 +292,47 @@ func (w *ProcessingWorker) processAudio(ctx context.Context, job repository.File
 	}
 
 	return w.finishAudioJob(ctx, job, file, result)
+}
+
+func (w *ProcessingWorker) processAIParse(ctx context.Context, job repository.FileProcessingJob, file repository.File) error {
+	if w.repos.AI == nil {
+		return w.failJob(ctx, job, "AI_REPOSITORY_UNAVAILABLE", map[string]string{"jobType": job.JobType}, false)
+	}
+
+	uploadedFiles, err := w.repos.AI.ListUploadedFilesByFileID(ctx, file.ID)
+	if err != nil {
+		return w.failAIParseJob(ctx, job, file.ID, "AI_UPLOAD_LOOKUP_FAILED", map[string]string{"error": err.Error()})
+	}
+	if len(uploadedFiles) == 0 {
+		result := aiParseResult{UploadedFileIDs: []string{}}
+		return w.finishAIParseJob(ctx, job, file.ID, uploadedFiles, nil, result)
+	}
+	if err := w.repos.AI.SetUploadedFilesParseStatusByFileID(ctx, file.ID, "processing", 0); err != nil {
+		return w.failAIParseJob(ctx, job, file.ID, "AI_PARSE_STATUS_FAILED", map[string]string{"error": err.Error()})
+	}
+
+	data, err := w.readObjectBytesLimited(ctx, file, maxAIParseSourceBytes)
+	if err != nil {
+		return w.failAIParseJob(ctx, job, file.ID, "AI_OBJECT_READ_FAILED", map[string]string{"error": err.Error()})
+	}
+	text, err := extractAIText(file, data)
+	if err != nil {
+		return w.failAIParseJob(ctx, job, file.ID, "AI_PARSE_UNSUPPORTED", map[string]string{"error": err.Error(), "mimeType": file.MimeType})
+	}
+
+	chunks, truncated := chunkAIText(text)
+	tokenCount := roughTextTokenCount(text)
+	uploadedFileIDs := make([]string, 0, len(uploadedFiles))
+	for _, uploadedFile := range uploadedFiles {
+		uploadedFileIDs = append(uploadedFileIDs, uploadedFile.ID)
+	}
+	result := aiParseResult{
+		UploadedFileIDs: uploadedFileIDs,
+		ChunkCount:      len(chunks),
+		TokenCount:      tokenCount,
+		Truncated:       truncated,
+	}
+	return w.finishAIParseJob(ctx, job, file.ID, uploadedFiles, chunks, result)
 }
 
 func (w *ProcessingWorker) createImageThumbnail(ctx context.Context, file repository.File, width int, height int) (repository.FileVariant, error) {
@@ -476,6 +531,63 @@ func (w *ProcessingWorker) finishAudioJob(ctx context.Context, job repository.Fi
 	})
 }
 
+func (w *ProcessingWorker) finishAIParseJob(ctx context.Context, job repository.FileProcessingJob, fileID string, uploadedFiles []repository.AIUploadedFile, chunkTexts []string, result aiParseResult) error {
+	resultJSON, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+
+	return repository.WithTx(ctx, w.db, func(repos repository.Repositories) error {
+		if repos.AI == nil {
+			return errors.New("ai repository unavailable")
+		}
+		for _, uploadedFile := range uploadedFiles {
+			chunks := make([]repository.CreateAIFileChunkParams, 0, len(chunkTexts))
+			for index, content := range chunkTexts {
+				metadata, err := json.Marshal(map[string]any{
+					"sourceFileId": fileID,
+					"chunkIndex":   index,
+				})
+				if err != nil {
+					return err
+				}
+				chunks = append(chunks, repository.CreateAIFileChunkParams{
+					AIFileID:   uploadedFile.ID,
+					ChunkIndex: index,
+					Content:    content,
+					TokenCount: roughTextTokenCount(content),
+					Metadata:   metadata,
+				})
+			}
+			if err := repos.AI.ReplaceFileChunks(ctx, uploadedFile.ID, chunks); err != nil {
+				return err
+			}
+			if _, err := repos.AI.SetUploadedFileParseStatus(ctx, uploadedFile.ID, "ready", result.TokenCount); err != nil {
+				return err
+			}
+		}
+		_, err := repos.Files.MarkProcessingJobSucceeded(ctx, job.ID, resultJSON)
+		return err
+	})
+}
+
+func (w *ProcessingWorker) failAIParseJob(ctx context.Context, job repository.FileProcessingJob, fileID string, errorCode string, payload any) error {
+	result, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	return repository.WithTx(ctx, w.db, func(repos repository.Repositories) error {
+		if repos.AI != nil {
+			if err := repos.AI.SetUploadedFilesParseStatusByFileID(ctx, fileID, "failed", 0); err != nil {
+				return err
+			}
+		}
+		_, err := repos.Files.MarkProcessingJobFailed(ctx, job.ID, errorCode, result)
+		return err
+	})
+}
+
 func (w *ProcessingWorker) failJob(ctx context.Context, job repository.FileProcessingJob, errorCode string, payload any, markFileFailed bool) error {
 	result, err := json.Marshal(payload)
 	if err != nil {
@@ -624,4 +736,89 @@ func videoCoverObjectKey(sourceObjectKey string) string {
 		dir = "variants"
 	}
 	return strings.TrimRight(dir, "/") + "/video_cover_512.jpg"
+}
+
+func extractAIText(file repository.File, data []byte) (string, error) {
+	if !isSupportedAITextFile(file) && !isLikelyUTF8Text(data) {
+		return "", fmt.Errorf("unsupported AI parse source")
+	}
+	if !utf8.Valid(data) {
+		return "", fmt.Errorf("AI parse source is not valid UTF-8 text")
+	}
+	text := strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
+	if text == "" {
+		return "", fmt.Errorf("AI parse source is empty")
+	}
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	return text, nil
+}
+
+func isSupportedAITextFile(file repository.File) bool {
+	mimeType := strings.ToLower(strings.TrimSpace(strings.Split(file.MimeType, ";")[0]))
+	if strings.HasPrefix(mimeType, "text/") {
+		return true
+	}
+	switch mimeType {
+	case "application/json", "application/xml", "application/x-ndjson", "application/javascript", "application/x-javascript", "application/sql":
+		return true
+	}
+	extension := strings.ToLower(filepath.Ext(file.OriginalFileName))
+	switch extension {
+	case ".txt", ".md", ".markdown", ".json", ".jsonl", ".csv", ".tsv", ".log", ".xml", ".html", ".htm", ".css", ".js", ".ts", ".tsx", ".jsx", ".go", ".py", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".rs", ".sql", ".yaml", ".yml", ".toml", ".ini":
+		return true
+	default:
+		return false
+	}
+}
+
+func isLikelyUTF8Text(data []byte) bool {
+	if len(data) == 0 || !utf8.Valid(data) {
+		return false
+	}
+	control := 0
+	runes := 0
+	for _, r := range string(data) {
+		runes++
+		if r < 32 && r != '\n' && r != '\r' && r != '\t' {
+			control++
+		}
+	}
+	return runes > 0 && float64(control)/float64(runes) < 0.05
+}
+
+func chunkAIText(text string) ([]string, bool) {
+	runes := []rune(strings.TrimSpace(text))
+	if len(runes) == 0 {
+		return []string{}, false
+	}
+	chunks := []string{}
+	for start := 0; start < len(runes) && len(chunks) < maxAIParseChunks; {
+		end := min(start+aiParseChunkRunes, len(runes))
+		chunk := strings.TrimSpace(string(runes[start:end]))
+		if chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+		if end >= len(runes) {
+			return chunks, false
+		}
+		next := end - aiParseChunkOverlapRunes
+		if next <= start {
+			next = end
+		}
+		start = next
+	}
+	return chunks, len(chunks) >= maxAIParseChunks
+}
+
+func roughTextTokenCount(text string) int {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return 0
+	}
+	count := len([]rune(trimmed)) / 4
+	if count < 1 {
+		return 1
+	}
+	return count
 }
