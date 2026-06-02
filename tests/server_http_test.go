@@ -100,8 +100,17 @@ func TestProtectedRouteWithoutTokenReturnsTokenMissing(t *testing.T) {
 		{method: http.MethodPost, path: "/api/v1/files/upload-session/00000000-0000-0000-0000-000000000000/parts"},
 		{method: http.MethodPost, path: "/api/v1/files/upload-session/00000000-0000-0000-0000-000000000000/complete"},
 		{method: http.MethodPost, path: "/api/v1/files/upload-session/00000000-0000-0000-0000-000000000000/abort"},
+		{method: http.MethodGet, path: "/api/v1/conversations"},
+		{method: http.MethodPost, path: "/api/v1/conversations/direct"},
+		{method: http.MethodPost, path: "/api/v1/conversations/group"},
+		{method: http.MethodGet, path: "/api/v1/conversations/00000000-0000-0000-0000-000000000000"},
+		{method: http.MethodPatch, path: "/api/v1/conversations/00000000-0000-0000-0000-000000000000/settings"},
+		{method: http.MethodPost, path: "/api/v1/conversations/00000000-0000-0000-0000-000000000000/read"},
+		{method: http.MethodPost, path: "/api/v1/conversations/00000000-0000-0000-0000-000000000000/unread"},
 		{method: http.MethodGet, path: "/api/v1/conversations/00000000-0000-0000-0000-000000000000/messages"},
 		{method: http.MethodPost, path: "/api/v1/conversations/00000000-0000-0000-0000-000000000000/messages"},
+		{method: http.MethodPost, path: "/api/v1/conversations/00000000-0000-0000-0000-000000000000/messages/00000000-0000-0000-0000-000000000000/recall"},
+		{method: http.MethodDelete, path: "/api/v1/conversations/00000000-0000-0000-0000-000000000000/messages"},
 	}
 
 	for _, route := range protectedRoutes {

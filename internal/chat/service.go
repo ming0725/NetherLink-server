@@ -59,8 +59,276 @@ type ListMessagesInput struct {
 	Limit          int
 }
 
+type ListConversationsInput struct {
+	UserID  string
+	Keyword string
+	Limit   int
+	Offset  int
+}
+
+type OpenDirectConversationInput struct {
+	UserID     string
+	PeerUserID string
+}
+
+type OpenGroupConversationInput struct {
+	UserID  string
+	GroupID string
+}
+
+type GetConversationInput struct {
+	UserID         string
+	ConversationID string
+}
+
+type UpdateConversationSettingsInput struct {
+	UserID         string
+	ConversationID string
+	IsPinned       *bool
+	IsDND          *bool
+	Hidden         *bool
+}
+
+type MarkConversationReadInput struct {
+	UserID            string
+	ConversationID    string
+	LastReadMessageID *string
+	LastReadAt        *time.Time
+}
+
+type MarkConversationUnreadInput struct {
+	UserID            string
+	ConversationID    string
+	LastReadMessageID *string
+	UnreadCount       *int
+}
+
+type RecallMessageInput struct {
+	UserID         string
+	ConversationID string
+	MessageID      string
+}
+
+type HideConversationHistoryInput struct {
+	UserID         string
+	ConversationID string
+}
+
 func NewService(repos repository.Repositories, tx repository.TxBeginner) *Service {
 	return &Service{repos: repos, tx: tx}
+}
+
+func (s *Service) ListConversations(ctx context.Context, input ListConversationsInput) ([]repository.ConversationEntry, error) {
+	if s.repos.Chat == nil {
+		return nil, ErrUnavailable
+	}
+	if strings.TrimSpace(input.UserID) == "" || input.Limit <= 0 || input.Offset < 0 {
+		return nil, ErrValidation
+	}
+	conversations, err := s.repos.Chat.ListConversationsForUser(ctx, input.UserID, input.Keyword, input.Limit, input.Offset)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return conversations, nil
+}
+
+func (s *Service) OpenDirectConversation(ctx context.Context, input OpenDirectConversationInput) (repository.ConversationEntry, error) {
+	if s.repos.Chat == nil || s.repos.Users == nil || s.tx == nil {
+		return repository.ConversationEntry{}, ErrUnavailable
+	}
+	if strings.TrimSpace(input.UserID) == "" || strings.TrimSpace(input.PeerUserID) == "" || input.UserID == input.PeerUserID {
+		return repository.ConversationEntry{}, ErrValidation
+	}
+
+	var conversationID string
+	err := repository.WithTx(ctx, s.tx, func(repos repository.Repositories) error {
+		peer, err := repos.Users.GetByID(ctx, input.PeerUserID)
+		if err != nil {
+			return err
+		}
+		if peer.Status != "active" {
+			return ErrForbidden
+		}
+
+		foundID, found, err := repos.Chat.FindDirectConversation(ctx, input.UserID, input.PeerUserID)
+		if err != nil {
+			return err
+		}
+		if found {
+			conversationID = foundID
+			return nil
+		}
+
+		conversation, err := repos.Chat.CreateConversation(ctx, repository.CreateConversationParams{
+			Type:       "direct",
+			PeerUserID: &input.PeerUserID,
+		})
+		if err != nil {
+			return err
+		}
+		if err := repos.Chat.AddConversationParticipants(ctx, conversation.ID, []string{input.UserID, input.PeerUserID}); err != nil {
+			return err
+		}
+		conversationID = conversation.ID
+		return nil
+	})
+	if err != nil {
+		return repository.ConversationEntry{}, mapError(err)
+	}
+
+	return s.GetConversation(ctx, GetConversationInput{UserID: input.UserID, ConversationID: conversationID})
+}
+
+func (s *Service) OpenGroupConversation(ctx context.Context, input OpenGroupConversationInput) (repository.ConversationEntry, error) {
+	if s.repos.Chat == nil || s.repos.Groups == nil || s.tx == nil {
+		return repository.ConversationEntry{}, ErrUnavailable
+	}
+	if strings.TrimSpace(input.UserID) == "" || strings.TrimSpace(input.GroupID) == "" {
+		return repository.ConversationEntry{}, ErrValidation
+	}
+
+	var conversationID string
+	err := repository.WithTx(ctx, s.tx, func(repos repository.Repositories) error {
+		if _, err := repos.Groups.GetForUser(ctx, input.UserID, input.GroupID); err != nil {
+			return err
+		}
+
+		foundID, found, err := repos.Chat.FindGroupConversation(ctx, input.GroupID)
+		if err != nil {
+			return err
+		}
+		if found {
+			conversationID = foundID
+			if err := repos.Chat.AddConversationParticipants(ctx, conversationID, []string{input.UserID}); err != nil {
+				return err
+			}
+			return nil
+		}
+
+		groupID := input.GroupID
+		conversation, err := repos.Chat.CreateConversation(ctx, repository.CreateConversationParams{
+			Type:    "group",
+			GroupID: &groupID,
+		})
+		if err != nil {
+			return err
+		}
+		memberIDs, err := repos.Chat.ListGroupMemberUserIDs(ctx, input.GroupID)
+		if err != nil {
+			return err
+		}
+		if len(memberIDs) == 0 {
+			return ErrForbidden
+		}
+		if err := repos.Chat.AddConversationParticipants(ctx, conversation.ID, memberIDs); err != nil {
+			return err
+		}
+		conversationID = conversation.ID
+		return nil
+	})
+	if err != nil {
+		return repository.ConversationEntry{}, mapError(err)
+	}
+
+	return s.GetConversation(ctx, GetConversationInput{UserID: input.UserID, ConversationID: conversationID})
+}
+
+func (s *Service) GetConversation(ctx context.Context, input GetConversationInput) (repository.ConversationEntry, error) {
+	if s.repos.Chat == nil {
+		return repository.ConversationEntry{}, ErrUnavailable
+	}
+	if strings.TrimSpace(input.UserID) == "" || strings.TrimSpace(input.ConversationID) == "" {
+		return repository.ConversationEntry{}, ErrValidation
+	}
+	entry, err := s.repos.Chat.GetConversationForUser(ctx, input.UserID, input.ConversationID)
+	if err != nil {
+		return repository.ConversationEntry{}, mapError(err)
+	}
+	return entry, nil
+}
+
+func (s *Service) UpdateConversationSettings(ctx context.Context, input UpdateConversationSettingsInput) (repository.ConversationParticipant, error) {
+	if s.repos.Chat == nil {
+		return repository.ConversationParticipant{}, ErrUnavailable
+	}
+	if strings.TrimSpace(input.UserID) == "" || strings.TrimSpace(input.ConversationID) == "" {
+		return repository.ConversationParticipant{}, ErrValidation
+	}
+	if input.IsPinned == nil && input.IsDND == nil && input.Hidden == nil {
+		return repository.ConversationParticipant{}, ErrValidation
+	}
+	participant, err := s.repos.Chat.UpdateConversationSettings(ctx, repository.UpdateConversationSettingsParams{
+		UserID:         input.UserID,
+		ConversationID: input.ConversationID,
+		IsPinned:       input.IsPinned,
+		IsDND:          input.IsDND,
+		Hidden:         input.Hidden,
+	})
+	if err != nil {
+		return repository.ConversationParticipant{}, mapError(err)
+	}
+	return participant, nil
+}
+
+func (s *Service) MarkConversationRead(ctx context.Context, input MarkConversationReadInput) (repository.ConversationParticipant, error) {
+	if s.repos.Chat == nil {
+		return repository.ConversationParticipant{}, ErrUnavailable
+	}
+	if strings.TrimSpace(input.UserID) == "" || strings.TrimSpace(input.ConversationID) == "" {
+		return repository.ConversationParticipant{}, ErrValidation
+	}
+	participant, err := s.repos.Chat.MarkConversationRead(ctx, input.UserID, input.ConversationID, normalizedOptional(input.LastReadMessageID), input.LastReadAt)
+	if err != nil {
+		return repository.ConversationParticipant{}, mapError(err)
+	}
+	return participant, nil
+}
+
+func (s *Service) MarkConversationUnread(ctx context.Context, input MarkConversationUnreadInput) (repository.ConversationParticipant, error) {
+	if s.repos.Chat == nil {
+		return repository.ConversationParticipant{}, ErrUnavailable
+	}
+	if strings.TrimSpace(input.UserID) == "" || strings.TrimSpace(input.ConversationID) == "" {
+		return repository.ConversationParticipant{}, ErrValidation
+	}
+	if input.UnreadCount != nil && *input.UnreadCount < 0 {
+		return repository.ConversationParticipant{}, ErrValidation
+	}
+	participant, err := s.repos.Chat.MarkConversationUnread(ctx, input.UserID, input.ConversationID, normalizedOptional(input.LastReadMessageID), input.UnreadCount)
+	if err != nil {
+		return repository.ConversationParticipant{}, mapError(err)
+	}
+	return participant, nil
+}
+
+func (s *Service) RecallMessage(ctx context.Context, input RecallMessageInput) (repository.Message, error) {
+	if s.repos.Chat == nil {
+		return repository.Message{}, ErrUnavailable
+	}
+	if strings.TrimSpace(input.UserID) == "" ||
+		strings.TrimSpace(input.ConversationID) == "" ||
+		strings.TrimSpace(input.MessageID) == "" {
+		return repository.Message{}, ErrValidation
+	}
+	message, err := s.repos.Chat.RecallMessage(ctx, input.UserID, input.ConversationID, input.MessageID)
+	if err != nil {
+		return repository.Message{}, mapError(err)
+	}
+	return message, nil
+}
+
+func (s *Service) HideConversationHistory(ctx context.Context, input HideConversationHistoryInput) (repository.ConversationParticipant, error) {
+	if s.repos.Chat == nil {
+		return repository.ConversationParticipant{}, ErrUnavailable
+	}
+	if strings.TrimSpace(input.UserID) == "" || strings.TrimSpace(input.ConversationID) == "" {
+		return repository.ConversationParticipant{}, ErrValidation
+	}
+	participant, err := s.repos.Chat.HideConversationHistory(ctx, input.UserID, input.ConversationID)
+	if err != nil {
+		return repository.ConversationParticipant{}, mapError(err)
+	}
+	return participant, nil
 }
 
 func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (repository.Message, error) {

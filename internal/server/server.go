@@ -173,8 +173,17 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/v1/files/upload-session/{uploadSessionId}/parts", s.withAuthRequired(http.HandlerFunc(s.handlePresignUploadParts)))
 	mux.Handle("POST /api/v1/files/upload-session/{uploadSessionId}/complete", s.withAuthRequired(http.HandlerFunc(s.handleCompleteUploadSession)))
 	mux.Handle("POST /api/v1/files/upload-session/{uploadSessionId}/abort", s.withAuthRequired(http.HandlerFunc(s.handleAbortUploadSession)))
+	mux.Handle("GET /api/v1/conversations", s.withAuthRequired(http.HandlerFunc(s.handleListConversations)))
+	mux.Handle("POST /api/v1/conversations/direct", s.withAuthRequired(http.HandlerFunc(s.handleOpenDirectConversation)))
+	mux.Handle("POST /api/v1/conversations/group", s.withAuthRequired(http.HandlerFunc(s.handleOpenGroupConversation)))
+	mux.Handle("GET /api/v1/conversations/{conversationId}", s.withAuthRequired(http.HandlerFunc(s.handleGetConversation)))
+	mux.Handle("PATCH /api/v1/conversations/{conversationId}/settings", s.withAuthRequired(http.HandlerFunc(s.handleUpdateConversationSettings)))
+	mux.Handle("POST /api/v1/conversations/{conversationId}/read", s.withAuthRequired(http.HandlerFunc(s.handleMarkConversationRead)))
+	mux.Handle("POST /api/v1/conversations/{conversationId}/unread", s.withAuthRequired(http.HandlerFunc(s.handleMarkConversationUnread)))
 	mux.Handle("GET /api/v1/conversations/{conversationId}/messages", s.withAuthRequired(http.HandlerFunc(s.handleListMessages)))
 	mux.Handle("POST /api/v1/conversations/{conversationId}/messages", s.withAuthRequired(http.HandlerFunc(s.handleSendMessage)))
+	mux.Handle("POST /api/v1/conversations/{conversationId}/messages/{messageId}/recall", s.withAuthRequired(http.HandlerFunc(s.handleRecallMessage)))
+	mux.Handle("DELETE /api/v1/conversations/{conversationId}/messages", s.withAuthRequired(http.HandlerFunc(s.handleHideConversationHistory)))
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
