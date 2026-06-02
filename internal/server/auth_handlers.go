@@ -256,7 +256,12 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, makeUserResponse(user))
+	response := makeUserResponse(user)
+	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, map[string]any{
+		"reason": "profile.updated",
+		"user":   response,
+	})
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
@@ -286,7 +291,12 @@ func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, makeUserResponse(user))
+	response := makeUserResponse(user)
+	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, map[string]any{
+		"reason": "public_id.updated",
+		"user":   response,
+	})
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleCheckMeUserID(w http.ResponseWriter, r *http.Request) {
@@ -380,7 +390,12 @@ func (s *Server) handleGetMePreferences(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	writeJSON(w, http.StatusOK, makePreferencesResponse(preferences))
+	response := makePreferencesResponse(preferences)
+	s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "user.preferences.updated", map[string]any{
+		"reason":      "preferences.updated",
+		"preferences": response,
+	})
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handlePatchMePreferences(w http.ResponseWriter, r *http.Request) {

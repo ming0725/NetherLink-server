@@ -801,6 +801,48 @@ func (r *GroupRepository) ListMembers(ctx context.Context, userID string, groupI
 	return members, total, nil
 }
 
+func (r *GroupRepository) ListActiveMemberUserIDs(ctx context.Context, groupID string) ([]string, error) {
+	return r.listMemberUserIDsByRole(ctx, groupID, nil)
+}
+
+func (r *GroupRepository) ListPrivilegedMemberUserIDs(ctx context.Context, groupID string) ([]string, error) {
+	return r.listMemberUserIDsByRole(ctx, groupID, []string{"owner", "admin"})
+}
+
+func (r *GroupRepository) listMemberUserIDsByRole(ctx context.Context, groupID string, roles []string) ([]string, error) {
+	roleFilter := ""
+	args := []any{normalizeText(groupID)}
+	if len(roles) > 0 {
+		roleFilter = " AND role = ANY($2::text[])"
+		args = append(args, roles)
+	}
+
+	rows, err := r.db.Query(ctx, `
+		SELECT user_id
+		FROM group_members
+		WHERE group_id = $1::uuid`+roleFilter+`
+		ORDER BY user_id`,
+		args...,
+	)
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	defer rows.Close()
+
+	userIDs := []string{}
+	for rows.Next() {
+		var userID pgtype.UUID
+		if err := rows.Scan(&userID); err != nil {
+			return nil, err
+		}
+		userIDs = append(userIDs, uuidString(userID))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return userIDs, nil
+}
+
 func scanGroupListEntry(row scanner) (GroupListEntry, int, error) {
 	var (
 		entry         GroupListEntry

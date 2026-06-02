@@ -308,6 +308,22 @@ func (r *UserRepository) UpdateProfile(ctx context.Context, params UpdateUserPro
 	return user, translateWriteError(err)
 }
 
+func (r *UserRepository) UpdateAvatarFile(ctx context.Context, userID string, avatarFileID string) (User, error) {
+	row := r.db.QueryRow(ctx, `
+		UPDATE users
+		SET avatar_file_id = $2::uuid,
+		    version = version + 1
+		WHERE id = $1::uuid
+		  AND deleted_at IS NULL
+		RETURNING `+userSelectColumns,
+		normalizeText(userID),
+		normalizeText(avatarFileID),
+	)
+
+	user, err := scanUser(row)
+	return user, translateWriteError(err)
+}
+
 func (r *UserRepository) UpdatePublicID(ctx context.Context, userID string, publicID string, clientOperationID *string) (User, error) {
 	row := r.db.QueryRow(ctx, `
 		WITH existing_change AS (

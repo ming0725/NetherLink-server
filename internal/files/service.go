@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"path/filepath"
 	"regexp"
@@ -48,6 +49,7 @@ var (
 	ErrUploadCompleted    = errors.New("files: upload session completed")
 	ErrUploadAborted      = errors.New("files: upload session aborted")
 	ErrUploadMode         = errors.New("files: unsupported upload mode")
+	ErrFileReferenced     = errors.New("files: file is referenced")
 )
 
 var targetTypePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
@@ -136,6 +138,60 @@ type CompleteUploadSessionResult struct {
 	ProcessingStatus string
 }
 
+type StoreFileRequest struct {
+	UserID      string
+	TargetType  string
+	FileName    string
+	MimeType    string
+	SizeBytes   int64
+	ContentHash *string
+	Body        io.Reader
+}
+
+type FileVariantResult struct {
+	VariantID   string
+	VariantType string
+	URL         string
+	MimeType    string
+	SizeBytes   int64
+	Width       *int
+	Height      *int
+	DurationMS  *int
+	ETag        *string
+	ContentHash *string
+	CreatedAt   time.Time
+}
+
+type FileResult struct {
+	FileID           string
+	FileName         string
+	MimeType         string
+	SizeBytes        int64
+	URL              string
+	Visibility       string
+	ProcessingStatus string
+	Version          int
+	ETag             *string
+	ContentHash      *string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	Variants         []FileVariantResult
+}
+
+type DownloadURLResult struct {
+	URL       string
+	ExpiresAt time.Time
+	Headers   map[string]string
+}
+
+type AvatarResult struct {
+	FileID            string
+	AvatarURL         string
+	AvatarVersion     int
+	AvatarEtag        *string
+	AvatarContentHash *string
+}
+
 func NewService(cfg config.StorageConfig, repos repository.Repositories, db repository.TxBeginner, provider storage.ObjectStorageProvider) *Service {
 	return &Service{
 		cfg:     cfg,
@@ -143,6 +199,152 @@ func NewService(cfg config.StorageConfig, repos repository.Repositories, db repo
 		db:      db,
 		storage: provider,
 	}
+}
+
+func (s *Service) StoreFile(ctx context.Context, req StoreFileRequest) (FileResult, error) {
+	file, err := s.storeFile(ctx, req)
+	if err != nil {
+		return FileResult{}, err
+	}
+	return s.makeFileResult(ctx, file)
+}
+
+func (s *Service) UploadAvatar(ctx context.Context, req StoreFileRequest) (AvatarResult, error) {
+	req.TargetType = "avatar"
+	file, err := s.storeFile(ctx, req)
+	if err != nil {
+		return AvatarResult{}, err
+	}
+
+	var user repository.User
+	err = repository.WithTx(ctx, s.db, func(repos repository.Repositories) error {
+		if _, err := repos.Files.SoftDeleteUsages(ctx, "avatar", req.UserID); err != nil {
+			return err
+		}
+		if _, err := repos.Files.CreateUsage(ctx, repository.CreateFileUsageParams{
+			FileID:      file.ID,
+			UsageType:   "avatar",
+			BusinessID:  req.UserID,
+			OwnerUserID: req.UserID,
+			Visibility:  "public",
+		}); err != nil {
+			return err
+		}
+		updatedUser, err := repos.Users.UpdateAvatarFile(ctx, req.UserID, file.ID)
+		if err != nil {
+			return err
+		}
+		user = updatedUser
+		return nil
+	})
+	if err != nil {
+		return AvatarResult{}, err
+	}
+
+	signed, err := s.storage.PresignGetObject(ctx, storage.PresignObjectInput{
+		Bucket:    file.Bucket,
+		ObjectKey: file.ObjectKey,
+		ExpiresIn: s.presignTTL(),
+	})
+	if err != nil {
+		return AvatarResult{}, err
+	}
+
+	return AvatarResult{
+		FileID:            file.ID,
+		AvatarURL:         signed.URL,
+		AvatarVersion:     user.Version,
+		AvatarEtag:        file.ETag,
+		AvatarContentHash: file.ContentHash,
+	}, nil
+}
+
+func (s *Service) GetFile(ctx context.Context, userID string, fileID string) (FileResult, error) {
+	if err := s.ensureReady(); err != nil {
+		return FileResult{}, err
+	}
+	file, err := s.repos.Files.Get(ctx, fileID)
+	if err != nil {
+		return FileResult{}, err
+	}
+	if !canReadFile(userID, file) {
+		return FileResult{}, ErrForbidden
+	}
+	return s.makeFileResult(ctx, file)
+}
+
+func (s *Service) PresignDownloadURL(ctx context.Context, userID string, fileID string, variantType string) (DownloadURLResult, error) {
+	if err := s.ensureReady(); err != nil {
+		return DownloadURLResult{}, err
+	}
+	file, err := s.repos.Files.Get(ctx, fileID)
+	if err != nil {
+		return DownloadURLResult{}, err
+	}
+	if !canReadFile(userID, file) {
+		return DownloadURLResult{}, ErrForbidden
+	}
+
+	bucket := file.Bucket
+	objectKey := file.ObjectKey
+	if strings.TrimSpace(variantType) != "" {
+		variants, err := s.repos.Files.ListVariants(ctx, file.ID)
+		if err != nil {
+			return DownloadURLResult{}, err
+		}
+		found := false
+		for _, variant := range variants {
+			if variant.VariantType == strings.TrimSpace(variantType) {
+				bucket = variant.Bucket
+				objectKey = variant.ObjectKey
+				found = true
+				break
+			}
+		}
+		if !found {
+			return DownloadURLResult{}, repository.ErrNotFound
+		}
+	}
+
+	signed, err := s.storage.PresignGetObject(ctx, storage.PresignObjectInput{
+		Bucket:    bucket,
+		ObjectKey: objectKey,
+		ExpiresIn: s.presignTTL(),
+	})
+	if err != nil {
+		return DownloadURLResult{}, err
+	}
+	return DownloadURLResult{URL: signed.URL, ExpiresAt: signed.ExpiresAt, Headers: signed.Headers}, nil
+}
+
+func (s *Service) DeleteFile(ctx context.Context, userID string, fileID string) error {
+	if err := s.ensureReady(); err != nil {
+		return err
+	}
+	file, err := s.repos.Files.Get(ctx, fileID)
+	if err != nil {
+		return err
+	}
+	if file.OwnerUserID == nil || *file.OwnerUserID != userID {
+		return ErrForbidden
+	}
+	referenced, err := s.repos.Files.HasActiveReferences(ctx, file.ID)
+	if err != nil {
+		return err
+	}
+	if referenced {
+		return ErrFileReferenced
+	}
+	variants, err := s.repos.Files.ListVariants(ctx, file.ID)
+	if err != nil {
+		return err
+	}
+
+	_ = s.storage.DeleteObject(ctx, storage.DeleteObjectInput{Bucket: file.Bucket, ObjectKey: file.ObjectKey})
+	for _, variant := range variants {
+		_ = s.storage.DeleteObject(ctx, storage.DeleteObjectInput{Bucket: variant.Bucket, ObjectKey: variant.ObjectKey})
+	}
+	return s.repos.Files.SoftDelete(ctx, file.ID)
 }
 
 func (s *Service) CreateUploadSession(ctx context.Context, req CreateUploadSessionRequest) (UploadSessionResult, error) {
@@ -395,50 +597,21 @@ func (s *Service) CompleteUploadSession(ctx context.Context, req CompleteUploadS
 	}
 	etag := normalizeOptional(&objectInfo.ETag)
 
-	var completedFile repository.File
-	err = repository.WithTx(ctx, s.db, func(repos repository.Repositories) error {
-		updatedFile, err := repos.Files.MarkUploaded(ctx, file.ID, etag, contentHash, objectInfo.SizeBytes)
-		if err != nil {
-			return err
-		}
-		if _, err := repos.Files.CompleteUploadSession(ctx, repository.CompleteUploadSessionParams{
+	updatedFile, err := s.finalizeUploadedFile(ctx, file.ID, etag, contentHash, objectInfo.SizeBytes, func(repos repository.Repositories) error {
+		_, err := repos.Files.CompleteUploadSession(ctx, repository.CompleteUploadSessionParams{
 			SessionID:     session.ID,
 			UserID:        req.UserID,
 			UploadedParts: uploadedParts,
-		}); err != nil {
-			return err
-		}
-
-		jobType := processingJobTypeForFile(updatedFile)
-		if jobType != "" {
-			if _, err := repos.Files.CreateProcessingJob(ctx, repository.CreateFileProcessingJobParams{
-				FileID:  updatedFile.ID,
-				JobType: jobType,
-				Status:  "pending",
-			}); err != nil {
-				return err
-			}
-			updatedFile, err = repos.Files.MarkStatus(ctx, updatedFile.ID, fileStatusProcessing)
-			if err != nil {
-				return err
-			}
-		} else {
-			updatedFile, err = repos.Files.MarkStatus(ctx, updatedFile.ID, fileStatusReady)
-			if err != nil {
-				return err
-			}
-		}
-
-		completedFile = updatedFile
-		return nil
+		})
+		return err
 	})
 	if err != nil {
 		return CompleteUploadSessionResult{}, err
 	}
 
 	downloadURL, err := s.storage.PresignGetObject(ctx, storage.PresignObjectInput{
-		Bucket:    completedFile.Bucket,
-		ObjectKey: completedFile.ObjectKey,
+		Bucket:    updatedFile.Bucket,
+		ObjectKey: updatedFile.ObjectKey,
 		ExpiresIn: s.presignTTL(),
 	})
 	if err != nil {
@@ -446,12 +619,12 @@ func (s *Service) CompleteUploadSession(ctx context.Context, req CompleteUploadS
 	}
 
 	return CompleteUploadSessionResult{
-		FileID:           completedFile.ID,
+		FileID:           updatedFile.ID,
 		URL:              downloadURL.URL,
-		ETag:             completedFile.ETag,
-		ContentHash:      completedFile.ContentHash,
-		Version:          completedFile.Version,
-		ProcessingStatus: completedFile.StorageStatus,
+		ETag:             updatedFile.ETag,
+		ContentHash:      updatedFile.ContentHash,
+		Version:          updatedFile.Version,
+		ProcessingStatus: updatedFile.StorageStatus,
 	}, nil
 }
 
@@ -494,6 +667,160 @@ func (s *Service) ensureReady() error {
 		return ErrStorageUnavailable
 	}
 	return nil
+}
+
+func (s *Service) storeFile(ctx context.Context, req StoreFileRequest) (repository.File, error) {
+	if err := s.ensureReady(); err != nil {
+		return repository.File{}, err
+	}
+	if err := validateStoreFile(req); err != nil {
+		return repository.File{}, err
+	}
+
+	fileID, err := newUUIDString()
+	if err != nil {
+		return repository.File{}, err
+	}
+	bucket, visibility := s.bucketForTarget(req.TargetType)
+	safeName := safeFileName(req.FileName)
+	objectKey := fmt.Sprintf("uploads/%s/%s/%s/%s", normalizePathSegment(req.TargetType), req.UserID, fileID, safeName)
+
+	var file repository.File
+	err = repository.WithTx(ctx, s.db, func(repos repository.Repositories) error {
+		createdFile, err := repos.Files.Create(ctx, repository.CreateFileParams{
+			ID:               fileID,
+			OwnerUserID:      req.UserID,
+			OriginalFileName: req.FileName,
+			Bucket:           bucket,
+			ObjectKey:        objectKey,
+			MimeType:         normalizeText(req.MimeType),
+			SizeBytes:        req.SizeBytes,
+			ContentHash:      normalizeOptional(req.ContentHash),
+			Visibility:       visibility,
+		})
+		if err != nil {
+			return err
+		}
+		file = createdFile
+		return nil
+	})
+	if err != nil {
+		return repository.File{}, err
+	}
+
+	put, err := s.storage.PutObject(ctx, storage.PutObjectInput{
+		Bucket:      file.Bucket,
+		ObjectKey:   file.ObjectKey,
+		Body:        req.Body,
+		SizeBytes:   req.SizeBytes,
+		ContentType: file.MimeType,
+		Metadata:    metadataForUpload(req.ContentHash),
+	})
+	if err != nil {
+		return repository.File{}, err
+	}
+
+	etag := normalizeOptional(&put.ETag)
+	return s.finalizeUploadedFile(ctx, file.ID, etag, normalizeOptional(req.ContentHash), req.SizeBytes, nil)
+}
+
+func (s *Service) finalizeUploadedFile(ctx context.Context, fileID string, etag *string, contentHash *string, sizeBytes int64, extra func(repository.Repositories) error) (repository.File, error) {
+	var completedFile repository.File
+	err := repository.WithTx(ctx, s.db, func(repos repository.Repositories) error {
+		updatedFile, err := repos.Files.MarkUploaded(ctx, fileID, etag, contentHash, sizeBytes)
+		if err != nil {
+			return err
+		}
+		if extra != nil {
+			if err := extra(repos); err != nil {
+				return err
+			}
+		}
+
+		jobType := processingJobTypeForFile(updatedFile)
+		if jobType != "" {
+			if _, err := repos.Files.CreateProcessingJob(ctx, repository.CreateFileProcessingJobParams{
+				FileID:  updatedFile.ID,
+				JobType: jobType,
+				Status:  "pending",
+			}); err != nil {
+				return err
+			}
+			updatedFile, err = repos.Files.MarkStatus(ctx, updatedFile.ID, fileStatusProcessing)
+			if err != nil {
+				return err
+			}
+		} else {
+			updatedFile, err = repos.Files.MarkStatus(ctx, updatedFile.ID, fileStatusReady)
+			if err != nil {
+				return err
+			}
+		}
+
+		completedFile = updatedFile
+		return nil
+	})
+	if err != nil {
+		return repository.File{}, err
+	}
+	return completedFile, nil
+}
+
+func (s *Service) makeFileResult(ctx context.Context, file repository.File) (FileResult, error) {
+	signed, err := s.storage.PresignGetObject(ctx, storage.PresignObjectInput{
+		Bucket:    file.Bucket,
+		ObjectKey: file.ObjectKey,
+		ExpiresIn: s.presignTTL(),
+	})
+	if err != nil {
+		return FileResult{}, err
+	}
+
+	variants, err := s.repos.Files.ListVariants(ctx, file.ID)
+	if err != nil {
+		return FileResult{}, err
+	}
+
+	variantResults := make([]FileVariantResult, 0, len(variants))
+	for _, variant := range variants {
+		variantURL, err := s.storage.PresignGetObject(ctx, storage.PresignObjectInput{
+			Bucket:    variant.Bucket,
+			ObjectKey: variant.ObjectKey,
+			ExpiresIn: s.presignTTL(),
+		})
+		if err != nil {
+			return FileResult{}, err
+		}
+		variantResults = append(variantResults, FileVariantResult{
+			VariantID:   variant.ID,
+			VariantType: variant.VariantType,
+			URL:         variantURL.URL,
+			MimeType:    variant.MimeType,
+			SizeBytes:   variant.SizeBytes,
+			Width:       variant.Width,
+			Height:      variant.Height,
+			DurationMS:  variant.DurationMS,
+			ETag:        variant.ETag,
+			ContentHash: variant.ContentHash,
+			CreatedAt:   variant.CreatedAt,
+		})
+	}
+
+	return FileResult{
+		FileID:           file.ID,
+		FileName:         file.OriginalFileName,
+		MimeType:         file.MimeType,
+		SizeBytes:        file.SizeBytes,
+		URL:              signed.URL,
+		Visibility:       file.Visibility,
+		ProcessingStatus: file.StorageStatus,
+		Version:          file.Version,
+		ETag:             file.ETag,
+		ContentHash:      file.ContentHash,
+		CreatedAt:        file.CreatedAt,
+		UpdatedAt:        file.UpdatedAt,
+		Variants:         variantResults,
+	}, nil
 }
 
 func (s *Service) makeUploadSessionResult(ctx context.Context, session repository.FileUploadSession, file repository.File) (UploadSessionResult, error) {
@@ -592,6 +919,21 @@ func validateCreateUploadSession(req CreateUploadSessionRequest) error {
 	}
 }
 
+func validateStoreFile(req StoreFileRequest) error {
+	if strings.TrimSpace(req.UserID) == "" ||
+		strings.TrimSpace(req.TargetType) == "" ||
+		strings.TrimSpace(req.FileName) == "" ||
+		strings.TrimSpace(req.MimeType) == "" ||
+		req.SizeBytes <= 0 ||
+		req.Body == nil {
+		return ErrValidation
+	}
+	if !targetTypePattern.MatchString(strings.TrimSpace(req.TargetType)) {
+		return ErrValidation
+	}
+	return nil
+}
+
 func chooseUploadMode(mode string, sizeBytes int64) string {
 	mode = normalizeUploadMode(mode)
 	if mode == "" || mode == uploadModeAuto {
@@ -661,6 +1003,18 @@ func processingJobTypeForFile(file repository.File) string {
 		return fileProcessingJobAudio
 	}
 	return ""
+}
+
+func canReadFile(userID string, file repository.File) bool {
+	if file.OwnerUserID != nil && *file.OwnerUserID == strings.TrimSpace(userID) {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(file.Visibility)) {
+	case "public", "authenticated", "protected":
+		return strings.TrimSpace(userID) != ""
+	default:
+		return false
+	}
 }
 
 func normalizeText(value string) string {

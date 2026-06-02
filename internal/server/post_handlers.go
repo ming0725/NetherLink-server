@@ -217,7 +217,9 @@ func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) {
 		writePostServiceError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, postDetailResponse{Post: makePostResponse(post, true)})
+	response := postDetailResponse{Post: makePostResponse(post, true)}
+	s.publishRealtimeEvent(r.Context(), []string{principal.UserID}, "post.created", response)
+	writeJSON(w, http.StatusCreated, response)
 }
 
 func (s *Server) handleGetPost(w http.ResponseWriter, r *http.Request) {
@@ -285,7 +287,9 @@ func (s *Server) handlePatchPost(w http.ResponseWriter, r *http.Request) {
 		writePostServiceError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, postDetailResponse{Post: makePostResponse(post, true)})
+	response := postDetailResponse{Post: makePostResponse(post, true)}
+	s.publishRealtimeEvent(r.Context(), []string{principal.UserID, post.Post.AuthorID}, "post.updated", response)
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleDeletePost(w http.ResponseWriter, r *http.Request) {
@@ -302,10 +306,20 @@ func (s *Server) handleDeletePost(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, r, reqErr)
 		return
 	}
+	post, err := s.repos.Posts.GetPost(r.Context(), principal.UserID, postID)
+	if err != nil {
+		writeRepositoryError(w, r, err)
+		return
+	}
 	if err := s.postService.DeletePost(r.Context(), postID, principal.UserID); err != nil {
 		writePostServiceError(w, r, err)
 		return
 	}
+	s.publishRealtimeEvent(r.Context(), []string{principal.UserID, post.Post.AuthorID}, "post.deleted", map[string]any{
+		"postId":       postID,
+		"authorUuid":   post.Post.AuthorID,
+		"operatorUuid": principal.UserID,
+	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -333,7 +347,11 @@ func (s *Server) handleSetPostLike(w http.ResponseWriter, r *http.Request) {
 		writePostServiceError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, postLikeResponse{LikeCount: count, IsLiked: liked})
+	response := postLikeResponse{LikeCount: count, IsLiked: liked}
+	s.publishPostSnapshotRealtimeEvent(r.Context(), principal.UserID, postID, "post.like.updated", "like.updated", map[string]any{
+		"like": response,
+	})
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleSetAuthorFollow(w http.ResponseWriter, r *http.Request) {
@@ -364,7 +382,13 @@ func (s *Server) handleSetAuthorFollow(w http.ResponseWriter, r *http.Request) {
 		writePostServiceError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, followResponse{IsFollowedAuthor: followed})
+	response := followResponse{IsFollowedAuthor: followed}
+	s.publishRealtimeEvent(r.Context(), []string{principal.UserID, authorID}, "post.author.follow.updated", map[string]any{
+		"authorUuid":   authorID,
+		"followerUuid": principal.UserID,
+		"follow":       response,
+	})
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleListPostComments(w http.ResponseWriter, r *http.Request) {
@@ -427,7 +451,11 @@ func (s *Server) handleCreatePostComment(w http.ResponseWriter, r *http.Request)
 		writePostServiceError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, postCommentDetailResponse{Comment: makePostCommentResponse(comment)})
+	response := postCommentDetailResponse{Comment: makePostCommentResponse(comment)}
+	s.publishPostSnapshotRealtimeEvent(r.Context(), principal.UserID, postID, "post.comment.created", "comment.created", map[string]any{
+		"comment": response.Comment,
+	})
+	writeJSON(w, http.StatusCreated, response)
 }
 
 func (s *Server) handleSetCommentLike(w http.ResponseWriter, r *http.Request) {
@@ -454,7 +482,12 @@ func (s *Server) handleSetCommentLike(w http.ResponseWriter, r *http.Request) {
 		writePostServiceError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, commentLikeResponse{LikeCount: count, IsLiked: liked})
+	response := commentLikeResponse{LikeCount: count, IsLiked: liked}
+	s.publishRealtimeEvent(r.Context(), []string{principal.UserID}, "post.comment.like.updated", map[string]any{
+		"commentId": commentID,
+		"like":      response,
+	})
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleCreateCommentReply(w http.ResponseWriter, r *http.Request) {
@@ -499,7 +532,11 @@ func (s *Server) handleCreateCommentReply(w http.ResponseWriter, r *http.Request
 		writePostServiceError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, postReplyDetailResponse{Reply: makePostReplyResponse(reply)})
+	response := postReplyDetailResponse{Reply: makePostReplyResponse(reply)}
+	s.publishPostSnapshotRealtimeEvent(r.Context(), principal.UserID, reply.PostID, "post.reply.created", "reply.created", map[string]any{
+		"reply": response.Reply,
+	})
+	writeJSON(w, http.StatusCreated, response)
 }
 
 func (s *Server) handleSetReplyLike(w http.ResponseWriter, r *http.Request) {
@@ -526,7 +563,12 @@ func (s *Server) handleSetReplyLike(w http.ResponseWriter, r *http.Request) {
 		writePostServiceError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, commentLikeResponse{LikeCount: count, IsLiked: liked})
+	response := commentLikeResponse{LikeCount: count, IsLiked: liked}
+	s.publishRealtimeEvent(r.Context(), []string{principal.UserID}, "post.reply.like.updated", map[string]any{
+		"replyId": replyID,
+		"like":    response,
+	})
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleDeleteComment(w http.ResponseWriter, r *http.Request) {
@@ -543,9 +585,22 @@ func (s *Server) handleDeleteComment(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, r, reqErr)
 		return
 	}
+	commentPostID := ""
+	if s.repos.Posts != nil {
+		if postID, err := s.repos.Posts.GetCommentPostID(r.Context(), commentID, principal.UserID); err == nil {
+			commentPostID = postID
+		} else {
+			s.logger.WarnContext(r.Context(), "failed to load comment post for realtime delete", "error", err, "comment_id", commentID)
+		}
+	}
 	if err := s.postService.DeleteComment(r.Context(), commentID, principal.UserID); err != nil {
 		writePostServiceError(w, r, err)
 		return
+	}
+	if commentPostID != "" {
+		s.publishPostSnapshotRealtimeEvent(r.Context(), principal.UserID, commentPostID, "post.comment.deleted", "comment.deleted", map[string]any{
+			"commentId": commentID,
+		})
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -564,9 +619,22 @@ func (s *Server) handleDeleteReply(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, r, reqErr)
 		return
 	}
+	replyPostID := ""
+	if s.repos.Posts != nil {
+		if postID, err := s.repos.Posts.GetReplyPostID(r.Context(), replyID, principal.UserID); err == nil {
+			replyPostID = postID
+		} else {
+			s.logger.WarnContext(r.Context(), "failed to load reply post for realtime delete", "error", err, "reply_id", replyID)
+		}
+	}
 	if err := s.postService.DeleteReply(r.Context(), replyID, principal.UserID); err != nil {
 		writePostServiceError(w, r, err)
 		return
+	}
+	if replyPostID != "" {
+		s.publishPostSnapshotRealtimeEvent(r.Context(), principal.UserID, replyPostID, "post.reply.deleted", "reply.deleted", map[string]any{
+			"replyId": replyID,
+		})
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

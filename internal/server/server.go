@@ -141,6 +141,7 @@ func repositoriesConfigured(repos repository.Repositories) bool {
 		repos.Friends != nil ||
 		repos.Groups != nil ||
 		repos.Posts != nil ||
+		repos.Notifications != nil ||
 		repos.RealtimeEvents != nil ||
 		repos.OperationReceipts != nil
 }
@@ -184,6 +185,7 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("PATCH /api/v1/me", s.withAuthRequired(http.HandlerFunc(s.handlePatchMe)))
 	mux.Handle("GET /api/v1/me/user-id/check", s.withAuthRequired(http.HandlerFunc(s.handleCheckMeUserID)))
 	mux.Handle("PATCH /api/v1/me/user-id", s.withAuthRequired(http.HandlerFunc(s.handlePatchMeUserID)))
+	mux.Handle("POST /api/v1/me/avatar", s.withAuthRequired(http.HandlerFunc(s.handleUploadMeAvatar)))
 	mux.Handle("GET /api/v1/me/preferences", s.withAuthRequired(http.HandlerFunc(s.handleGetMePreferences)))
 	mux.Handle("PATCH /api/v1/me/preferences", s.withAuthRequired(http.HandlerFunc(s.handlePatchMePreferences)))
 	mux.Handle("GET /api/v1/users", s.withAuthRequired(http.HandlerFunc(s.handleUsersSearch)))
@@ -215,11 +217,8 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /api/v1/group-notifications", s.withAuthRequired(http.HandlerFunc(s.handleGroupNotifications)))
 	mux.Handle("POST /api/v1/group-join-requests/{requestId}/accept", s.withAuthRequired(http.HandlerFunc(s.handleAcceptGroupJoinRequest)))
 	mux.Handle("POST /api/v1/group-join-requests/{requestId}/reject", s.withAuthRequired(http.HandlerFunc(s.handleRejectGroupJoinRequest)))
-	mux.Handle("POST /api/v1/files/upload-session", s.withAuthRequired(http.HandlerFunc(s.handleCreateUploadSession)))
-	mux.Handle("GET /api/v1/files/upload-session/{uploadSessionId}", s.withAuthRequired(http.HandlerFunc(s.handleGetUploadSession)))
-	mux.Handle("POST /api/v1/files/upload-session/{uploadSessionId}/parts", s.withAuthRequired(http.HandlerFunc(s.handlePresignUploadParts)))
-	mux.Handle("POST /api/v1/files/upload-session/{uploadSessionId}/complete", s.withAuthRequired(http.HandlerFunc(s.handleCompleteUploadSession)))
-	mux.Handle("POST /api/v1/files/upload-session/{uploadSessionId}/abort", s.withAuthRequired(http.HandlerFunc(s.handleAbortUploadSession)))
+	mux.Handle("POST /api/v1/files", s.withAuthRequired(http.HandlerFunc(s.handleUploadFile)))
+	mux.Handle("/api/v1/files/", s.withAuthRequired(http.HandlerFunc(s.handleFileRoutes)))
 	mux.Handle("GET /api/v1/posts", s.withAuthRequired(http.HandlerFunc(s.handleListPosts)))
 	mux.Handle("POST /api/v1/posts", s.withAuthRequired(http.HandlerFunc(s.handleCreatePost)))
 	mux.Handle("GET /api/v1/posts/{postId}", s.withAuthRequired(http.HandlerFunc(s.handleGetPost)))
@@ -233,6 +232,10 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("DELETE /api/v1/comments/{commentId}", s.withAuthRequired(http.HandlerFunc(s.handleDeleteComment)))
 	mux.Handle("POST /api/v1/replies/{replyId}/like", s.withAuthRequired(http.HandlerFunc(s.handleSetReplyLike)))
 	mux.Handle("DELETE /api/v1/replies/{replyId}", s.withAuthRequired(http.HandlerFunc(s.handleDeleteReply)))
+	mux.Handle("GET /api/v1/notifications", s.withAuthRequired(http.HandlerFunc(s.handleNotifications)))
+	mux.Handle("POST /api/v1/notifications/read-all", s.withAuthRequired(http.HandlerFunc(s.handleNotificationsReadAll)))
+	mux.Handle("POST /api/v1/notifications/{notificationId}/read", s.withAuthRequired(http.HandlerFunc(s.handleNotificationRead)))
+	mux.Handle("POST /api/v1/operations/receipt", s.withAuthRequired(http.HandlerFunc(s.handleOperationReceipt)))
 	mux.Handle("GET /api/v1/conversations", s.withAuthRequired(http.HandlerFunc(s.handleListConversations)))
 	mux.Handle("POST /api/v1/conversations/direct", s.withAuthRequired(http.HandlerFunc(s.handleOpenDirectConversation)))
 	mux.Handle("POST /api/v1/conversations/group", s.withAuthRequired(http.HandlerFunc(s.handleOpenGroupConversation)))

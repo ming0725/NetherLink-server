@@ -31,6 +31,7 @@ type Repositories struct {
 	Friends           *FriendRepository
 	Groups            *GroupRepository
 	Posts             *PostRepository
+	Notifications     *NotificationRepository
 	RealtimeEvents    *RealtimeEventRepository
 	OperationReceipts *OperationReceiptRepository
 }
@@ -45,6 +46,7 @@ func New(db DBTX) Repositories {
 		Friends:           NewFriendRepository(db),
 		Groups:            NewGroupRepository(db),
 		Posts:             NewPostRepository(db),
+		Notifications:     NewNotificationRepository(db),
 		RealtimeEvents:    NewRealtimeEventRepository(db),
 		OperationReceipts: NewOperationReceiptRepository(db),
 	}

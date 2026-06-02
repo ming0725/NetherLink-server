@@ -556,6 +556,38 @@ func (r *PostRepository) ListComments(ctx context.Context, viewerUserID string, 
 	return stripPostCommentTotals(comments), total, nil
 }
 
+func (r *PostRepository) GetCommentPostID(ctx context.Context, commentID string, viewerUserID string) (string, error) {
+	var postID pgtype.UUID
+	err := r.db.QueryRow(ctx, `
+		SELECT pc.post_id
+		FROM post_comments pc
+		JOIN posts p ON p.id = pc.post_id
+		WHERE pc.id = $1::uuid
+		  AND pc.deleted_at IS NULL
+		  AND p.deleted_at IS NULL
+		  AND (p.visibility = 'public' OR p.author_id = $2::uuid OR pc.author_id = $2::uuid)`,
+		normalizeText(commentID),
+		normalizeText(viewerUserID),
+	).Scan(&postID)
+	return uuidString(postID), translateReadError(err)
+}
+
+func (r *PostRepository) GetReplyPostID(ctx context.Context, replyID string, viewerUserID string) (string, error) {
+	var postID pgtype.UUID
+	err := r.db.QueryRow(ctx, `
+		SELECT pr.post_id
+		FROM post_comment_replies pr
+		JOIN posts p ON p.id = pr.post_id
+		WHERE pr.id = $1::uuid
+		  AND pr.deleted_at IS NULL
+		  AND p.deleted_at IS NULL
+		  AND (p.visibility = 'public' OR p.author_id = $2::uuid OR pr.author_id = $2::uuid)`,
+		normalizeText(replyID),
+		normalizeText(viewerUserID),
+	).Scan(&postID)
+	return uuidString(postID), translateReadError(err)
+}
+
 func (r *PostRepository) SetCommentLike(ctx context.Context, commentID string, userID string, liked bool) (int, bool, error) {
 	if liked {
 		if _, err := r.db.Exec(ctx, `

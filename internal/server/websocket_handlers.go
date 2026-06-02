@@ -307,8 +307,10 @@ func (s *Server) publishRealtimeEvent(ctx context.Context, userIDs []string, eve
 				Payload:   event.Payload,
 			}
 			s.realtimeHub.PublishEvent(userIDs, realtimeEvent)
-			if err := s.realtimeFanout.Publish(ctx, userIDs, realtimeEvent); err != nil {
-				s.logger.WarnContext(ctx, "failed to publish realtime redis fanout", "error", err, "event_type", eventType)
+			if s.realtimeFanout != nil {
+				if err := s.realtimeFanout.Publish(ctx, userIDs, realtimeEvent); err != nil {
+					s.logger.WarnContext(ctx, "failed to publish realtime redis fanout", "error", err, "event_type", eventType)
+				}
 			}
 			return realtimeEvent
 		}

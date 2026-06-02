@@ -387,7 +387,9 @@ func (s *Server) handleCreateFriendGroup(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, friendGroupDetailResponse{Group: makeFriendGroupResponse(group)})
+	response := friendGroupDetailResponse{Group: makeFriendGroupResponse(group)}
+	s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "friend.group.created", response)
+	writeJSON(w, http.StatusCreated, response)
 }
 
 func (s *Server) handleFriends(w http.ResponseWriter, r *http.Request) {
@@ -465,7 +467,9 @@ func (s *Server) handlePatchFriend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, friendshipResponse{Friendship: makeFriendResponse(friend)})
+	response := friendshipResponse{Friendship: makeFriendResponse(friend)}
+	s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "friend.updated", response)
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleDeleteFriend(w http.ResponseWriter, r *http.Request) {
@@ -489,6 +493,10 @@ func (s *Server) handleDeleteFriend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.publishRealtimeEvent(r.Context(), []string{principal.UserID, friendUserID}, "friend.deleted", map[string]any{
+		"userUuid":       principal.UserID,
+		"friendUserUuid": friendUserID,
+	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -537,7 +545,9 @@ func (s *Server) handleCreateFriendRequest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, friendRequestDetailResponse{Request: makeFriendRequestResponse(request)})
+	response := friendRequestDetailResponse{Request: makeFriendRequestResponse(request)}
+	s.publishRealtimeEvent(r.Context(), []string{request.FromUser.ID, request.ToUser.ID}, "friend.request.created", response)
+	writeJSON(w, http.StatusCreated, response)
 }
 
 func (s *Server) handleFriendRequests(w http.ResponseWriter, r *http.Request) {
@@ -613,7 +623,9 @@ func (s *Server) handleAcceptFriendRequest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	writeJSON(w, http.StatusOK, friendshipResponse{Friendship: makeFriendResponse(friend)})
+	response := friendshipResponse{Friendship: makeFriendResponse(friend)}
+	s.publishRealtimeEvent(r.Context(), []string{principal.UserID, friend.User.ID}, "friend.request.accepted", response)
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleRejectFriendRequest(w http.ResponseWriter, r *http.Request) {
@@ -638,7 +650,9 @@ func (s *Server) handleRejectFriendRequest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	writeJSON(w, http.StatusOK, friendRequestDetailResponse{Request: makeFriendRequestResponse(request)})
+	response := friendRequestDetailResponse{Request: makeFriendRequestResponse(request)}
+	s.publishRealtimeEvent(r.Context(), []string{request.FromUser.ID, request.ToUser.ID}, "friend.request.rejected", response)
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
@@ -713,7 +727,9 @@ func (s *Server) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, groupDetailResponse{Group: makeGroupResponse(group)})
+	response := groupDetailResponse{Group: makeGroupResponse(group)}
+	s.publishGroupRealtimeEvent(r.Context(), group.Group.ID, "group.created", response)
+	writeJSON(w, http.StatusCreated, response)
 }
 
 func (s *Server) handleGroupDetail(w http.ResponseWriter, r *http.Request) {
@@ -779,7 +795,9 @@ func (s *Server) handlePatchGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, groupDetailResponse{Group: makeGroupResponse(group)})
+	response := groupDetailResponse{Group: makeGroupResponse(group)}
+	s.publishGroupRealtimeEvent(r.Context(), groupID, "group.updated", response)
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
@@ -797,11 +815,27 @@ func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	recipients := []string{}
+	action := "group.member.removed"
+	if s.repos.Groups != nil {
+		if userIDs, err := s.repos.Groups.ListActiveMemberUserIDs(r.Context(), groupID); err == nil {
+			recipients = userIDs
+		} else {
+			s.logger.WarnContext(r.Context(), "failed to list group delete realtime recipients", "error", err, "group_id", groupID)
+		}
+		if member, err := s.repos.Groups.GetMember(r.Context(), groupID, principal.UserID); err == nil && member.Role == "owner" {
+			action = "group.deleted"
+		}
+	}
 	if err := s.groupService.DeleteOrLeaveGroup(r.Context(), principal.UserID, groupID); err != nil {
 		writeGroupServiceError(w, r, err)
 		return
 	}
 
+	s.publishGroupRealtimeEventTo(r.Context(), recipients, action, map[string]any{
+		"groupId":      groupID,
+		"operatorUuid": principal.UserID,
+	})
 	writeJSON(w, http.StatusOK, okResponse{OK: true})
 }
 
@@ -880,7 +914,9 @@ func (s *Server) handleAddGroupMembers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, groupMembersResponse{Members: makeGroupMemberResponses(members), Total: len(members)})
+	response := groupMembersResponse{Members: makeGroupMemberResponses(members), Total: len(members)}
+	s.publishGroupRealtimeEvent(r.Context(), groupID, "group.members.added", response)
+	writeJSON(w, http.StatusCreated, response)
 }
 
 func (s *Server) handleRemoveGroupMember(w http.ResponseWriter, r *http.Request) {
@@ -903,6 +939,14 @@ func (s *Server) handleRemoveGroupMember(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	recipients := []string{}
+	if s.repos.Groups != nil {
+		if userIDs, err := s.repos.Groups.ListActiveMemberUserIDs(r.Context(), groupID); err == nil {
+			recipients = userIDs
+		} else {
+			s.logger.WarnContext(r.Context(), "failed to list group member remove realtime recipients", "error", err, "group_id", groupID)
+		}
+	}
 	if err := s.groupService.RemoveMember(r.Context(), groupsvc.RemoveMemberInput{
 		UserID:       principal.UserID,
 		GroupID:      groupID,
@@ -912,6 +956,11 @@ func (s *Server) handleRemoveGroupMember(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	s.publishGroupRealtimeEventTo(r.Context(), recipients, "group.member.removed", map[string]any{
+		"groupId":      groupID,
+		"userUuid":     userID,
+		"operatorUuid": principal.UserID,
+	})
 	writeJSON(w, http.StatusOK, okResponse{OK: true})
 }
 
@@ -954,7 +1003,9 @@ func (s *Server) handlePatchGroupMember(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	writeJSON(w, http.StatusOK, groupMemberDetailResponse{Member: makeGroupMemberResponse(member)})
+	response := groupMemberDetailResponse{Member: makeGroupMemberResponse(member)}
+	s.publishGroupRealtimeEvent(r.Context(), groupID, "group.member.updated", response)
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleTransferGroupOwner(w http.ResponseWriter, r *http.Request) {
@@ -991,7 +1042,9 @@ func (s *Server) handleTransferGroupOwner(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	writeJSON(w, http.StatusOK, groupDetailResponse{Group: makeGroupResponse(group)})
+	response := groupDetailResponse{Group: makeGroupResponse(group)}
+	s.publishGroupRealtimeEvent(r.Context(), groupID, "group.owner.transferred", response)
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handlePatchGroupMySettings(w http.ResponseWriter, r *http.Request) {
@@ -1036,7 +1089,9 @@ func (s *Server) handlePatchGroupMySettings(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	writeJSON(w, http.StatusOK, groupSettingsDetailResponse{Settings: makeGroupSettingsResponse(settings)})
+	response := groupSettingsDetailResponse{Settings: makeGroupSettingsResponse(settings)}
+	s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "group.my_settings.updated", response)
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleCreateGroupJoinRequest(w http.ResponseWriter, r *http.Request) {
@@ -1068,7 +1123,17 @@ func (s *Server) handleCreateGroupJoinRequest(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, groupJoinRequestDetailResponse{Request: makeGroupJoinRequestResponse(request)})
+	response := groupJoinRequestDetailResponse{Request: makeGroupJoinRequestResponse(request)}
+	recipients := []string{request.ActorUser.ID}
+	if s.repos.Groups != nil {
+		if userIDs, err := s.repos.Groups.ListPrivilegedMemberUserIDs(r.Context(), request.Group.ID); err == nil {
+			recipients = append(recipients, userIDs...)
+		} else {
+			s.logger.WarnContext(r.Context(), "failed to list group join request realtime recipients", "error", err, "group_id", request.Group.ID)
+		}
+	}
+	s.publishGroupRealtimeEventTo(r.Context(), recipients, "group.join_request.created", response)
+	writeJSON(w, http.StatusCreated, response)
 }
 
 func (s *Server) handleGroupNotifications(w http.ResponseWriter, r *http.Request) {
@@ -1124,7 +1189,17 @@ func (s *Server) handleAcceptGroupJoinRequest(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	writeJSON(w, http.StatusOK, groupJoinRequestDetailResponse{Request: makeGroupJoinRequestResponse(request)})
+	response := groupJoinRequestDetailResponse{Request: makeGroupJoinRequestResponse(request)}
+	recipients := []string{request.ActorUser.ID, principal.UserID}
+	if s.repos.Groups != nil {
+		if userIDs, err := s.repos.Groups.ListActiveMemberUserIDs(r.Context(), request.Group.ID); err == nil {
+			recipients = append(recipients, userIDs...)
+		} else {
+			s.logger.WarnContext(r.Context(), "failed to list group join accept realtime recipients", "error", err, "group_id", request.Group.ID)
+		}
+	}
+	s.publishGroupRealtimeEventTo(r.Context(), recipients, "group.join_request.accepted", response)
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleRejectGroupJoinRequest(w http.ResponseWriter, r *http.Request) {
@@ -1148,7 +1223,17 @@ func (s *Server) handleRejectGroupJoinRequest(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	writeJSON(w, http.StatusOK, groupJoinRequestDetailResponse{Request: makeGroupJoinRequestResponse(request)})
+	response := groupJoinRequestDetailResponse{Request: makeGroupJoinRequestResponse(request)}
+	recipients := []string{request.ActorUser.ID, principal.UserID}
+	if s.repos.Groups != nil {
+		if userIDs, err := s.repos.Groups.ListPrivilegedMemberUserIDs(r.Context(), request.Group.ID); err == nil {
+			recipients = append(recipients, userIDs...)
+		} else {
+			s.logger.WarnContext(r.Context(), "failed to list group join reject realtime recipients", "error", err, "group_id", request.Group.ID)
+		}
+	}
+	s.publishGroupRealtimeEventTo(r.Context(), recipients, "group.join_request.rejected", response)
+	writeJSON(w, http.StatusOK, response)
 }
 
 func makeUserDetailResponse(ctx context.Context, repos repository.Repositories, viewerUserID string, user repository.User) (userDetailResponse, error) {

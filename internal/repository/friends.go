@@ -227,6 +227,34 @@ func (r *FriendRepository) ListFriends(ctx context.Context, userID string, keywo
 	return friends, total, nil
 }
 
+func (r *FriendRepository) ListActiveFriendUserIDs(ctx context.Context, userID string) ([]string, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT friend_user_id
+		FROM friendships
+		WHERE user_id = $1::uuid
+		  AND status = 'active'
+		ORDER BY friend_user_id`,
+		normalizeText(userID),
+	)
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	defer rows.Close()
+
+	userIDs := []string{}
+	for rows.Next() {
+		var friendUserID pgtype.UUID
+		if err := rows.Scan(&friendUserID); err != nil {
+			return nil, err
+		}
+		userIDs = append(userIDs, uuidString(friendUserID))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return userIDs, nil
+}
+
 func (r *FriendRepository) GetRelation(ctx context.Context, userID string, friendUserID string) (Friend, error) {
 	friend, err := scanFriendWithNoTotal(r.db.QueryRow(ctx, `
 		SELECT

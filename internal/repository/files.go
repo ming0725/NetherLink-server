@@ -148,6 +148,18 @@ type FileObjectReference struct {
 	ObjectKey string
 }
 
+type FileUsage struct {
+	ID          string
+	FileID      string
+	UsageType   string
+	BusinessID  string
+	OwnerUserID *string
+	Visibility  string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	DeletedAt   *time.Time
+}
+
 type ExpiredUploadSessionCleanupCandidate struct {
 	SessionID  string
 	FileID     string
@@ -219,6 +231,14 @@ type CreateFileProcessingJobParams struct {
 	Status  string
 }
 
+type CreateFileUsageParams struct {
+	FileID      string
+	UsageType   string
+	BusinessID  string
+	OwnerUserID string
+	Visibility  string
+}
+
 func NewFileRepository(db DBTX) *FileRepository {
 	return &FileRepository{db: db}
 }
@@ -266,6 +286,33 @@ func (r *FileRepository) Get(ctx context.Context, fileID string) (File, error) {
 		normalizeText(fileID),
 	))
 	return file, translateReadError(err)
+}
+
+func (r *FileRepository) ListVariants(ctx context.Context, fileID string) ([]FileVariant, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT `+fileVariantSelectColumns+`
+		FROM file_variants
+		WHERE file_id = $1::uuid
+		ORDER BY variant_type ASC, created_at ASC`,
+		normalizeText(fileID),
+	)
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	defer rows.Close()
+
+	variants := []FileVariant{}
+	for rows.Next() {
+		variant, err := scanFileVariant(rows)
+		if err != nil {
+			return nil, err
+		}
+		variants = append(variants, variant)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return variants, nil
 }
 
 func (r *FileRepository) MarkUploaded(ctx context.Context, fileID string, etag *string, contentHash *string, sizeBytes int64) (File, error) {
@@ -543,6 +590,115 @@ func (r *FileRepository) MarkProcessingJobFailed(ctx context.Context, jobID stri
 		result,
 	))
 	return job, translateWriteError(err)
+}
+
+func (r *FileRepository) CreateUsage(ctx context.Context, params CreateFileUsageParams) (FileUsage, error) {
+	visibility := normalizeText(params.Visibility)
+	if visibility == "" {
+		visibility = "private"
+	}
+
+	usage, err := scanFileUsage(r.db.QueryRow(ctx, `
+		INSERT INTO file_usages (
+			file_id,
+			usage_type,
+			business_id,
+			owner_user_id,
+			visibility
+		)
+		VALUES ($1::uuid, $2, $3::uuid, $4::uuid, $5)
+		RETURNING
+			id,
+			file_id,
+			usage_type,
+			business_id,
+			owner_user_id,
+			visibility,
+			created_at,
+			updated_at,
+			deleted_at`,
+		normalizeText(params.FileID),
+		normalizeText(params.UsageType),
+		normalizeText(params.BusinessID),
+		normalizeText(params.OwnerUserID),
+		visibility,
+	))
+	return usage, translateWriteError(err)
+}
+
+func (r *FileRepository) SoftDeleteUsages(ctx context.Context, usageType string, businessID string) (int64, error) {
+	tag, err := r.db.Exec(ctx, `
+		UPDATE file_usages
+		SET deleted_at = COALESCE(deleted_at, now()),
+		    updated_at = now()
+		WHERE usage_type = $1
+		  AND business_id = $2::uuid
+		  AND deleted_at IS NULL`,
+		normalizeText(usageType),
+		normalizeText(businessID),
+	)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+func (r *FileRepository) HasActiveReferences(ctx context.Context, fileID string) (bool, error) {
+	var referenced bool
+	err := r.db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM file_usages fu
+			WHERE fu.file_id = $1::uuid
+			  AND fu.deleted_at IS NULL
+		) OR EXISTS (
+			SELECT 1
+			FROM users u
+			WHERE u.avatar_file_id = $1::uuid
+			  AND u.deleted_at IS NULL
+		) OR EXISTS (
+			SELECT 1
+			FROM groups g
+			WHERE g.avatar_file_id = $1::uuid
+			  AND g.deleted_at IS NULL
+		) OR EXISTS (
+			SELECT 1
+			FROM message_attachments ma
+			WHERE ma.file_id = $1::uuid
+		) OR EXISTS (
+			SELECT 1
+			FROM post_media pm
+			WHERE pm.file_id = $1::uuid
+			   OR pm.cover_file_id = $1::uuid
+		) OR EXISTS (
+			SELECT 1
+			FROM ai_uploaded_files auf
+			WHERE (auf.file_id = $1::uuid OR auf.extracted_text_file_id = $1::uuid)
+			  AND auf.deleted_at IS NULL
+		)`,
+		normalizeText(fileID),
+	).Scan(&referenced)
+	return referenced, translateReadError(err)
+}
+
+func (r *FileRepository) SoftDelete(ctx context.Context, fileID string) error {
+	tag, err := r.db.Exec(ctx, `
+		UPDATE files
+		SET storage_status = 'deleted',
+		    deleted_at = COALESCE(deleted_at, now()),
+		    version = version + 1,
+		    updated_at = now()
+		WHERE id = $1::uuid
+		  AND deleted_at IS NULL`,
+		normalizeText(fileID),
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (r *FileRepository) ClaimExpiredUploadSessionsForCleanup(ctx context.Context, limit int, retryAfter time.Duration) ([]ExpiredUploadSessionCleanupCandidate, error) {
@@ -953,6 +1109,41 @@ func scanFileVariant(row scanner) (FileVariant, error) {
 	variant.ETag = stringPtrFromNull(etag)
 	variant.ContentHash = stringPtrFromNull(contentHash)
 	return variant, nil
+}
+
+func scanFileUsage(row scanner) (FileUsage, error) {
+	var (
+		usage       FileUsage
+		id          pgtype.UUID
+		fileID      pgtype.UUID
+		businessID  pgtype.UUID
+		ownerUserID pgtype.UUID
+		deletedAt   sql.NullTime
+	)
+
+	err := row.Scan(
+		&id,
+		&fileID,
+		&usage.UsageType,
+		&businessID,
+		&ownerUserID,
+		&usage.Visibility,
+		&usage.CreatedAt,
+		&usage.UpdatedAt,
+		&deletedAt,
+	)
+	if err != nil {
+		return FileUsage{}, err
+	}
+
+	usage.ID = uuidString(id)
+	usage.FileID = uuidString(fileID)
+	usage.BusinessID = uuidString(businessID)
+	usage.OwnerUserID = uuidStringPtr(ownerUserID)
+	if deletedAt.Valid {
+		usage.DeletedAt = &deletedAt.Time
+	}
+	return usage, nil
 }
 
 func scanFileProcessingJob(row scanner) (FileProcessingJob, error) {

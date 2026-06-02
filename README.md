@@ -9,7 +9,7 @@ Current scope is intentionally small:
 - Thin HTTP server under `internal/server`.
 - PostgreSQL connection pool setup under `internal/database`.
 - Redis client setup under `internal/cache`.
-- PostgreSQL repositories for users, user preferences, user sessions, files, chat, friends, groups, and realtime events under `internal/repository`.
+- PostgreSQL repositories for users, user preferences, user sessions, files, chat, friends, groups, notifications, realtime events, and operation receipts under `internal/repository`.
 - Shared repository infrastructure: aggregate repository construction, transaction helper, and operation receipt repository for idempotent writes.
 - P0 auth service under `internal/auth`: password hashing, access token signing/validation, refresh token hashing/rotation, PostgreSQL-backed session checks, current-user profile updates, public ID checks/changes, and device session management.
 - Application runtime assembly under `internal/app` for PostgreSQL, Redis, repositories, auth service, file workers, realtime fanout, realtime cleanup, and object storage provider injection.
@@ -18,16 +18,18 @@ Current scope is intentionally small:
 - Redis service bootstrap under `docker-compose.yml`.
 - MinIO object storage bootstrap under `minio/`.
 - Health endpoints, API v1 root, request IDs, panic recovery, structured access logs, JSON 404/405 responses, request body helper functions, readiness checks for PostgreSQL and Redis, and Bearer access-token validation are available.
-- P0 auth HTTP handlers are available: register, login, refresh, logout, session listing/revoke, `/me`, profile editing, public ID availability/change, `GET /me/preferences`, and `PATCH /me/preferences`.
+- P0 auth HTTP handlers are available: register, login, refresh, logout, session listing/revoke, `/me`, profile editing, public ID availability/change, avatar upload, `GET /me/preferences`, and `PATCH /me/preferences`.
 - User/friend/group HTTP handlers are available: user search/detail/batch, friend list/group list, friend group creation, friend settings update/delete, friend request create/list/accept/reject, group list/detail/member list, group create/edit/delete, membership management, owner transfer, member settings, current-user group settings, and join-request handling.
-- File upload-session HTTP handlers are available for presigned single and multipart MinIO/S3 uploads.
+- File HTTP handlers are available for avatar upload, proxy upload, presigned single and multipart MinIO/S3 upload sessions, file metadata, controlled download URLs, and owner-side deletion of unreferenced files.
 - File upload completion now queues image, video, and audio processing jobs; the runtime starts a background worker that reads uploaded media from MinIO, extracts backend-side image dimensions, generates 512px JPEG image thumbnails, probes video/audio duration with `ffprobe`, extracts 512px video cover JPEGs with `ffmpeg`, retries stale processing jobs, records derived image/video variants in `file_variants`, and moves file status from `processing` to `ready` or `failed`.
 - File cleanup worker is available for expired upload sessions, unbound files, and files whose `file_usages` are all deleted; it deletes original and variant objects from MinIO and soft-deletes cleaned file metadata.
 - Chat conversation list/open/detail/settings/read/unread endpoints are available, along with message send, history, sender recall, and current-user hidden-history clearing; image attachments require and return `width` and `height` for frontend preview placeholders.
-- WebSocket realtime foundation is available at `GET /api/v1/ws`: access-token auth, per-user connection management, PostgreSQL-backed global event IDs, durable replay, Redis pub/sub fanout, replay metrics, fanout operational counters, `ping`/`realtime.pong`, `chat.message.created`, `chat.message.recalled`, `chat.conversation.sync.updated`, hidden-history sync, and `chat.message.send`.
+- WebSocket realtime foundation is available at `GET /api/v1/ws`: access-token auth, per-user connection management, PostgreSQL-backed global event IDs, durable replay, Redis pub/sub fanout, replay metrics, fanout operational counters, `ping`/`realtime.pong`, chat events, notification read sync, friend/group change events, profile/preference change events, post count/version update events, hidden-history sync, and `chat.message.send`.
 - Realtime event cleanup is available: `realtime_events` are retained for the configured window, old events are deleted in batches, and `/readyz` exposes hub, fanout, and cleanup snapshots.
 - Post HTTP handlers are available for feed/detail/create/edit/delete, media binding, likes, follows, comments, replies, comment/reply likes, and comment/reply deletion.
-- No AI API handlers yet.
+- Notification HTTP handlers are available for listing notifications, marking all notifications read, and marking one notification read.
+- Operation receipt HTTP handler is available for idempotent client-operation result lookup and creation.
+- AI API handlers are intentionally paused until provider credentials and model runtime configuration are available.
 - Redis is used for auth rate limiting and realtime fanout today. It is not used as the source of truth for users, refresh token sessions, messages, notifications, realtime events, file metadata, or durable business state.
 
 ## Start Local Dependencies
@@ -84,12 +86,13 @@ The current API foundation includes:
 - Bearer auth middleware validates access token signature, expiry, active PostgreSQL session, active user status, and `tokenVersion`.
 - WebSocket endpoint: `GET /api/v1/ws` accepts `Authorization: Bearer <access_token>`, `?accessToken=`, or `?token=`; optional `lastEventSeq` / `lastEventId=evt_N` enables durable replay when PostgreSQL is available.
 - WebSocket command: send `{"type":"chat.message.send","payload":{...}}` with `conversationId` plus the same message fields as REST `POST /conversations/{conversationId}/messages`; success emits durable `chat.message.created` plus non-durable `chat.message.sent` ACK to the sender.
-- Auth endpoints: `POST /api/v1/auth/register`, `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/sessions`, `POST /api/v1/auth/sessions/{sessionId}/revoke`, `GET /api/v1/me`, `PATCH /api/v1/me`, `GET /api/v1/me/user-id/check`, `PATCH /api/v1/me/user-id`, `GET /api/v1/me/preferences`, and `PATCH /api/v1/me/preferences`.
+- Auth endpoints: `POST /api/v1/auth/register`, `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/sessions`, `POST /api/v1/auth/sessions/{sessionId}/revoke`, `GET /api/v1/me`, `PATCH /api/v1/me`, `GET /api/v1/me/user-id/check`, `PATCH /api/v1/me/user-id`, `POST /api/v1/me/avatar`, `GET /api/v1/me/preferences`, and `PATCH /api/v1/me/preferences`.
 - Directory endpoints: `GET /api/v1/users`, `GET /api/v1/users/{userUuid}`, `GET /api/v1/users/by-id/{userId}`, `POST /api/v1/users/batch`, `GET /api/v1/friends`, `PATCH /api/v1/friends/{friendUserUuid}`, `DELETE /api/v1/friends/{friendUserUuid}`, `GET /api/v1/friend-groups`, `POST /api/v1/friend-groups`, `POST /api/v1/friend-requests`, `GET /api/v1/friend-requests`, `POST /api/v1/friend-requests/{requestId}/accept`, `POST /api/v1/friend-requests/{requestId}/reject`, `GET /api/v1/groups`, `POST /api/v1/groups`, `GET /api/v1/groups/{groupId}`, `PATCH /api/v1/groups/{groupId}`, `DELETE /api/v1/groups/{groupId}`, `GET /api/v1/groups/{groupId}/members`, `POST /api/v1/groups/{groupId}/members`, `DELETE /api/v1/groups/{groupId}/members/{userUuid}`, `PATCH /api/v1/groups/{groupId}/members/{userUuid}`, `POST /api/v1/groups/{groupId}/transfer-owner`, `PATCH /api/v1/groups/{groupId}/my-settings`, `POST /api/v1/group-join-requests`, `GET /api/v1/group-notifications`, `POST /api/v1/group-join-requests/{requestId}/accept`, and `POST /api/v1/group-join-requests/{requestId}/reject`.
-- File endpoints: `POST /api/v1/files/upload-session`, `GET /api/v1/files/upload-session/{uploadSessionId}`, `POST /api/v1/files/upload-session/{uploadSessionId}/parts`, `POST /api/v1/files/upload-session/{uploadSessionId}/complete`, and `POST /api/v1/files/upload-session/{uploadSessionId}/abort`.
+- File endpoints: `POST /api/v1/files`, `POST /api/v1/files/upload-session`, `GET /api/v1/files/upload-session/{uploadSessionId}`, `POST /api/v1/files/upload-session/{uploadSessionId}/parts`, `POST /api/v1/files/upload-session/{uploadSessionId}/complete`, `POST /api/v1/files/upload-session/{uploadSessionId}/abort`, `GET /api/v1/files/{fileId}`, `GET /api/v1/files/{fileId}/download-url`, and `DELETE /api/v1/files/{fileId}`.
 - File upload completion returns `processingStatus` from the file storage status. Image, video, and audio uploads enter `processing` until the background worker records metadata and any supported variants; other file types move directly to `ready` for now.
 - Chat endpoints: `GET /api/v1/conversations`, `POST /api/v1/conversations/direct`, `POST /api/v1/conversations/group`, `GET /api/v1/conversations/{conversationId}`, `PATCH /api/v1/conversations/{conversationId}/settings`, `POST /api/v1/conversations/{conversationId}/read`, `POST /api/v1/conversations/{conversationId}/unread`, `POST /api/v1/conversations/{conversationId}/messages`, `GET /api/v1/conversations/{conversationId}/messages`, `POST /api/v1/conversations/{conversationId}/messages/{messageId}/recall`, and `DELETE /api/v1/conversations/{conversationId}/messages`. Image messages must include attachment `width` and `height`; message responses include those fields on each attachment.
 - Post endpoints: `GET /api/v1/posts`, `POST /api/v1/posts`, `GET /api/v1/posts/{postId}`, `PATCH /api/v1/posts/{postId}`, `DELETE /api/v1/posts/{postId}`, `POST /api/v1/posts/{postId}/like`, `POST /api/v1/users/{authorUuid}/follow`, `GET /api/v1/posts/{postId}/comments`, `POST /api/v1/posts/{postId}/comments`, `POST /api/v1/comments/{commentId}/like`, `POST /api/v1/comments/{commentId}/replies`, `POST /api/v1/replies/{replyId}/like`, `DELETE /api/v1/comments/{commentId}`, and `DELETE /api/v1/replies/{replyId}`.
+- Notification and operation endpoints: `GET /api/v1/notifications`, `POST /api/v1/notifications/read-all`, `POST /api/v1/notifications/{notificationId}/read`, and `POST /api/v1/operations/receipt`.
 
 PostgreSQL:
 
@@ -200,6 +203,11 @@ Current pushed events:
 - `chat.message.created` after REST message send succeeds.
 - `chat.message.recalled` after REST sender recall succeeds.
 - `chat.conversation.sync.updated` after read/unread/settings/hidden-history changes and after new messages update participant unread state.
+- `user.profile.updated` and `user.preferences.updated` after profile, avatar, public ID, or preference changes.
+- `friend.group.created`, `friend.updated`, `friend.deleted`, and `friend.request.*` after friend list and request changes.
+- `group.created`, `group.updated`, `group.deleted`, `group.members.added`, `group.member.removed`, `group.member.updated`, `group.owner.transferred`, `group.my_settings.updated`, and `group.join_request.*` after group changes.
+- `notification.read` and `notification.read_all` after notification read-state changes.
+- `post.created`, `post.updated`, `post.deleted`, `post.like.updated`, `post.comment.created`, `post.comment.deleted`, `post.reply.created`, `post.reply.deleted`, `post.comment.like.updated`, `post.reply.like.updated`, and `post.author.follow.updated` after post/count/viewer-state changes.
 
 Incoming WebSocket command:
 
@@ -226,5 +234,5 @@ The former `internal/database/postgres_test.go` was a single DSN unit test, not 
 
 ## Next Build Steps
 
-1. Add AI conversation, message, file binding, parse-status, context, feedback, and title-generation workflows.
-2. Add realtime post events after client notification semantics are finalized.
+1. Tighten file access control for chat attachments, group avatars, and post media based on business ownership and visibility.
+2. Add full ETag / `If-None-Match` handling and version-conflict checks across profile, group, file, and post resources.

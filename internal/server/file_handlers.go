@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	filesvc "nlserver/internal/files"
@@ -66,8 +67,89 @@ type completeUploadSessionResponse struct {
 	ProcessingStatus string  `json:"processingStatus"`
 }
 
+type fileResponse struct {
+	FileID           string                `json:"fileId"`
+	FileName         string                `json:"fileName"`
+	MimeType         string                `json:"mimeType"`
+	SizeBytes        int64                 `json:"sizeBytes"`
+	URL              string                `json:"url"`
+	Visibility       string                `json:"visibility"`
+	ProcessingStatus string                `json:"processingStatus"`
+	Version          int                   `json:"version"`
+	ETag             *string               `json:"etag"`
+	ContentHash      *string               `json:"contentHash"`
+	CreatedAt        time.Time             `json:"createdAt"`
+	UpdatedAt        time.Time             `json:"updatedAt"`
+	Variants         []fileVariantResponse `json:"variants"`
+}
+
+type fileVariantResponse struct {
+	VariantID   string    `json:"variantId"`
+	VariantType string    `json:"variantType"`
+	URL         string    `json:"url"`
+	MimeType    string    `json:"mimeType"`
+	SizeBytes   int64     `json:"sizeBytes"`
+	Width       *int      `json:"width,omitempty"`
+	Height      *int      `json:"height,omitempty"`
+	DurationMS  *int      `json:"durationMs,omitempty"`
+	ETag        *string   `json:"etag"`
+	ContentHash *string   `json:"contentHash"`
+	CreatedAt   time.Time `json:"createdAt"`
+}
+
+type downloadURLResponse struct {
+	URL       string            `json:"url"`
+	ExpiresAt time.Time         `json:"expiresAt"`
+	Headers   map[string]string `json:"headers,omitempty"`
+}
+
+type avatarUploadResponse struct {
+	AvatarURL         string  `json:"avatarUrl"`
+	AvatarVersion     int     `json:"avatarVersion"`
+	AvatarEtag        *string `json:"avatarEtag"`
+	AvatarContentHash *string `json:"avatarContentHash"`
+	FileID            string  `json:"fileId"`
+}
+
 type okResponse struct {
 	OK bool `json:"ok"`
+}
+
+func (s *Server) handleFileRoutes(w http.ResponseWriter, r *http.Request) {
+	const prefix = "/api/v1/files/"
+	tail := strings.Trim(strings.TrimPrefix(r.URL.Path, prefix), "/")
+	parts := []string{}
+	if tail != "" {
+		parts = strings.Split(tail, "/")
+	}
+
+	switch {
+	case r.Method == http.MethodPost && len(parts) == 1 && parts[0] == "upload-session":
+		s.handleCreateUploadSession(w, r)
+	case r.Method == http.MethodGet && len(parts) == 2 && parts[0] == "upload-session":
+		r.SetPathValue("uploadSessionId", parts[1])
+		s.handleGetUploadSession(w, r)
+	case r.Method == http.MethodPost && len(parts) == 3 && parts[0] == "upload-session" && parts[2] == "parts":
+		r.SetPathValue("uploadSessionId", parts[1])
+		s.handlePresignUploadParts(w, r)
+	case r.Method == http.MethodPost && len(parts) == 3 && parts[0] == "upload-session" && parts[2] == "complete":
+		r.SetPathValue("uploadSessionId", parts[1])
+		s.handleCompleteUploadSession(w, r)
+	case r.Method == http.MethodPost && len(parts) == 3 && parts[0] == "upload-session" && parts[2] == "abort":
+		r.SetPathValue("uploadSessionId", parts[1])
+		s.handleAbortUploadSession(w, r)
+	case r.Method == http.MethodGet && len(parts) == 1:
+		r.SetPathValue("fileId", parts[0])
+		s.handleGetFile(w, r)
+	case r.Method == http.MethodGet && len(parts) == 2 && parts[1] == "download-url":
+		r.SetPathValue("fileId", parts[0])
+		s.handleGetFileDownloadURL(w, r)
+	case r.Method == http.MethodDelete && len(parts) == 1:
+		r.SetPathValue("fileId", parts[0])
+		s.handleDeleteFile(w, r)
+	default:
+		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "Resource not found")
+	}
 }
 
 func (s *Server) handleCreateUploadSession(w http.ResponseWriter, r *http.Request) {
@@ -257,6 +339,219 @@ func (s *Server) handleAbortUploadSession(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, okResponse{OK: true})
 }
 
+func (s *Server) handleUploadFile(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+	if s.fileService == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "File service is not configured")
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "VALIDATION_ERROR", "file is required")
+		return
+	}
+	defer file.Close()
+
+	targetType := strings.TrimSpace(r.FormValue("targetType"))
+	if targetType == "" {
+		writeError(w, r, http.StatusBadRequest, "VALIDATION_ERROR", "targetType is required")
+		return
+	}
+
+	mimeType := strings.TrimSpace(header.Header.Get("Content-Type"))
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	var contentHash *string
+	if value := strings.TrimSpace(r.FormValue("contentHash")); value != "" {
+		contentHash = &value
+	}
+
+	result, err := s.fileService.StoreFile(r.Context(), filesvc.StoreFileRequest{
+		UserID:      principal.UserID,
+		TargetType:  targetType,
+		FileName:    header.Filename,
+		MimeType:    mimeType,
+		SizeBytes:   header.Size,
+		ContentHash: contentHash,
+		Body:        file,
+	})
+	if err != nil {
+		writeFileError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, makeFileResponse(result))
+}
+
+func (s *Server) handleUploadMeAvatar(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+	if s.fileService == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "File service is not configured")
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "VALIDATION_ERROR", "file is required")
+		return
+	}
+	defer file.Close()
+
+	mimeType := strings.TrimSpace(header.Header.Get("Content-Type"))
+	if !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+		writeError(w, r, http.StatusUnsupportedMediaType, "FILE_TYPE_NOT_ALLOWED", "Avatar must be an image")
+		return
+	}
+	var contentHash *string
+	if value := strings.TrimSpace(r.FormValue("contentHash")); value != "" {
+		contentHash = &value
+	}
+
+	result, err := s.fileService.UploadAvatar(r.Context(), filesvc.StoreFileRequest{
+		UserID:      principal.UserID,
+		FileName:    header.Filename,
+		MimeType:    mimeType,
+		SizeBytes:   header.Size,
+		ContentHash: contentHash,
+		Body:        file,
+	})
+	if err != nil {
+		writeFileError(w, r, err)
+		return
+	}
+
+	response := avatarUploadResponse{
+		AvatarURL:         result.AvatarURL,
+		AvatarVersion:     result.AvatarVersion,
+		AvatarEtag:        result.AvatarEtag,
+		AvatarContentHash: result.AvatarContentHash,
+		FileID:            result.FileID,
+	}
+	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, map[string]any{
+		"reason": "avatar.updated",
+		"avatar": response,
+	})
+	writeJSON(w, http.StatusCreated, response)
+}
+
+func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+	if s.fileService == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "File service is not configured")
+		return
+	}
+	fileID := r.PathValue("fileId")
+	if err := validateUUID(fileID, "fileId"); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+
+	result, err := s.fileService.GetFile(r.Context(), principal.UserID, fileID)
+	if err != nil {
+		writeFileError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, makeFileResponse(result))
+}
+
+func (s *Server) handleGetFileDownloadURL(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+	if s.fileService == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "File service is not configured")
+		return
+	}
+	fileID := r.PathValue("fileId")
+	if err := validateUUID(fileID, "fileId"); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+
+	result, err := s.fileService.PresignDownloadURL(r.Context(), principal.UserID, fileID, r.URL.Query().Get("variant"))
+	if err != nil {
+		writeFileError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, downloadURLResponse{
+		URL:       result.URL,
+		ExpiresAt: result.ExpiresAt,
+		Headers:   result.Headers,
+	})
+}
+
+func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+	if s.fileService == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "File service is not configured")
+		return
+	}
+	fileID := r.PathValue("fileId")
+	if err := validateUUID(fileID, "fileId"); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+
+	if err := s.fileService.DeleteFile(r.Context(), principal.UserID, fileID); err != nil {
+		writeFileError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, okResponse{OK: true})
+}
+
+func makeFileResponse(result filesvc.FileResult) fileResponse {
+	variants := make([]fileVariantResponse, 0, len(result.Variants))
+	for _, variant := range result.Variants {
+		variants = append(variants, fileVariantResponse{
+			VariantID:   variant.VariantID,
+			VariantType: variant.VariantType,
+			URL:         variant.URL,
+			MimeType:    variant.MimeType,
+			SizeBytes:   variant.SizeBytes,
+			Width:       variant.Width,
+			Height:      variant.Height,
+			DurationMS:  variant.DurationMS,
+			ETag:        variant.ETag,
+			ContentHash: variant.ContentHash,
+			CreatedAt:   variant.CreatedAt,
+		})
+	}
+	return fileResponse{
+		FileID:           result.FileID,
+		FileName:         result.FileName,
+		MimeType:         result.MimeType,
+		SizeBytes:        result.SizeBytes,
+		URL:              result.URL,
+		Visibility:       result.Visibility,
+		ProcessingStatus: result.ProcessingStatus,
+		Version:          result.Version,
+		ETag:             result.ETag,
+		ContentHash:      result.ContentHash,
+		CreatedAt:        result.CreatedAt,
+		UpdatedAt:        result.UpdatedAt,
+		Variants:         variants,
+	}
+}
+
 func writeFileError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, filesvc.ErrValidation):
@@ -273,6 +568,8 @@ func writeFileError(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, r, http.StatusConflict, "UPLOAD_SESSION_COMPLETED", "Upload session already completed")
 	case errors.Is(err, filesvc.ErrUploadAborted):
 		writeError(w, r, http.StatusConflict, "UPLOAD_SESSION_ABORTED", "Upload session already aborted")
+	case errors.Is(err, filesvc.ErrFileReferenced):
+		writeError(w, r, http.StatusConflict, "FILE_IN_USE", "File is referenced by a business resource")
 	case errors.Is(err, repository.ErrNotFound):
 		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "Resource not found")
 	case errors.Is(err, repository.ErrConflict):
