@@ -21,9 +21,10 @@ Current scope is intentionally small:
 - P0 auth HTTP handlers are available: register, login, refresh, logout, session listing/revoke, `/me`, profile editing, public ID availability/change, `GET /me/preferences`, and `PATCH /me/preferences`.
 - User/friend/group HTTP handlers are available: user search/detail/batch, friend list/group list, friend group creation, friend settings update/delete, friend request create/list/accept/reject, and group list/detail/member list.
 - File upload-session HTTP handlers are available for presigned single and multipart MinIO/S3 uploads.
+- File upload completion now queues image processing jobs; the runtime starts a background worker that reads uploaded images from MinIO, extracts backend-side dimensions, generates 512px JPEG thumbnails when needed, records thumbnail rows in `file_variants`, and moves file status from `processing` to `ready` or `failed`.
 - Chat conversation list/open/detail/settings/read/unread endpoints are available, along with message send, history, sender recall, and current-user hidden-history clearing; image attachments require and return `width` and `height` for frontend preview placeholders.
 - WebSocket realtime foundation is available at `GET /api/v1/ws`: access-token auth, per-user connection management, PostgreSQL-backed global event IDs, durable replay, Redis pub/sub fanout, `ping`/`realtime.pong`, `chat.message.created`, `chat.message.recalled`, `chat.conversation.sync.updated`, hidden-history sync, and `chat.message.send`.
-- No file processing workers, group write handlers, post/AI API handlers, realtime cleanup policy, or fanout operational metrics yet.
+- No video cover worker, audio duration worker, file cleanup worker, group write handlers, post/AI API handlers, realtime cleanup policy, or fanout operational metrics yet.
 - Redis is used for auth rate limiting and realtime fanout today. It is not used as the source of truth for users, refresh token sessions, messages, notifications, realtime events, file metadata, or durable business state.
 
 ## Start Local Dependencies
@@ -77,6 +78,7 @@ The current API foundation includes:
 - Auth endpoints: `POST /api/v1/auth/register`, `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/sessions`, `POST /api/v1/auth/sessions/{sessionId}/revoke`, `GET /api/v1/me`, `PATCH /api/v1/me`, `GET /api/v1/me/user-id/check`, `PATCH /api/v1/me/user-id`, `GET /api/v1/me/preferences`, and `PATCH /api/v1/me/preferences`.
 - Directory endpoints: `GET /api/v1/users`, `GET /api/v1/users/{userUuid}`, `GET /api/v1/users/by-id/{userId}`, `POST /api/v1/users/batch`, `GET /api/v1/friends`, `PATCH /api/v1/friends/{friendUserUuid}`, `DELETE /api/v1/friends/{friendUserUuid}`, `GET /api/v1/friend-groups`, `POST /api/v1/friend-groups`, `POST /api/v1/friend-requests`, `GET /api/v1/friend-requests`, `POST /api/v1/friend-requests/{requestId}/accept`, `POST /api/v1/friend-requests/{requestId}/reject`, `GET /api/v1/groups`, `GET /api/v1/groups/{groupId}`, and `GET /api/v1/groups/{groupId}/members`.
 - File endpoints: `POST /api/v1/files/upload-session`, `GET /api/v1/files/upload-session/{uploadSessionId}`, `POST /api/v1/files/upload-session/{uploadSessionId}/parts`, `POST /api/v1/files/upload-session/{uploadSessionId}/complete`, and `POST /api/v1/files/upload-session/{uploadSessionId}/abort`.
+- File upload completion returns `processingStatus` from the file storage status. Image uploads enter `processing` until the background worker records dimensions and optional `thumbnail_512` variants; non-image uploads move directly to `ready` for now.
 - Chat endpoints: `GET /api/v1/conversations`, `POST /api/v1/conversations/direct`, `POST /api/v1/conversations/group`, `GET /api/v1/conversations/{conversationId}`, `PATCH /api/v1/conversations/{conversationId}/settings`, `POST /api/v1/conversations/{conversationId}/read`, `POST /api/v1/conversations/{conversationId}/unread`, `POST /api/v1/conversations/{conversationId}/messages`, `GET /api/v1/conversations/{conversationId}/messages`, `POST /api/v1/conversations/{conversationId}/messages/{messageId}/recall`, and `DELETE /api/v1/conversations/{conversationId}/messages`. Image messages must include attachment `width` and `height`; message responses include those fields on each attachment.
 
 PostgreSQL:
@@ -142,7 +144,7 @@ The first PostgreSQL repositories cover:
 - `users`: create account records, read by UUID/email/public ID/account, update profile fields, check and update public ID with history, enforce public ID change idempotency, increment token version, and update last-seen time.
 - `user_preferences`: ensure defaults, upsert full preferences, read by user UUID, and patch preference fields.
 - `user_sessions`: create refresh-token sessions, read active sessions, list user sessions, rotate refresh token hash, revoke sessions, and update session last-seen time.
-- `files`: create file metadata, upload sessions, multipart part tracking, upload completion, status transitions, and object-storage metadata bookkeeping.
+- `files`: create file metadata, upload sessions, multipart part tracking, upload completion, status transitions, object-storage metadata bookkeeping, file processing job claims/results, and file variant records.
 - `chat`: list/open/read/update conversations, persist participant sync state, persist messages, assign per-conversation `message_seq`, persist message attachments, recall sender messages, hide current-user history with `hidden_at`, return attachment file metadata, and preserve image `width` and `height`.
 - `friends`: create and list current-user friend groups, list active friends with keyword/group filters, read current-user friendship relation metadata, update/delete friendship settings, create/list/accept/reject friend requests, and upsert bidirectional friendships when accepting requests.
 - `groups`: list current-user groups with keyword/category filters, read group details only for members, and page group members only when the viewer belongs to the group.
@@ -158,9 +160,15 @@ Repository infrastructure:
 
 ## Runtime Boundary
 
-`internal/app` owns runtime dependency assembly and lifecycle for PostgreSQL, Redis, repository aggregates, auth service, and object storage provider injection. `cmd/nlserver` should stay thin: load configuration, create the runtime, pass dependencies into `server.NewWithDependencies`, and start HTTP serving.
+`internal/app` owns runtime dependency assembly and lifecycle for PostgreSQL, Redis, repository aggregates, auth service, file service, file processing worker, and object storage provider injection. `cmd/nlserver` should stay thin: load configuration, create the runtime, pass dependencies into `server.NewWithDependencies`, and start HTTP serving.
 
-The MinIO/S3 provider implements object PUT/HEAD/DELETE, presigned GET/PUT URLs, multipart upload creation, part presigning, completion, and abort. File metadata remains in PostgreSQL; public API responses do not expose bucket names or object keys.
+The MinIO/S3 provider implements object PUT/GET/HEAD/DELETE, presigned GET/PUT URLs, multipart upload creation, part presigning, completion, and abort. File metadata remains in PostgreSQL; public API responses do not expose bucket names or object keys.
+
+## File Processing Boundary
+
+`internal/files` now includes the upload-session service and a background processing worker. Completing an uploaded image creates a `file_processing_jobs(job_type=image_metadata)` row and moves the file to `processing`. The worker claims pending jobs with `FOR UPDATE SKIP LOCKED`, reads the original object through the storage provider, extracts image width/height, optionally writes a `thumbnail_512` JPEG object, stores the thumbnail metadata in `file_variants`, records the job result JSON, and marks the file `ready`. Processing failures are recorded on the job and mark the file `failed`.
+
+The current worker supports image metadata and thumbnails. Video cover extraction, audio duration probing, stale job retry, orphan object cleanup, and business-level usage cleanup are still future work.
 
 ## Chat Boundary
 
@@ -205,6 +213,6 @@ The former `internal/database/postgres_test.go` was a single DSN unit test, not 
 
 ## Next Build Steps
 
-1. Add file processing workers for image thumbnails, backend-side dimension extraction, video covers, audio duration, and cleanup.
+1. Extend file processing to video cover extraction, audio duration probing, stale job retry, and orphan/unused object cleanup.
 2. Add realtime event cleanup policy, replay metrics, and operational health checks for Redis fanout.
 3. Add group write APIs, post APIs, and AI workflows after the chat/file metadata paths settle.

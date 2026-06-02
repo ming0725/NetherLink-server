@@ -513,6 +513,7 @@ CREATE INDEX idx_users_public_id ON users(public_id);
 CREATE INDEX idx_users_email ON users(email);
 CREATE INDEX idx_files_owner_user_id ON files(owner_user_id);
 CREATE INDEX idx_file_usages_business ON file_usages(usage_type, business_id);
+CREATE INDEX idx_file_processing_jobs_pending ON file_processing_jobs(status, created_at);
 CREATE INDEX idx_user_sessions_user_id ON user_sessions(user_id);
 CREATE UNIQUE INDEX idx_user_sessions_refresh_token_hash ON user_sessions(refresh_token_hash);
 CREATE INDEX idx_friendships_user_id ON friendships(user_id);

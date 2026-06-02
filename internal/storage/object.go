@@ -8,6 +8,7 @@ import (
 
 type ObjectStorageProvider interface {
 	PutObject(ctx context.Context, input PutObjectInput) (PutObjectOutput, error)
+	GetObject(ctx context.Context, input GetObjectInput) (ObjectReader, error)
 	HeadObject(ctx context.Context, input HeadObjectInput) (ObjectInfo, error)
 	DeleteObject(ctx context.Context, input DeleteObjectInput) error
 	PresignGetObject(ctx context.Context, input PresignObjectInput) (PresignedURL, error)
@@ -29,6 +30,16 @@ type PutObjectInput struct {
 
 type PutObjectOutput struct {
 	ETag string
+}
+
+type GetObjectInput struct {
+	Bucket    string
+	ObjectKey string
+}
+
+type ObjectReader struct {
+	Body io.ReadCloser
+	Info ObjectInfo
 }
 
 type HeadObjectInput struct {

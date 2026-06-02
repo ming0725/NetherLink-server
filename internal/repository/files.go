@@ -44,6 +44,34 @@ const uploadSessionSelectColumns = `
 	created_at,
 	updated_at`
 
+const fileVariantSelectColumns = `
+	id,
+	file_id,
+	variant_type,
+	bucket,
+	object_key,
+	mime_type,
+	size_bytes,
+	width,
+	height,
+	duration_ms,
+	etag,
+	content_hash,
+	created_at,
+	updated_at`
+
+const fileProcessingJobSelectColumns = `
+	id,
+	file_id,
+	job_type,
+	status,
+	result_json,
+	error_code,
+	started_at,
+	finished_at,
+	created_at,
+	updated_at`
+
 type FileRepository struct {
 	db DBTX
 }
@@ -85,6 +113,36 @@ type FileUploadSession struct {
 	UpdatedAt         time.Time
 }
 
+type FileVariant struct {
+	ID          string
+	FileID      string
+	VariantType string
+	Bucket      string
+	ObjectKey   string
+	MimeType    string
+	SizeBytes   int64
+	Width       *int
+	Height      *int
+	DurationMS  *int
+	ETag        *string
+	ContentHash *string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+type FileProcessingJob struct {
+	ID         string
+	FileID     string
+	JobType    string
+	Status     string
+	Result     json.RawMessage
+	ErrorCode  *string
+	StartedAt  *time.Time
+	FinishedAt *time.Time
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
 type CreateFileParams struct {
 	ID               string
 	OwnerUserID      string
@@ -118,6 +176,26 @@ type CompleteUploadSessionParams struct {
 	SessionID     string
 	UserID        string
 	UploadedParts json.RawMessage
+}
+
+type CreateFileVariantParams struct {
+	FileID      string
+	VariantType string
+	Bucket      string
+	ObjectKey   string
+	MimeType    string
+	SizeBytes   int64
+	Width       *int
+	Height      *int
+	DurationMS  *int
+	ETag        *string
+	ContentHash *string
+}
+
+type CreateFileProcessingJobParams struct {
+	FileID  string
+	JobType string
+	Status  string
 }
 
 func NewFileRepository(db DBTX) *FileRepository {
@@ -312,6 +390,119 @@ func (r *FileRepository) MarkUploadSessionStatus(ctx context.Context, userID str
 	return session, translateWriteError(err)
 }
 
+func (r *FileRepository) CreateVariant(ctx context.Context, params CreateFileVariantParams) (FileVariant, error) {
+	variant, err := scanFileVariant(r.db.QueryRow(ctx, `
+		INSERT INTO file_variants (
+			file_id,
+			variant_type,
+			bucket,
+			object_key,
+			mime_type,
+			size_bytes,
+			width,
+			height,
+			duration_ms,
+			etag,
+			content_hash
+		)
+		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		RETURNING `+fileVariantSelectColumns,
+		normalizeText(params.FileID),
+		normalizeText(params.VariantType),
+		normalizeText(params.Bucket),
+		normalizeText(params.ObjectKey),
+		normalizeText(params.MimeType),
+		params.SizeBytes,
+		params.Width,
+		params.Height,
+		params.DurationMS,
+		normalizeTextPtr(params.ETag),
+		normalizeTextPtr(params.ContentHash),
+	))
+	return variant, translateWriteError(err)
+}
+
+func (r *FileRepository) CreateProcessingJob(ctx context.Context, params CreateFileProcessingJobParams) (FileProcessingJob, error) {
+	status := normalizeText(params.Status)
+	if status == "" {
+		status = "pending"
+	}
+
+	job, err := scanFileProcessingJob(r.db.QueryRow(ctx, `
+		INSERT INTO file_processing_jobs (
+			file_id,
+			job_type,
+			status
+		)
+		VALUES ($1::uuid, $2, $3)
+		RETURNING `+fileProcessingJobSelectColumns,
+		normalizeText(params.FileID),
+		normalizeText(params.JobType),
+		status,
+	))
+	return job, translateWriteError(err)
+}
+
+func (r *FileRepository) ClaimNextProcessingJob(ctx context.Context) (FileProcessingJob, error) {
+	job, err := scanFileProcessingJob(r.db.QueryRow(ctx, `
+		UPDATE file_processing_jobs
+		SET status = 'processing',
+		    started_at = now(),
+		    updated_at = now()
+		WHERE id = (
+			SELECT id
+			FROM file_processing_jobs
+			WHERE status = 'pending'
+			ORDER BY created_at ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		)
+		RETURNING `+fileProcessingJobSelectColumns,
+	))
+	return job, translateWriteError(err)
+}
+
+func (r *FileRepository) MarkProcessingJobSucceeded(ctx context.Context, jobID string, result json.RawMessage) (FileProcessingJob, error) {
+	if len(result) == 0 {
+		result = json.RawMessage(`{}`)
+	}
+
+	job, err := scanFileProcessingJob(r.db.QueryRow(ctx, `
+		UPDATE file_processing_jobs
+		SET status = 'succeeded',
+		    result_json = $2,
+		    error_code = NULL,
+		    finished_at = now(),
+		    updated_at = now()
+		WHERE id = $1::uuid
+		RETURNING `+fileProcessingJobSelectColumns,
+		normalizeText(jobID),
+		result,
+	))
+	return job, translateWriteError(err)
+}
+
+func (r *FileRepository) MarkProcessingJobFailed(ctx context.Context, jobID string, errorCode string, result json.RawMessage) (FileProcessingJob, error) {
+	if len(result) == 0 {
+		result = json.RawMessage(`{}`)
+	}
+
+	job, err := scanFileProcessingJob(r.db.QueryRow(ctx, `
+		UPDATE file_processing_jobs
+		SET status = 'failed',
+		    result_json = $3,
+		    error_code = $2,
+		    finished_at = now(),
+		    updated_at = now()
+		WHERE id = $1::uuid
+		RETURNING `+fileProcessingJobSelectColumns,
+		normalizeText(jobID),
+		normalizeText(errorCode),
+		result,
+	))
+	return job, translateWriteError(err)
+}
+
 func scanFile(row scanner) (File, error) {
 	var (
 		file        File
@@ -409,6 +600,96 @@ func scanUploadSession(row scanner) (FileUploadSession, error) {
 	session.ClientOperationID = stringPtrFromNull(clientOperationID)
 	session.UploadedParts = jsonOrDefaultArray(session.UploadedParts)
 	return session, nil
+}
+
+func scanFileVariant(row scanner) (FileVariant, error) {
+	var (
+		variant     FileVariant
+		id          pgtype.UUID
+		fileID      pgtype.UUID
+		width       sql.NullInt64
+		height      sql.NullInt64
+		durationMS  sql.NullInt64
+		etag        sql.NullString
+		contentHash sql.NullString
+	)
+
+	err := row.Scan(
+		&id,
+		&fileID,
+		&variant.VariantType,
+		&variant.Bucket,
+		&variant.ObjectKey,
+		&variant.MimeType,
+		&variant.SizeBytes,
+		&width,
+		&height,
+		&durationMS,
+		&etag,
+		&contentHash,
+		&variant.CreatedAt,
+		&variant.UpdatedAt,
+	)
+	if err != nil {
+		return FileVariant{}, err
+	}
+
+	variant.ID = uuidString(id)
+	variant.FileID = uuidString(fileID)
+	if width.Valid {
+		value := int(width.Int64)
+		variant.Width = &value
+	}
+	if height.Valid {
+		value := int(height.Int64)
+		variant.Height = &value
+	}
+	if durationMS.Valid {
+		value := int(durationMS.Int64)
+		variant.DurationMS = &value
+	}
+	variant.ETag = stringPtrFromNull(etag)
+	variant.ContentHash = stringPtrFromNull(contentHash)
+	return variant, nil
+}
+
+func scanFileProcessingJob(row scanner) (FileProcessingJob, error) {
+	var (
+		job        FileProcessingJob
+		id         pgtype.UUID
+		fileID     pgtype.UUID
+		errorCode  sql.NullString
+		startedAt  sql.NullTime
+		finishedAt sql.NullTime
+	)
+
+	err := row.Scan(
+		&id,
+		&fileID,
+		&job.JobType,
+		&job.Status,
+		&job.Result,
+		&errorCode,
+		&startedAt,
+		&finishedAt,
+		&job.CreatedAt,
+		&job.UpdatedAt,
+	)
+	if err != nil {
+		return FileProcessingJob{}, err
+	}
+
+	job.ID = uuidString(id)
+	job.FileID = uuidString(fileID)
+	job.Result = jsonOrDefault(job.Result)
+	job.ErrorCode = stringPtrFromNull(errorCode)
+	if startedAt.Valid {
+		job.StartedAt = &startedAt.Time
+	}
+	if finishedAt.Valid {
+		job.FinishedAt = &finishedAt.Time
+	}
+	return job, nil
 }
 
 func stringPtrFromNull(value sql.NullString) *string {

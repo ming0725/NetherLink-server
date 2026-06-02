@@ -105,6 +105,24 @@ func (p *minioProvider) PutObject(ctx context.Context, input PutObjectInput) (Pu
 	return PutObjectOutput{ETag: normalizeETag(info.ETag)}, nil
 }
 
+func (p *minioProvider) GetObject(ctx context.Context, input GetObjectInput) (ObjectReader, error) {
+	object, err := p.client.GetObject(ctx, input.Bucket, input.ObjectKey, minio.GetObjectOptions{})
+	if err != nil {
+		return ObjectReader{}, err
+	}
+
+	info, err := object.Stat()
+	if err != nil {
+		_ = object.Close()
+		return ObjectReader{}, err
+	}
+
+	return ObjectReader{
+		Body: object,
+		Info: makeObjectInfo(input.Bucket, input.ObjectKey, info),
+	}, nil
+}
+
 func (p *minioProvider) HeadObject(ctx context.Context, input HeadObjectInput) (ObjectInfo, error) {
 	info, err := p.client.StatObject(ctx, input.Bucket, input.ObjectKey, minio.StatObjectOptions{})
 	if err != nil {

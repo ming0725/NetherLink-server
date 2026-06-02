@@ -30,6 +30,11 @@ const (
 	defaultSingleUploadLimitBytes = 64 * 1024 * 1024
 	defaultMultipartPartSizeBytes = 8 * 1024 * 1024
 	maxMultipartParts             = 10000
+
+	fileStatusProcessing = "processing"
+	fileStatusReady      = "ready"
+
+	fileProcessingJobImage = "image_metadata"
 )
 
 var (
@@ -401,6 +406,26 @@ func (s *Service) CompleteUploadSession(ctx context.Context, req CompleteUploadS
 			return err
 		}
 
+		jobType := processingJobTypeForFile(updatedFile)
+		if jobType != "" {
+			if _, err := repos.Files.CreateProcessingJob(ctx, repository.CreateFileProcessingJobParams{
+				FileID:  updatedFile.ID,
+				JobType: jobType,
+				Status:  "pending",
+			}); err != nil {
+				return err
+			}
+			updatedFile, err = repos.Files.MarkStatus(ctx, updatedFile.ID, fileStatusProcessing)
+			if err != nil {
+				return err
+			}
+		} else {
+			updatedFile, err = repos.Files.MarkStatus(ctx, updatedFile.ID, fileStatusReady)
+			if err != nil {
+				return err
+			}
+		}
+
 		completedFile = updatedFile
 		return nil
 	})
@@ -423,7 +448,7 @@ func (s *Service) CompleteUploadSession(ctx context.Context, req CompleteUploadS
 		ETag:             completedFile.ETag,
 		ContentHash:      completedFile.ContentHash,
 		Version:          completedFile.Version,
-		ProcessingStatus: "pending",
+		ProcessingStatus: completedFile.StorageStatus,
 	}, nil
 }
 
@@ -619,6 +644,14 @@ func metadataForUpload(contentHash *string) map[string]string {
 
 func normalizeUploadMode(mode string) string {
 	return strings.ToLower(strings.TrimSpace(mode))
+}
+
+func processingJobTypeForFile(file repository.File) string {
+	mimeType := strings.ToLower(strings.TrimSpace(file.MimeType))
+	if strings.HasPrefix(mimeType, "image/") {
+		return fileProcessingJobImage
+	}
+	return ""
 }
 
 func normalizeText(value string) string {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -27,9 +28,12 @@ type Runtime struct {
 	AuthService     *authsvc.Service
 	ChatService     *chatsvc.Service
 	FileService     *filesvc.Service
+	FileWorker      *filesvc.ProcessingWorker
 	FriendService   *friendsvc.Service
 	StorageProvider storage.ObjectStorageProvider
 	Logger          *slog.Logger
+	cancel          context.CancelFunc
+	fileWorkerDone  <-chan struct{}
 }
 
 func NewRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Runtime, error) {
@@ -44,6 +48,7 @@ func NewRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*R
 
 	redisClient := cache.NewRedisClient(cfg.Redis)
 	repos := repository.New(db)
+	runtimeCtx, cancel := context.WithCancel(ctx)
 
 	runtime := &Runtime{
 		Config:        cfg,
@@ -55,6 +60,7 @@ func NewRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*R
 		FileService:   filesvc.NewService(cfg.Storage, repos, db, nil),
 		FriendService: friendsvc.NewService(repos, db),
 		Logger:        logger,
+		cancel:        cancel,
 	}
 
 	storageProvider, err := storage.NewProvider(cfg.Storage)
@@ -62,6 +68,8 @@ func NewRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*R
 	case err == nil:
 		runtime.StorageProvider = storageProvider
 		runtime.FileService = filesvc.NewService(cfg.Storage, repos, db, storageProvider)
+		runtime.FileWorker = filesvc.NewProcessingWorker(repos, db, storageProvider, logger)
+		runtime.fileWorkerDone = runtime.FileWorker.Start(runtimeCtx)
 	case errors.Is(err, storage.ErrProviderDisabled):
 		logger.Warn("object storage provider disabled")
 	case errors.Is(err, storage.ErrProviderNotImplemented):
@@ -77,6 +85,16 @@ func NewRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*R
 func (r *Runtime) Close() {
 	if r == nil {
 		return
+	}
+	if r.cancel != nil {
+		r.cancel()
+	}
+	if r.fileWorkerDone != nil {
+		select {
+		case <-r.fileWorkerDone:
+		case <-time.After(2 * time.Second):
+			r.Logger.Warn("file processing worker did not stop before shutdown timeout")
+		}
 	}
 	if r.Redis != nil {
 		_ = r.Redis.Close()
