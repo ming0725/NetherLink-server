@@ -462,6 +462,27 @@ func (r *FileRepository) ClaimNextProcessingJob(ctx context.Context) (FileProces
 	return job, translateWriteError(err)
 }
 
+func (r *FileRepository) ResetStaleProcessingJobs(ctx context.Context, staleAfter time.Duration) (int64, error) {
+	if staleAfter <= 0 {
+		return 0, nil
+	}
+
+	tag, err := r.db.Exec(ctx, `
+		UPDATE file_processing_jobs
+		SET status = 'pending',
+		    started_at = NULL,
+		    updated_at = now()
+		WHERE status = 'processing'
+		  AND started_at IS NOT NULL
+		  AND started_at < now() - ($1 * interval '1 second')`,
+		staleAfter.Seconds(),
+	)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (r *FileRepository) MarkProcessingJobSucceeded(ctx context.Context, jobID string, result json.RawMessage) (FileProcessingJob, error) {
 	if len(result) == 0 {
 		result = json.RawMessage(`{}`)

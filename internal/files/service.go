@@ -33,8 +33,11 @@ const (
 
 	fileStatusProcessing = "processing"
 	fileStatusReady      = "ready"
+	fileStatusFailed     = "failed"
 
 	fileProcessingJobImage = "image_metadata"
+	fileProcessingJobVideo = "video_cover"
+	fileProcessingJobAudio = "audio_metadata"
 )
 
 var (
@@ -650,6 +653,12 @@ func processingJobTypeForFile(file repository.File) string {
 	mimeType := strings.ToLower(strings.TrimSpace(file.MimeType))
 	if strings.HasPrefix(mimeType, "image/") {
 		return fileProcessingJobImage
+	}
+	if strings.HasPrefix(mimeType, "video/") {
+		return fileProcessingJobVideo
+	}
+	if strings.HasPrefix(mimeType, "audio/") {
+		return fileProcessingJobAudio
 	}
 	return ""
 }
