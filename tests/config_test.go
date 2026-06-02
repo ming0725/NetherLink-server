@@ -40,6 +40,12 @@ func TestConfigLoadWithValidEnvironment(t *testing.T) {
 	if cfg.Storage.Buckets.Public != "netherlink-public" {
 		t.Fatalf("public bucket = %q, want netherlink-public", cfg.Storage.Buckets.Public)
 	}
+	if cfg.AI.Provider != "disabled" {
+		t.Fatalf("ai provider = %q, want disabled", cfg.AI.Provider)
+	}
+	if cfg.AI.RequestTimeout != time.Minute {
+		t.Fatalf("ai request timeout = %v, want 1m", cfg.AI.RequestTimeout)
+	}
 }
 
 func TestConfigLoadRejectsMalformedValues(t *testing.T) {
@@ -56,6 +62,52 @@ func TestConfigLoadRejectsMalformedValues(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "NETHERLINK_AUTH_ACCESS_TOKEN_TTL must be a duration") {
 		t.Fatalf("Load() error = %q, want ttl parse error", err)
+	}
+}
+
+func TestConfigLoadAIProvider(t *testing.T) {
+	setValidRequiredConfig(t)
+	t.Setenv("NETHERLINK_AI_PROVIDER", "openai")
+	t.Setenv("NETHERLINK_AI_API_KEY", "test-ai-key")
+	t.Setenv("NETHERLINK_AI_DEFAULT_MODEL", "test-model")
+	t.Setenv("NETHERLINK_AI_TITLE_MODEL", "test-title-model")
+	t.Setenv("NETHERLINK_AI_MAX_CONTEXT_TOKENS", "8192")
+	t.Setenv("NETHERLINK_AI_REQUEST_TIMEOUT", "45s")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.AI.Provider != "openai" {
+		t.Fatalf("ai provider = %q, want openai", cfg.AI.Provider)
+	}
+	if cfg.AI.DefaultModel != "test-model" {
+		t.Fatalf("ai default model = %q, want test-model", cfg.AI.DefaultModel)
+	}
+	if cfg.AI.TitleModel != "test-title-model" {
+		t.Fatalf("ai title model = %q, want test-title-model", cfg.AI.TitleModel)
+	}
+	if cfg.AI.MaxContextTokens != 8192 {
+		t.Fatalf("ai max context tokens = %d, want 8192", cfg.AI.MaxContextTokens)
+	}
+	if cfg.AI.RequestTimeout != 45*time.Second {
+		t.Fatalf("ai request timeout = %v, want 45s", cfg.AI.RequestTimeout)
+	}
+}
+
+func TestConfigLoadAIProviderRequiresRuntimeSettings(t *testing.T) {
+	setValidRequiredConfig(t)
+	t.Setenv("NETHERLINK_AI_PROVIDER", "openai")
+
+	_, err := config.Load()
+	if err == nil {
+		t.Fatal("Load() error = nil, want AI runtime validation error")
+	}
+	if !strings.Contains(err.Error(), "NETHERLINK_AI_API_KEY is required") {
+		t.Fatalf("Load() error = %q, want AI API key error", err)
+	}
+	if !strings.Contains(err.Error(), "NETHERLINK_AI_DEFAULT_MODEL is required") {
+		t.Fatalf("Load() error = %q, want AI default model error", err)
 	}
 }
 

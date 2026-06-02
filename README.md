@@ -31,7 +31,7 @@ Current scope is intentionally small:
 - Post HTTP handlers are available for feed/detail/create/edit/delete, media binding, likes, follows, comments, replies, comment/reply likes, and comment/reply deletion.
 - Notification HTTP handlers are available for listing notifications, marking all notifications read, and marking one notification read.
 - Operation receipt HTTP handler is available for idempotent client-operation result lookup and creation.
-- AI API handlers are intentionally paused until provider credentials and model runtime configuration are available.
+- AI provider/model runtime configuration is available under `NETHERLINK_AI_*`; AI API handlers are still intentionally paused until provider integration and streaming runtime code are implemented.
 - Redis is used for auth rate limiting and realtime fanout today. It is not used as the source of truth for users, refresh token sessions, messages, notifications, realtime events, file metadata, or durable business state.
 
 ## Start Local Dependencies
@@ -74,6 +74,16 @@ Realtime configuration:
 - `NETHERLINK_REALTIME_EVENT_RETENTION`: default `168h`.
 - `NETHERLINK_REALTIME_EVENT_CLEANUP_INTERVAL`: default `1h`.
 - `NETHERLINK_REALTIME_EVENT_CLEANUP_BATCH`: default `5000`.
+
+AI configuration:
+
+- `NETHERLINK_AI_PROVIDER`: default `disabled`; supported configured values are `openai` and `openai-compatible`.
+- `NETHERLINK_AI_API_KEY`: required when the AI provider is enabled.
+- `NETHERLINK_AI_BASE_URL`: optional provider base URL, mainly for OpenAI-compatible providers.
+- `NETHERLINK_AI_DEFAULT_MODEL`: required when the AI provider is enabled.
+- `NETHERLINK_AI_TITLE_MODEL`: optional separate title-generation model.
+- `NETHERLINK_AI_MAX_CONTEXT_TOKENS`: default `0`, meaning no configured backend cap yet.
+- `NETHERLINK_AI_REQUEST_TIMEOUT`: default `1m`.
 
 ## API Foundation
 
@@ -235,9 +245,17 @@ Run all current tests with:
 go test ./...
 ```
 
+Business-aware file access integration coverage is available when a PostgreSQL test DSN is provided:
+
+```sh
+NETHERLINK_TEST_POSTGRES_DSN='postgres://...' go test ./tests -run TestFileAccessBusinessReferences
+```
+
+Without `NETHERLINK_TEST_POSTGRES_DSN`, that integration test is skipped and the rest of the test suite still runs normally.
+
 The former `internal/database/postgres_test.go` was a single DSN unit test, not a duplicate or repeated test file. It now lives at `tests/postgres_dsn_test.go` with the rest of the external test suite.
 
 ## Next Build Steps
 
-1. Add automated coverage around business-aware file access for chat attachments, group avatars, and post media.
-2. Add AI provider/model runtime configuration before implementing the paused AI API handlers.
+1. Add AI repositories/services and paused HTTP handler wiring for AI conversations, messages, uploaded files, context metadata, and feedback.
+2. Add provider integration and streaming response runtime for the configured AI provider.

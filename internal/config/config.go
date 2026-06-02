@@ -16,6 +16,7 @@ type Config struct {
 	Redis    RedisConfig
 	Realtime RealtimeConfig
 	Storage  StorageConfig
+	AI       AIConfig
 }
 
 type HTTPConfig struct {
@@ -69,6 +70,16 @@ type StorageBuckets struct {
 	Tmp       string
 }
 
+type AIConfig struct {
+	Provider         string
+	APIKey           string
+	BaseURL          string
+	DefaultModel     string
+	TitleModel       string
+	MaxContextTokens int
+	RequestTimeout   time.Duration
+}
+
 func Load() (Config, error) {
 	var validationErrors []string
 	storageEndpoint := getEnv("NETHERLINK_OBJECT_STORAGE_ENDPOINT", "http://localhost:9000")
@@ -117,6 +128,15 @@ func Load() (Config, error) {
 				Private:   getEnv("NETHERLINK_OBJECT_STORAGE_PRIVATE_BUCKET", "netherlink-private"),
 				Tmp:       getEnv("NETHERLINK_OBJECT_STORAGE_TMP_BUCKET", "netherlink-tmp"),
 			},
+		},
+		AI: AIConfig{
+			Provider:         getEnv("NETHERLINK_AI_PROVIDER", "disabled"),
+			APIKey:           getEnv("NETHERLINK_AI_API_KEY", ""),
+			BaseURL:          getEnv("NETHERLINK_AI_BASE_URL", ""),
+			DefaultModel:     getEnv("NETHERLINK_AI_DEFAULT_MODEL", ""),
+			TitleModel:       getEnv("NETHERLINK_AI_TITLE_MODEL", ""),
+			MaxContextTokens: getEnvNonNegativeInt(&validationErrors, "NETHERLINK_AI_MAX_CONTEXT_TOKENS", 0),
+			RequestTimeout:   getEnvDuration(&validationErrors, "NETHERLINK_AI_REQUEST_TIMEOUT", time.Minute),
 		},
 	}
 
@@ -236,6 +256,18 @@ func validate(cfg Config, validationErrors *[]string) {
 	}
 	if cfg.Storage.SecretKey != "" && len(cfg.Storage.SecretKey) < 16 {
 		*validationErrors = append(*validationErrors, "NETHERLINK_OBJECT_STORAGE_SECRET_KEY must be at least 16 characters")
+	}
+	switch cfg.AI.Provider {
+	case "disabled":
+	case "openai", "openai-compatible":
+		if cfg.AI.APIKey == "" {
+			*validationErrors = append(*validationErrors, "NETHERLINK_AI_API_KEY is required when NETHERLINK_AI_PROVIDER is enabled")
+		}
+		if cfg.AI.DefaultModel == "" {
+			*validationErrors = append(*validationErrors, "NETHERLINK_AI_DEFAULT_MODEL is required when NETHERLINK_AI_PROVIDER is enabled")
+		}
+	default:
+		*validationErrors = append(*validationErrors, "NETHERLINK_AI_PROVIDER must be disabled, openai, or openai-compatible")
 	}
 	if cfg.Env == "production" {
 		if cfg.Postgres.SSLMode == "disable" {
