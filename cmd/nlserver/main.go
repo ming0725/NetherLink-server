@@ -43,6 +43,7 @@ func main() {
 		ChatService:     runtime.ChatService,
 		FileService:     runtime.FileService,
 		FriendService:   runtime.FriendService,
+		GroupService:    runtime.GroupService,
 		RealtimeHub:     runtime.RealtimeHub,
 		RealtimeFanout:  runtime.RealtimeFanout,
 		RealtimeCleanup: runtime.RealtimeCleanup,

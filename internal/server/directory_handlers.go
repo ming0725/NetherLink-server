@@ -7,6 +7,7 @@ import (
 	"time"
 
 	friendsvc "nlserver/internal/friend"
+	groupsvc "nlserver/internal/group"
 	"nlserver/internal/repository"
 )
 
@@ -38,6 +39,45 @@ type createFriendRequestRequest struct {
 type acceptFriendRequestRequest struct {
 	Remark  *string `json:"remark"`
 	GroupID *string `json:"groupId"`
+}
+
+type createGroupRequest struct {
+	Name         string   `json:"name"`
+	MemberIDs    []string `json:"memberIds"`
+	AvatarFileID *string  `json:"avatarFileId"`
+}
+
+type patchGroupRequest struct {
+	Name         *string `json:"name"`
+	Introduction *string `json:"introduction"`
+	Announcement *string `json:"announcement"`
+	AvatarFileID *string `json:"avatarFileId"`
+}
+
+type addGroupMembersRequest struct {
+	UserUUIDs []string `json:"userUuids"`
+}
+
+type patchGroupMemberRequest struct {
+	Role     *string `json:"role"`
+	Nickname *string `json:"nickname"`
+	IsDND    *bool   `json:"isDnd"`
+}
+
+type transferGroupOwnerRequest struct {
+	UserUUID string `json:"userUuid"`
+}
+
+type patchGroupMySettingsRequest struct {
+	Remark        *string `json:"remark"`
+	ListGroupID   *string `json:"listGroupId"`
+	ListGroupName *string `json:"listGroupName"`
+	IsDND         *bool   `json:"isDnd"`
+}
+
+type createGroupJoinRequestRequest struct {
+	GroupID string  `json:"groupId"`
+	Message *string `json:"message"`
 }
 
 type usersListResponse struct {
@@ -130,6 +170,10 @@ type groupDetailResponse struct {
 	Group groupResponse `json:"group"`
 }
 
+type groupSettingsDetailResponse struct {
+	Settings groupSettingsResponse `json:"settings"`
+}
+
 type groupResponse struct {
 	GroupID           string    `json:"groupId"`
 	Name              string    `json:"name"`
@@ -157,6 +201,10 @@ type groupMembersResponse struct {
 	Total   int                   `json:"total"`
 }
 
+type groupMemberDetailResponse struct {
+	Member groupMemberResponse `json:"member"`
+}
+
 type groupMemberResponse struct {
 	User     userResponse `json:"user"`
 	Role     string       `json:"role"`
@@ -164,6 +212,38 @@ type groupMemberResponse struct {
 	IsDND    bool         `json:"isDnd"`
 	JoinedAt time.Time    `json:"joinedAt"`
 	Version  int          `json:"version"`
+}
+
+type groupSettingsResponse struct {
+	GroupID       string    `json:"groupId"`
+	Remark        *string   `json:"remark"`
+	ListGroupID   *string   `json:"listGroupId"`
+	ListGroupName *string   `json:"listGroupName"`
+	IsDND         bool      `json:"isDnd"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+}
+
+type groupJoinRequestsResponse struct {
+	Notifications []groupJoinRequestResponse `json:"notifications"`
+	Total         int                        `json:"total"`
+	UnreadCount   int                        `json:"unreadCount"`
+}
+
+type groupJoinRequestDetailResponse struct {
+	Request groupJoinRequestResponse `json:"request"`
+}
+
+type groupJoinRequestResponse struct {
+	RequestID    string        `json:"requestId"`
+	Group        groupResponse `json:"group"`
+	ActorUser    userResponse  `json:"actorUser"`
+	OperatorUser *userResponse `json:"operatorUser,omitempty"`
+	Message      *string       `json:"message"`
+	Status       string        `json:"status"`
+	HandledAt    *time.Time    `json:"handledAt"`
+	CreatedAt    time.Time     `json:"createdAt"`
+	UpdatedAt    time.Time     `json:"updatedAt"`
 }
 
 func (s *Server) handleUsersSearch(w http.ResponseWriter, r *http.Request) {
@@ -594,6 +674,48 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, groupsResponse{Groups: makeGroupResponses(groups), Total: total})
 }
 
+func (s *Server) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
+	if !s.requireGroupService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	var req createGroupRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	for _, userID := range req.MemberIDs {
+		if err := validateUUID(userID, "memberIds"); err != nil {
+			writeRequestError(w, r, err)
+			return
+		}
+	}
+	if req.AvatarFileID != nil {
+		if err := validateOptionalUUID(*req.AvatarFileID, "avatarFileId"); err != nil {
+			writeRequestError(w, r, err)
+			return
+		}
+	}
+
+	group, err := s.groupService.CreateGroup(r.Context(), groupsvc.CreateGroupInput{
+		UserID:       principal.UserID,
+		Name:         req.Name,
+		MemberIDs:    req.MemberIDs,
+		AvatarFileID: req.AvatarFileID,
+	})
+	if err != nil {
+		writeGroupServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, groupDetailResponse{Group: makeGroupResponse(group)})
+}
+
 func (s *Server) handleGroupDetail(w http.ResponseWriter, r *http.Request) {
 	principal, ok := authPrincipalFromContext(r.Context())
 	if !ok {
@@ -614,6 +736,73 @@ func (s *Server) handleGroupDetail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, groupDetailResponse{Group: makeGroupResponse(group)})
+}
+
+func (s *Server) handlePatchGroup(w http.ResponseWriter, r *http.Request) {
+	if !s.requireGroupService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	groupID := r.PathValue("groupId")
+	if err := validateUUID(groupID, "groupId"); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	var req patchGroupRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	if req.AvatarFileID != nil {
+		if err := validateOptionalUUID(*req.AvatarFileID, "avatarFileId"); err != nil {
+			writeRequestError(w, r, err)
+			return
+		}
+	}
+
+	group, err := s.groupService.UpdateGroup(r.Context(), groupsvc.UpdateGroupInput{
+		UserID:          principal.UserID,
+		GroupID:         groupID,
+		Name:            req.Name,
+		Introduction:    req.Introduction,
+		Announcement:    req.Announcement,
+		AvatarFileIDSet: req.AvatarFileID != nil,
+		AvatarFileID:    req.AvatarFileID,
+	})
+	if err != nil {
+		writeGroupServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupDetailResponse{Group: makeGroupResponse(group)})
+}
+
+func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
+	if !s.requireGroupService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+	groupID := r.PathValue("groupId")
+	if err := validateUUID(groupID, "groupId"); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+
+	if err := s.groupService.DeleteOrLeaveGroup(r.Context(), principal.UserID, groupID); err != nil {
+		writeGroupServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, okResponse{OK: true})
 }
 
 func (s *Server) handleGroupMembers(w http.ResponseWriter, r *http.Request) {
@@ -653,6 +842,313 @@ func (s *Server) handleGroupMembers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, groupMembersResponse{Members: makeGroupMemberResponses(members), Total: total})
+}
+
+func (s *Server) handleAddGroupMembers(w http.ResponseWriter, r *http.Request) {
+	if !s.requireGroupService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+	groupID := r.PathValue("groupId")
+	if err := validateUUID(groupID, "groupId"); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	var req addGroupMembersRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	for _, userID := range req.UserUUIDs {
+		if err := validateUUID(userID, "userUuids"); err != nil {
+			writeRequestError(w, r, err)
+			return
+		}
+	}
+
+	members, err := s.groupService.AddMembers(r.Context(), groupsvc.AddMembersInput{
+		UserID:  principal.UserID,
+		GroupID: groupID,
+		UserIDs: req.UserUUIDs,
+	})
+	if err != nil {
+		writeGroupServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, groupMembersResponse{Members: makeGroupMemberResponses(members), Total: len(members)})
+}
+
+func (s *Server) handleRemoveGroupMember(w http.ResponseWriter, r *http.Request) {
+	if !s.requireGroupService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+	groupID := r.PathValue("groupId")
+	userID := r.PathValue("userUuid")
+	if err := validateUUID(groupID, "groupId"); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	if err := validateUUID(userID, "userUuid"); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+
+	if err := s.groupService.RemoveMember(r.Context(), groupsvc.RemoveMemberInput{
+		UserID:       principal.UserID,
+		GroupID:      groupID,
+		TargetUserID: userID,
+	}); err != nil {
+		writeGroupServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, okResponse{OK: true})
+}
+
+func (s *Server) handlePatchGroupMember(w http.ResponseWriter, r *http.Request) {
+	if !s.requireGroupService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+	groupID := r.PathValue("groupId")
+	userID := r.PathValue("userUuid")
+	if err := validateUUID(groupID, "groupId"); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	if err := validateUUID(userID, "userUuid"); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	var req patchGroupMemberRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+
+	member, err := s.groupService.UpdateMember(r.Context(), groupsvc.UpdateMemberInput{
+		UserID:       principal.UserID,
+		GroupID:      groupID,
+		TargetUserID: userID,
+		Role:         req.Role,
+		Nickname:     req.Nickname,
+		NicknameSet:  req.Nickname != nil,
+		IsDND:        req.IsDND,
+	})
+	if err != nil {
+		writeGroupServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupMemberDetailResponse{Member: makeGroupMemberResponse(member)})
+}
+
+func (s *Server) handleTransferGroupOwner(w http.ResponseWriter, r *http.Request) {
+	if !s.requireGroupService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+	groupID := r.PathValue("groupId")
+	if err := validateUUID(groupID, "groupId"); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	var req transferGroupOwnerRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	if err := validateUUID(req.UserUUID, "userUuid"); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+
+	group, err := s.groupService.TransferOwner(r.Context(), groupsvc.TransferOwnerInput{
+		UserID:       principal.UserID,
+		GroupID:      groupID,
+		TargetUserID: req.UserUUID,
+	})
+	if err != nil {
+		writeGroupServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupDetailResponse{Group: makeGroupResponse(group)})
+}
+
+func (s *Server) handlePatchGroupMySettings(w http.ResponseWriter, r *http.Request) {
+	if !s.requireGroupService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+	groupID := r.PathValue("groupId")
+	if err := validateUUID(groupID, "groupId"); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	var req patchGroupMySettingsRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	if req.ListGroupID != nil {
+		if err := validateOptionalUUID(*req.ListGroupID, "listGroupId"); err != nil {
+			writeRequestError(w, r, err)
+			return
+		}
+	}
+
+	settings, err := s.groupService.UpdateMySettings(r.Context(), groupsvc.UpdateMySettingsInput{
+		UserID:           principal.UserID,
+		GroupID:          groupID,
+		Remark:           req.Remark,
+		RemarkSet:        req.Remark != nil,
+		ListGroupID:      req.ListGroupID,
+		ListGroupIDSet:   req.ListGroupID != nil,
+		ListGroupName:    req.ListGroupName,
+		ListGroupNameSet: req.ListGroupName != nil,
+		IsDND:            req.IsDND,
+	})
+	if err != nil {
+		writeGroupServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupSettingsDetailResponse{Settings: makeGroupSettingsResponse(settings)})
+}
+
+func (s *Server) handleCreateGroupJoinRequest(w http.ResponseWriter, r *http.Request) {
+	if !s.requireGroupService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+	var req createGroupJoinRequestRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	if err := validateUUID(req.GroupID, "groupId"); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+
+	request, err := s.groupService.CreateJoinRequest(r.Context(), groupsvc.CreateJoinRequestInput{
+		UserID:  principal.UserID,
+		GroupID: req.GroupID,
+		Message: req.Message,
+	})
+	if err != nil {
+		writeGroupServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, groupJoinRequestDetailResponse{Request: makeGroupJoinRequestResponse(request)})
+}
+
+func (s *Server) handleGroupNotifications(w http.ResponseWriter, r *http.Request) {
+	if !s.requireGroupService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+	limit, offset, err := parsePagination(r)
+	if err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+
+	requests, total, unread, svcErr := s.groupService.ListJoinRequests(r.Context(), groupsvc.ListJoinRequestsInput{
+		UserID: principal.UserID,
+		Limit:  limit,
+		Offset: offset,
+	})
+	if svcErr != nil {
+		writeGroupServiceError(w, r, svcErr)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupJoinRequestsResponse{
+		Notifications: makeGroupJoinRequestResponses(requests),
+		Total:         total,
+		UnreadCount:   unread,
+	})
+}
+
+func (s *Server) handleAcceptGroupJoinRequest(w http.ResponseWriter, r *http.Request) {
+	if !s.requireGroupService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+	requestID := r.PathValue("requestId")
+	if err := validateUUID(requestID, "requestId"); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+
+	request, err := s.groupService.AcceptJoinRequest(r.Context(), principal.UserID, requestID)
+	if err != nil {
+		writeGroupServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupJoinRequestDetailResponse{Request: makeGroupJoinRequestResponse(request)})
+}
+
+func (s *Server) handleRejectGroupJoinRequest(w http.ResponseWriter, r *http.Request) {
+	if !s.requireGroupService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+	requestID := r.PathValue("requestId")
+	if err := validateUUID(requestID, "requestId"); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+
+	request, err := s.groupService.RejectJoinRequest(r.Context(), principal.UserID, requestID)
+	if err != nil {
+		writeGroupServiceError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupJoinRequestDetailResponse{Request: makeGroupJoinRequestResponse(request)})
 }
 
 func makeUserDetailResponse(ctx context.Context, repos repository.Repositories, viewerUserID string, user repository.User) (userDetailResponse, error) {
@@ -791,16 +1287,61 @@ func makeGroupResponse(entry repository.GroupListEntry) groupResponse {
 func makeGroupMemberResponses(members []repository.GroupMember) []groupMemberResponse {
 	responses := make([]groupMemberResponse, 0, len(members))
 	for _, member := range members {
-		responses = append(responses, groupMemberResponse{
-			User:     makePublicUserResponse(member.User),
-			Role:     member.Role,
-			Nickname: member.Nickname,
-			IsDND:    member.IsDND,
-			JoinedAt: member.JoinedAt,
-			Version:  member.Version,
-		})
+		responses = append(responses, makeGroupMemberResponse(member))
 	}
 	return responses
+}
+
+func makeGroupMemberResponse(member repository.GroupMember) groupMemberResponse {
+	return groupMemberResponse{
+		User:     makePublicUserResponse(member.User),
+		Role:     member.Role,
+		Nickname: member.Nickname,
+		IsDND:    member.IsDND,
+		JoinedAt: member.JoinedAt,
+		Version:  member.Version,
+	}
+}
+
+func makeGroupSettingsResponse(settings repository.GroupUserSettings) groupSettingsResponse {
+	return groupSettingsResponse{
+		GroupID:       settings.GroupID,
+		Remark:        settings.Remark,
+		ListGroupID:   settings.ListGroupID,
+		ListGroupName: settings.ListGroupName,
+		IsDND:         settings.IsDND,
+		CreatedAt:     settings.CreatedAt,
+		UpdatedAt:     settings.UpdatedAt,
+	}
+}
+
+func makeGroupJoinRequestResponses(requests []repository.GroupJoinRequest) []groupJoinRequestResponse {
+	responses := make([]groupJoinRequestResponse, 0, len(requests))
+	for _, request := range requests {
+		responses = append(responses, makeGroupJoinRequestResponse(request))
+	}
+	return responses
+}
+
+func makeGroupJoinRequestResponse(request repository.GroupJoinRequest) groupJoinRequestResponse {
+	response := groupJoinRequestResponse{
+		RequestID: request.ID,
+		Group: makeGroupResponse(repository.GroupListEntry{
+			Group:       request.Group,
+			MemberCount: 0,
+		}),
+		ActorUser: makePublicUserResponse(request.ActorUser),
+		Message:   request.Message,
+		Status:    request.Status,
+		HandledAt: request.HandledAt,
+		CreatedAt: request.CreatedAt,
+		UpdatedAt: request.UpdatedAt,
+	}
+	if request.OperatorUser != nil {
+		operator := makePublicUserResponse(*request.OperatorUser)
+		response.OperatorUser = &operator
+	}
+	return response
 }
 
 func (s *Server) requireFriendService(w http.ResponseWriter, r *http.Request) bool {
@@ -808,6 +1349,14 @@ func (s *Server) requireFriendService(w http.ResponseWriter, r *http.Request) bo
 		return true
 	}
 	writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "Friend service is not configured")
+	return false
+}
+
+func (s *Server) requireGroupService(w http.ResponseWriter, r *http.Request) bool {
+	if s.groupService != nil {
+		return true
+	}
+	writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "Group service is not configured")
 	return false
 }
 
@@ -821,6 +1370,23 @@ func writeFriendServiceError(w http.ResponseWriter, r *http.Request, err error) 
 		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Forbidden")
 	case errors.Is(err, friendsvc.ErrUnavailable):
 		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "Friend service is not ready")
+	case errors.Is(err, repository.ErrNotFound):
+		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "Resource not found")
+	default:
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error")
+	}
+}
+
+func writeGroupServiceError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, groupsvc.ErrValidation):
+		writeError(w, r, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid group request")
+	case errors.Is(err, groupsvc.ErrConflict):
+		writeError(w, r, http.StatusConflict, "CONFLICT", "Group resource conflict")
+	case errors.Is(err, groupsvc.ErrForbidden):
+		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Forbidden")
+	case errors.Is(err, groupsvc.ErrUnavailable):
+		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "Group service is not ready")
 	case errors.Is(err, repository.ErrNotFound):
 		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "Resource not found")
 	default:

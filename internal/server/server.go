@@ -15,6 +15,7 @@ import (
 	"nlserver/internal/config"
 	filesvc "nlserver/internal/files"
 	friendsvc "nlserver/internal/friend"
+	groupsvc "nlserver/internal/group"
 	"nlserver/internal/realtime"
 	"nlserver/internal/repository"
 	"nlserver/internal/storage"
@@ -29,6 +30,7 @@ type Server struct {
 	chatService     *chatsvc.Service
 	fileService     *filesvc.Service
 	friendService   *friendsvc.Service
+	groupService    *groupsvc.Service
 	realtimeHub     *realtime.Hub
 	realtimeFanout  *realtime.RedisFanout
 	realtimeCleanup *realtime.CleanupWorker
@@ -46,6 +48,7 @@ type Dependencies struct {
 	ChatService     *chatsvc.Service
 	FileService     *filesvc.Service
 	FriendService   *friendsvc.Service
+	GroupService    *groupsvc.Service
 	RealtimeHub     *realtime.Hub
 	RealtimeFanout  *realtime.RedisFanout
 	RealtimeCleanup *realtime.CleanupWorker
@@ -84,6 +87,9 @@ func NewWithDependencies(deps Dependencies) *Server {
 	if deps.FriendService == nil && deps.Repos.Users != nil && deps.Repos.Friends != nil {
 		deps.FriendService = friendsvc.NewService(deps.Repos, deps.DB)
 	}
+	if deps.GroupService == nil && deps.Repos.Users != nil && deps.Repos.Groups != nil {
+		deps.GroupService = groupsvc.NewService(deps.Repos, deps.DB)
+	}
 	if deps.FileService == nil && deps.Repos.Files != nil {
 		deps.FileService = filesvc.NewService(deps.Config.Storage, deps.Repos, deps.DB, deps.Storage)
 	}
@@ -104,6 +110,7 @@ func NewWithDependencies(deps Dependencies) *Server {
 		chatService:     deps.ChatService,
 		fileService:     deps.FileService,
 		friendService:   deps.FriendService,
+		groupService:    deps.GroupService,
 		realtimeHub:     deps.RealtimeHub,
 		realtimeFanout:  deps.RealtimeFanout,
 		realtimeCleanup: deps.RealtimeCleanup,
@@ -185,8 +192,20 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/v1/friend-requests/{requestId}/accept", s.withAuthRequired(http.HandlerFunc(s.handleAcceptFriendRequest)))
 	mux.Handle("POST /api/v1/friend-requests/{requestId}/reject", s.withAuthRequired(http.HandlerFunc(s.handleRejectFriendRequest)))
 	mux.Handle("GET /api/v1/groups", s.withAuthRequired(http.HandlerFunc(s.handleGroups)))
+	mux.Handle("POST /api/v1/groups", s.withAuthRequired(http.HandlerFunc(s.handleCreateGroup)))
 	mux.Handle("GET /api/v1/groups/{groupId}", s.withAuthRequired(http.HandlerFunc(s.handleGroupDetail)))
+	mux.Handle("PATCH /api/v1/groups/{groupId}", s.withAuthRequired(http.HandlerFunc(s.handlePatchGroup)))
+	mux.Handle("DELETE /api/v1/groups/{groupId}", s.withAuthRequired(http.HandlerFunc(s.handleDeleteGroup)))
 	mux.Handle("GET /api/v1/groups/{groupId}/members", s.withAuthRequired(http.HandlerFunc(s.handleGroupMembers)))
+	mux.Handle("POST /api/v1/groups/{groupId}/members", s.withAuthRequired(http.HandlerFunc(s.handleAddGroupMembers)))
+	mux.Handle("DELETE /api/v1/groups/{groupId}/members/{userUuid}", s.withAuthRequired(http.HandlerFunc(s.handleRemoveGroupMember)))
+	mux.Handle("PATCH /api/v1/groups/{groupId}/members/{userUuid}", s.withAuthRequired(http.HandlerFunc(s.handlePatchGroupMember)))
+	mux.Handle("POST /api/v1/groups/{groupId}/transfer-owner", s.withAuthRequired(http.HandlerFunc(s.handleTransferGroupOwner)))
+	mux.Handle("PATCH /api/v1/groups/{groupId}/my-settings", s.withAuthRequired(http.HandlerFunc(s.handlePatchGroupMySettings)))
+	mux.Handle("POST /api/v1/group-join-requests", s.withAuthRequired(http.HandlerFunc(s.handleCreateGroupJoinRequest)))
+	mux.Handle("GET /api/v1/group-notifications", s.withAuthRequired(http.HandlerFunc(s.handleGroupNotifications)))
+	mux.Handle("POST /api/v1/group-join-requests/{requestId}/accept", s.withAuthRequired(http.HandlerFunc(s.handleAcceptGroupJoinRequest)))
+	mux.Handle("POST /api/v1/group-join-requests/{requestId}/reject", s.withAuthRequired(http.HandlerFunc(s.handleRejectGroupJoinRequest)))
 	mux.Handle("POST /api/v1/files/upload-session", s.withAuthRequired(http.HandlerFunc(s.handleCreateUploadSession)))
 	mux.Handle("GET /api/v1/files/upload-session/{uploadSessionId}", s.withAuthRequired(http.HandlerFunc(s.handleGetUploadSession)))
 	mux.Handle("POST /api/v1/files/upload-session/{uploadSessionId}/parts", s.withAuthRequired(http.HandlerFunc(s.handlePresignUploadParts)))
