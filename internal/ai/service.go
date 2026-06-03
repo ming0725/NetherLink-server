@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
+	"unicode"
 
 	"nlserver/internal/config"
 	"nlserver/internal/repository"
@@ -417,7 +420,7 @@ func (s *Service) selectFileContext(ctx context.Context, userID string, conversa
 	if err != nil {
 		return nil, err
 	}
-	return selectRelevantChunks(userMessage, chunks), nil
+	return SelectRelevantChunks(userMessage, chunks), nil
 }
 
 func (s *Service) GenerateTitle(ctx context.Context, firstUserMessage string) (string, error) {
@@ -483,41 +486,106 @@ func makeCompletionMessages(messages []repository.AIMessage, chunks []repository
 	return result
 }
 
-func selectRelevantChunks(query string, chunks []repository.AIFileChunk) []repository.AIFileChunk {
+// SelectRelevantChunks chooses bounded uploaded-file context for provider prompts.
+func SelectRelevantChunks(query string, chunks []repository.AIFileChunk) []repository.AIFileChunk {
+	if len(chunks) == 0 {
+		return []repository.AIFileChunk{}
+	}
 	if len(chunks) <= maxAIContextChunks {
 		return trimChunksToContext(chunks)
 	}
-	keywords := queryKeywords(query)
+	terms := querySearchTerms(query)
+	if len(terms) == 0 {
+		return trimChunksToContext(chunks)
+	}
+	phrase := normalizedSearchText(query)
+	bigrams := queryBigrams(terms)
+
+	type chunkStats struct {
+		tokens []string
+		tf     map[string]int
+	}
 	type scoredChunk struct {
-		chunk repository.AIFileChunk
-		score int
+		score float64
 		index int
 	}
-	scored := make([]scoredChunk, 0, len(chunks))
+
+	stats := make([]chunkStats, len(chunks))
+	documentFrequency := map[string]int{}
+	totalTokenCount := 0
 	for index, chunk := range chunks {
-		content := strings.ToLower(chunk.Content)
-		score := 0
-		for _, keyword := range keywords {
-			if strings.Contains(content, keyword) {
-				score++
+		tokens := tokenizeSearchText(chunk.Content)
+		tf := map[string]int{}
+		for _, token := range tokens {
+			tf[token]++
+		}
+		seenInChunk := map[string]bool{}
+		for _, term := range terms {
+			if tf[term] > 0 && !seenInChunk[term] {
+				documentFrequency[term]++
+				seenInChunk[term] = true
 			}
 		}
-		scored = append(scored, scoredChunk{chunk: chunk, score: score, index: index})
+		stats[index] = chunkStats{tokens: tokens, tf: tf}
+		totalTokenCount += len(tokens)
 	}
-	for i := 1; i < len(scored); i++ {
-		current := scored[i]
-		j := i - 1
-		for ; j >= 0 && (scored[j].score < current.score || (scored[j].score == current.score && scored[j].index > current.index)); j-- {
-			scored[j+1] = scored[j]
+	averageTokenCount := float64(totalTokenCount) / float64(len(chunks))
+	if averageTokenCount < 1 {
+		averageTokenCount = 1
+	}
+
+	scored := make([]scoredChunk, 0, len(chunks))
+	for index, chunk := range chunks {
+		score := bm25Score(terms, stats[index].tf, len(stats[index].tokens), averageTokenCount, documentFrequency, len(chunks))
+		content := normalizedSearchText(chunk.Content)
+		if phrase != "" && len(terms) > 1 && strings.Contains(content, phrase) {
+			score += 3
 		}
-		scored[j+1] = current
+		for _, bigram := range bigrams {
+			if strings.Contains(content, bigram) {
+				score += 1.25
+			}
+		}
+		scored = append(scored, scoredChunk{score: score, index: index})
 	}
-	selected := make([]repository.AIFileChunk, 0, maxAIContextChunks)
+
+	sort.SliceStable(scored, func(i, j int) bool {
+		if scored[i].score == scored[j].score {
+			return scored[i].index < scored[j].index
+		}
+		return scored[i].score > scored[j].score
+	})
+
+	selectedIndexes := []int{}
+	selectedSet := map[int]bool{}
+	addIndex := func(index int) {
+		if index < 0 || index >= len(chunks) || selectedSet[index] || len(selectedIndexes) >= maxAIContextChunks {
+			return
+		}
+		selectedSet[index] = true
+		selectedIndexes = append(selectedIndexes, index)
+	}
 	for _, item := range scored {
-		if len(selected) >= maxAIContextChunks {
+		if item.score <= 0 || len(selectedIndexes) >= maxAIContextChunks {
 			break
 		}
-		selected = append(selected, item.chunk)
+		addIndex(item.index)
+		if item.index > 0 && chunks[item.index-1].AIFileID == chunks[item.index].AIFileID {
+			addIndex(item.index - 1)
+		}
+		if item.index+1 < len(chunks) && chunks[item.index+1].AIFileID == chunks[item.index].AIFileID {
+			addIndex(item.index + 1)
+		}
+	}
+	if len(selectedIndexes) == 0 {
+		for index := range chunks {
+			addIndex(index)
+		}
+	}
+	sort.Ints(selectedIndexes)
+	selected := make([]repository.AIFileChunk, 0, len(selectedIndexes))
+	for _, index := range selectedIndexes {
+		selected = append(selected, chunks[index])
 	}
 	return trimChunksToContext(selected)
 }
@@ -542,18 +610,81 @@ func trimChunksToContext(chunks []repository.AIFileChunk) []repository.AIFileChu
 	return selected
 }
 
-func queryKeywords(query string) []string {
+func querySearchTerms(query string) []string {
 	seen := map[string]bool{}
 	result := []string{}
-	for _, part := range strings.Fields(strings.ToLower(query)) {
-		keyword := strings.Trim(part, " \t\r\n.,;:!?()[]{}\"'")
-		if len([]rune(keyword)) < 2 || seen[keyword] {
+	for _, token := range tokenizeSearchText(query) {
+		if len([]rune(token)) < 2 || commonSearchStopWords[token] || seen[token] {
 			continue
 		}
-		seen[keyword] = true
-		result = append(result, keyword)
+		seen[token] = true
+		result = append(result, token)
 	}
 	return result
+}
+
+func bm25Score(terms []string, termFrequency map[string]int, documentTokenCount int, averageTokenCount float64, documentFrequency map[string]int, documentCount int) float64 {
+	if documentTokenCount == 0 || documentCount == 0 {
+		return 0
+	}
+	const k1 = 1.2
+	const b = 0.75
+	score := 0.0
+	for _, term := range terms {
+		tf := termFrequency[term]
+		if tf == 0 {
+			continue
+		}
+		df := documentFrequency[term]
+		idf := math.Log(1 + (float64(documentCount)-float64(df)+0.5)/(float64(df)+0.5))
+		lengthNorm := k1 * (1 - b + b*float64(documentTokenCount)/averageTokenCount)
+		score += idf * (float64(tf) * (k1 + 1)) / (float64(tf) + lengthNorm)
+	}
+	return score
+}
+
+func queryBigrams(terms []string) []string {
+	if len(terms) < 2 {
+		return nil
+	}
+	bigrams := make([]string, 0, len(terms)-1)
+	for index := 0; index+1 < len(terms); index++ {
+		bigrams = append(bigrams, terms[index]+" "+terms[index+1])
+	}
+	return bigrams
+}
+
+func normalizedSearchText(text string) string {
+	return strings.Join(tokenizeSearchText(text), " ")
+}
+
+func tokenizeSearchText(text string) []string {
+	tokens := []string{}
+	var builder strings.Builder
+	flush := func() {
+		if builder.Len() == 0 {
+			return
+		}
+		tokens = append(tokens, builder.String())
+		builder.Reset()
+	}
+	for _, r := range strings.ToLower(text) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+			builder.WriteRune(r)
+			continue
+		}
+		flush()
+	}
+	flush()
+	return tokens
+}
+
+var commonSearchStopWords = map[string]bool{
+	"a": true, "an": true, "and": true, "are": true, "as": true, "at": true,
+	"be": true, "by": true, "for": true, "from": true, "how": true, "in": true,
+	"is": true, "it": true, "of": true, "on": true, "or": true, "that": true,
+	"the": true, "this": true, "to": true, "was": true, "what": true, "when": true,
+	"where": true, "which": true, "who": true, "why": true, "with": true,
 }
 
 func formatAIFileContext(chunks []repository.AIFileChunk) string {
