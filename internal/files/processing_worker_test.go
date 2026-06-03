@@ -96,6 +96,74 @@ func TestExtractAITextPDF(t *testing.T) {
 	}
 }
 
+func TestExtractAITextDOCXIncludesSupplementalParts(t *testing.T) {
+	data := makeZip(t, map[string]string{
+		"word/document.xml": `<?xml version="1.0" encoding="UTF-8"?>
+			<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+				<w:body><w:p><w:r><w:t>Main body</w:t></w:r></w:p></w:body>
+			</w:document>`,
+		"word/header1.xml": `<?xml version="1.0" encoding="UTF-8"?>
+			<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+				<w:p><w:r><w:t>Header text</w:t></w:r></w:p>
+			</w:hdr>`,
+		"word/footnotes.xml": `<?xml version="1.0" encoding="UTF-8"?>
+			<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+				<w:footnote><w:p><w:r><w:t>Footnote text</w:t></w:r></w:p></w:footnote>
+			</w:footnotes>`,
+		"word/comments.xml": `<?xml version="1.0" encoding="UTF-8"?>
+			<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+				<w:comment><w:p><w:r><w:t>Reviewer comment</w:t></w:r></w:p></w:comment>
+			</w:comments>`,
+	})
+	parsed, err := extractAIText(repository.File{
+		OriginalFileName: "complex.docx",
+		MimeType:         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	}, data)
+	if err != nil {
+		t.Fatalf("extractAIText() error = %v", err)
+	}
+	for _, want := range []string{"Main body", "Header text", "Footnote text", "Reviewer comment"} {
+		if !strings.Contains(parsed.Text, want) {
+			t.Fatalf("text = %q, want %q", parsed.Text, want)
+		}
+	}
+}
+
+func TestExtractAITextPPTX(t *testing.T) {
+	data := makeZip(t, map[string]string{
+		"ppt/slides/slide1.xml": `<?xml version="1.0" encoding="UTF-8"?>
+			<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+				xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+				<p:cSld><p:spTree><p:sp><p:txBody>
+					<a:p><a:r><a:t>Quarterly review</a:t></a:r></a:p>
+					<a:p><a:r><a:t>Revenue</a:t></a:r><a:r><a:tab/></a:r><a:r><a:t>42</a:t></a:r></a:p>
+				</p:txBody></p:sp></p:spTree></p:cSld>
+			</p:sld>`,
+		"ppt/notesSlides/notesSlide1.xml": `<?xml version="1.0" encoding="UTF-8"?>
+			<p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+				xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+				<p:cSld><p:spTree><p:sp><p:txBody>
+					<a:p><a:r><a:t>Speaker note</a:t></a:r></a:p>
+				</p:txBody></p:sp></p:spTree></p:cSld>
+			</p:notes>`,
+	})
+	parsed, err := extractAIText(repository.File{
+		OriginalFileName: "deck.pptx",
+		MimeType:         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	}, data)
+	if err != nil {
+		t.Fatalf("extractAIText() error = %v", err)
+	}
+	if parsed.Parser != "pptx" {
+		t.Fatalf("parser = %q, want pptx", parsed.Parser)
+	}
+	for _, want := range []string{"Quarterly review", "Revenue\t42", "Speaker note"} {
+		if !strings.Contains(parsed.Text, want) {
+			t.Fatalf("text = %q, want %q", parsed.Text, want)
+		}
+	}
+}
+
 func makeZip(t *testing.T, files map[string]string) []byte {
 	t.Helper()
 

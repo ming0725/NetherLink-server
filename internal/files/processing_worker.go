@@ -18,6 +18,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -39,9 +40,11 @@ const (
 	mediaCommandTimeout           = 45 * time.Second
 	staleProcessingJobAge         = 15 * time.Minute
 	maxAIParseSourceBytes         = 4 * 1024 * 1024
+	aiDocumentCommandTimeout      = 90 * time.Second
 	aiParseChunkRunes             = 2400
 	aiParseChunkOverlapRunes      = 200
 	maxAIParseChunks              = 80
+	maxAIOCRPDFPages              = 3
 )
 
 type ProcessingWorker struct {
@@ -802,13 +805,19 @@ type extractedAIText struct {
 func extractAIText(file repository.File, data []byte) (extractedAIText, error) {
 	switch aiDocumentParser(file) {
 	case "pdf":
-		return normalizeExtractedAIText(extractPDFText(data), "pdf")
+		return extractPDFAIText(data)
 	case "docx":
 		text, err := extractDOCXText(data)
 		if err != nil {
 			return extractedAIText{}, err
 		}
 		return normalizeExtractedAIText(text, "docx")
+	case "pptx":
+		text, err := extractPPTXText(data)
+		if err != nil {
+			return extractedAIText{}, err
+		}
+		return normalizeExtractedAIText(text, "pptx")
 	case "xlsx":
 		text, err := extractXLSXText(data)
 		if err != nil {
@@ -844,6 +853,8 @@ func aiDocumentParser(file repository.File) string {
 		return "pdf"
 	case mimeType == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || extension == ".docx":
 		return "docx"
+	case mimeType == "application/vnd.openxmlformats-officedocument.presentationml.presentation" || extension == ".pptx":
+		return "pptx"
 	case mimeType == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" || extension == ".xlsx":
 		return "xlsx"
 	default:
@@ -856,11 +867,48 @@ func extractDOCXText(data []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	main, ok := files["word/document.xml"]
-	if !ok {
+	if _, ok := files["word/document.xml"]; !ok {
 		return "", fmt.Errorf("docx document.xml not found")
 	}
-	return extractWordprocessingText(main)
+	names := []string{"word/document.xml"}
+	for name := range files {
+		if name == "word/document.xml" {
+			continue
+		}
+		if isDOCXTextPart(name) {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names[1:])
+
+	var builder strings.Builder
+	for _, name := range names {
+		text, err := extractWordprocessingText(files[name])
+		if err != nil {
+			return "", err
+		}
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+		if builder.Len() > 0 {
+			builder.WriteString("\n\n")
+		}
+		builder.WriteString(text)
+	}
+	return builder.String(), nil
+}
+
+func isDOCXTextPart(name string) bool {
+	if !strings.HasPrefix(name, "word/") || !strings.HasSuffix(name, ".xml") {
+		return false
+	}
+	base := filepath.Base(name)
+	return strings.HasPrefix(base, "header") ||
+		strings.HasPrefix(base, "footer") ||
+		base == "footnotes.xml" ||
+		base == "endnotes.xml" ||
+		base == "comments.xml"
 }
 
 func extractWordprocessingText(data []byte) (string, error) {
@@ -895,6 +943,94 @@ func extractWordprocessingText(data []byte) (string, error) {
 		case xml.CharData:
 			if inText {
 				builder.WriteString(string(value))
+			}
+		}
+	}
+	return builder.String(), nil
+}
+
+func extractPPTXText(data []byte) (string, error) {
+	files, err := openZipFiles(data)
+	if err != nil {
+		return "", err
+	}
+	names := make([]string, 0, len(files))
+	for name := range files {
+		if isPPTXTextPart(name) {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		return "", fmt.Errorf("pptx slides not found")
+	}
+
+	var builder strings.Builder
+	for _, name := range names {
+		text, err := extractDrawingMLText(files[name])
+		if err != nil {
+			return "", err
+		}
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+		if builder.Len() > 0 {
+			builder.WriteString("\n\n")
+		}
+		builder.WriteString(text)
+	}
+	return builder.String(), nil
+}
+
+func isPPTXTextPart(name string) bool {
+	if !strings.HasPrefix(name, "ppt/") || !strings.HasSuffix(name, ".xml") {
+		return false
+	}
+	return strings.HasPrefix(name, "ppt/slides/slide") ||
+		strings.HasPrefix(name, "ppt/notesSlides/notesSlide") ||
+		strings.HasPrefix(name, "ppt/comments/comment")
+}
+
+func extractDrawingMLText(data []byte) (string, error) {
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	var builder strings.Builder
+	inText := false
+	textInParagraph := false
+	for {
+		token, err := decoder.Token()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		switch value := token.(type) {
+		case xml.StartElement:
+			switch value.Name.Local {
+			case "t":
+				inText = true
+			case "tab":
+				builder.WriteByte('\t')
+				textInParagraph = true
+			case "br":
+				builder.WriteByte('\n')
+				textInParagraph = false
+			}
+		case xml.EndElement:
+			switch value.Name.Local {
+			case "t":
+				inText = false
+			case "p":
+				if textInParagraph {
+					builder.WriteByte('\n')
+				}
+				textInParagraph = false
+			}
+		case xml.CharData:
+			if inText {
+				builder.WriteString(string(value))
+				textInParagraph = true
 			}
 		}
 	}
@@ -1096,6 +1232,128 @@ func resolveXLSXCellValue(value string, cellType string, sharedStrings []string)
 		return strings.TrimSpace(sharedStrings[index])
 	}
 	return strings.TrimSpace(value)
+}
+
+func extractPDFAIText(data []byte) (extractedAIText, error) {
+	if text, err := extractPDFTextWithPdftotext(data); err == nil && strings.TrimSpace(text) != "" {
+		return normalizeExtractedAIText(text, "pdf_pdftotext")
+	}
+	if text := extractPDFText(data); strings.TrimSpace(text) != "" {
+		return normalizeExtractedAIText(text, "pdf")
+	}
+	if text, err := extractPDFTextWithOCR(data); err == nil && strings.TrimSpace(text) != "" {
+		return normalizeExtractedAIText(text, "pdf_ocr")
+	}
+	return extractedAIText{}, fmt.Errorf("AI parse source is empty")
+}
+
+func extractPDFTextWithPdftotext(data []byte) (string, error) {
+	if _, err := exec.LookPath("pdftotext"); err != nil {
+		return "", err
+	}
+	path, cleanup, err := writeTempPDF(data)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+	output, err := runDocumentCommand("pdftotext", "-layout", "-enc", "UTF-8", path, "-")
+	if err != nil {
+		return "", err
+	}
+	return string(output), nil
+}
+
+func extractPDFTextWithOCR(data []byte) (string, error) {
+	if _, err := exec.LookPath("pdftoppm"); err != nil {
+		return "", err
+	}
+	if _, err := exec.LookPath("tesseract"); err != nil {
+		return "", err
+	}
+	path, cleanup, err := writeTempPDF(data)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+
+	dir, err := os.MkdirTemp("", "nlserver-pdf-ocr-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(dir)
+
+	prefix := filepath.Join(dir, "page")
+	if _, err := runDocumentCommand("pdftoppm", "-r", "200", "-png", "-f", "1", "-l", strconv.Itoa(maxAIOCRPDFPages), path, prefix); err != nil {
+		return "", err
+	}
+	images, err := filepath.Glob(prefix + "-*.png")
+	if err != nil {
+		return "", err
+	}
+	sort.Strings(images)
+	if len(images) == 0 {
+		return "", fmt.Errorf("pdftoppm produced no page images")
+	}
+
+	languages := strings.TrimSpace(os.Getenv("NETHERLINK_AI_OCR_LANGS"))
+	if languages == "" {
+		languages = "eng"
+	}
+	var builder strings.Builder
+	for _, imagePath := range images {
+		output, err := runDocumentCommand("tesseract", imagePath, "stdout", "-l", languages)
+		if err != nil {
+			return "", err
+		}
+		text := strings.TrimSpace(string(output))
+		if text == "" {
+			continue
+		}
+		if builder.Len() > 0 {
+			builder.WriteString("\n\n")
+		}
+		builder.WriteString(text)
+	}
+	return builder.String(), nil
+}
+
+func writeTempPDF(data []byte) (string, func(), error) {
+	file, err := os.CreateTemp("", "nlserver-ai-*.pdf")
+	if err != nil {
+		return "", func() {}, err
+	}
+	path := file.Name()
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", func() {}, err
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", func() {}, err
+	}
+	return path, func() { _ = os.Remove(path) }, nil
+}
+
+func runDocumentCommand(name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), aiDocumentCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, name, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	output, err := cmd.Output()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = err.Error()
+		}
+		return nil, fmt.Errorf("%s failed: %s", name, detail)
+	}
+	return output, nil
 }
 
 func extractPDFText(data []byte) string {
