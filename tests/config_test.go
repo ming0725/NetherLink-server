@@ -40,6 +40,9 @@ func TestConfigLoadWithValidEnvironment(t *testing.T) {
 	if cfg.Storage.Buckets.Public != "netherlink-public" {
 		t.Fatalf("public bucket = %q, want netherlink-public", cfg.Storage.Buckets.Public)
 	}
+	if cfg.Storage.UserQuotaBytes != 10*1024*1024*1024 {
+		t.Fatalf("storage user quota bytes = %d, want 10 GiB", cfg.Storage.UserQuotaBytes)
+	}
 	if cfg.AI.Provider != "disabled" {
 		t.Fatalf("ai provider = %q, want disabled", cfg.AI.Provider)
 	}
@@ -100,6 +103,19 @@ func TestConfigLoadAIProvider(t *testing.T) {
 	}
 	if cfg.AI.RequestTimeout != 45*time.Second {
 		t.Fatalf("ai request timeout = %v, want 45s", cfg.AI.RequestTimeout)
+	}
+}
+
+func TestConfigLoadStorageUserQuota(t *testing.T) {
+	setValidRequiredConfig(t)
+	t.Setenv("NETHERLINK_FILE_USER_QUOTA_BYTES", "123456")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Storage.UserQuotaBytes != 123456 {
+		t.Fatalf("storage user quota bytes = %d, want 123456", cfg.Storage.UserQuotaBytes)
 	}
 }
 

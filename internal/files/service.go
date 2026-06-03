@@ -1,6 +1,7 @@
 package files
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -59,6 +60,7 @@ type Service struct {
 	repos   repository.Repositories
 	db      repository.TxBeginner
 	storage storage.ObjectStorageProvider
+	scanner MaliciousContentScanner
 }
 
 type CreateUploadSessionRequest struct {
@@ -198,7 +200,16 @@ func NewService(cfg config.StorageConfig, repos repository.Repositories, db repo
 		repos:   repos,
 		db:      db,
 		storage: provider,
+		scanner: noopMaliciousContentScanner{},
 	}
+}
+
+func (s *Service) SetMaliciousContentScanner(scanner MaliciousContentScanner) {
+	if scanner == nil {
+		s.scanner = noopMaliciousContentScanner{}
+		return
+	}
+	s.scanner = scanner
 }
 
 func (s *Service) StoreFile(ctx context.Context, req StoreFileRequest) (FileResult, error) {
@@ -362,6 +373,12 @@ func (s *Service) CreateUploadSession(ctx context.Context, req CreateUploadSessi
 	if err := validateCreateUploadSession(req); err != nil {
 		return UploadSessionResult{}, err
 	}
+	canonicalTarget, normalizedMime, err := s.validateGovernance(ctx, req.UserID, req.TargetType, req.FileName, req.MimeType, req.SizeBytes)
+	if err != nil {
+		return UploadSessionResult{}, err
+	}
+	req.TargetType = canonicalTarget
+	req.MimeType = normalizedMime
 
 	clientOperationID := normalizeOptional(req.ClientOperationID)
 	if clientOperationID != nil {
@@ -598,6 +615,9 @@ func (s *Service) CompleteUploadSession(ctx context.Context, req CompleteUploadS
 	default:
 		return CompleteUploadSessionResult{}, ErrUploadMode
 	}
+	if err := validateCompletedObject(session, file, objectInfo); err != nil {
+		return CompleteUploadSessionResult{}, err
+	}
 
 	contentHash := normalizeOptional(req.ContentHash)
 	if contentHash == nil {
@@ -605,7 +625,7 @@ func (s *Service) CompleteUploadSession(ctx context.Context, req CompleteUploadS
 	}
 	etag := normalizeOptional(&objectInfo.ETag)
 
-	updatedFile, err := s.finalizeUploadedFile(ctx, file.ID, etag, contentHash, objectInfo.SizeBytes, func(repos repository.Repositories) error {
+	updatedFile, err := s.finalizeUploadedFile(ctx, file.ID, session.TargetType, etag, contentHash, objectInfo.SizeBytes, func(repos repository.Repositories) error {
 		_, err := repos.Files.CompleteUploadSession(ctx, repository.CompleteUploadSessionParams{
 			SessionID:     session.ID,
 			UserID:        req.UserID,
@@ -684,6 +704,11 @@ func (s *Service) storeFile(ctx context.Context, req StoreFileRequest) (reposito
 	if err := validateStoreFile(req); err != nil {
 		return repository.File{}, err
 	}
+	prepared, err := s.prepareProxyUpload(ctx, req)
+	if err != nil {
+		return repository.File{}, err
+	}
+	req = prepared
 
 	fileID, err := newUUIDString()
 	if err != nil {
@@ -729,12 +754,26 @@ func (s *Service) storeFile(ctx context.Context, req StoreFileRequest) (reposito
 	}
 
 	etag := normalizeOptional(&put.ETag)
-	return s.finalizeUploadedFile(ctx, file.ID, etag, normalizeOptional(req.ContentHash), req.SizeBytes, nil)
+	return s.finalizeUploadedFile(ctx, file.ID, req.TargetType, etag, normalizeOptional(req.ContentHash), req.SizeBytes, nil)
 }
 
-func (s *Service) finalizeUploadedFile(ctx context.Context, fileID string, etag *string, contentHash *string, sizeBytes int64, extra func(repository.Repositories) error) (repository.File, error) {
+func (s *Service) finalizeUploadedFile(ctx context.Context, fileID string, targetType string, etag *string, contentHash *string, sizeBytes int64, extra func(repository.Repositories) error) (repository.File, error) {
+	file, err := s.repos.Files.Get(ctx, fileID)
+	if err != nil {
+		return repository.File{}, err
+	}
+	scanned := file
+	scanned.ETag = etag
+	scanned.ContentHash = contentHash
+	if sizeBytes > 0 {
+		scanned.SizeBytes = sizeBytes
+	}
+	if err := s.scanUploadedObject(ctx, scanned, targetType); err != nil {
+		return repository.File{}, err
+	}
+
 	var completedFile repository.File
-	err := repository.WithTx(ctx, s.db, func(repos repository.Repositories) error {
+	err = repository.WithTx(ctx, s.db, func(repos repository.Repositories) error {
 		updatedFile, err := repos.Files.MarkUploaded(ctx, fileID, etag, contentHash, sizeBytes)
 		if err != nil {
 			return err
@@ -960,7 +999,7 @@ func (s *Service) bucketForTarget(targetType string) (string, string) {
 	switch strings.ToLower(strings.TrimSpace(targetType)) {
 	case "avatar", "user_avatar":
 		return s.cfg.Buckets.Public, "public"
-	case "group_avatar", "chat_attachment", "chat_image", "chat_video", "chat_audio", "chat_file", "post_media":
+	case "group_avatar", "chat_attachment", "chat_image", "chat_video", "chat_audio", "chat_file", "post_image", "post_video", "post_live", "post_media":
 		return s.cfg.Buckets.Protected, "protected"
 	default:
 		return s.cfg.Buckets.Private, "private"
@@ -1011,6 +1050,43 @@ func processingJobTypeForFile(file repository.File) string {
 		return fileProcessingJobAudio
 	}
 	return ""
+}
+
+func (s *Service) prepareProxyUpload(ctx context.Context, req StoreFileRequest) (StoreFileRequest, error) {
+	var prefix bytes.Buffer
+	limited := io.LimitReader(req.Body, 512)
+	if _, err := io.Copy(&prefix, limited); err != nil {
+		return StoreFileRequest{}, err
+	}
+	body := io.MultiReader(bytes.NewReader(prefix.Bytes()), req.Body)
+	mimeType := sniffedMimeType(prefix.Bytes(), req.MimeType)
+	canonicalTarget, normalizedMime, err := s.validateGovernance(ctx, req.UserID, req.TargetType, req.FileName, mimeType, req.SizeBytes)
+	if err != nil {
+		return StoreFileRequest{}, err
+	}
+	req.TargetType = canonicalTarget
+	req.MimeType = normalizedMime
+	req.Body = body
+	return req, nil
+}
+
+func validateCompletedObject(session repository.FileUploadSession, file repository.File, objectInfo storage.ObjectInfo) error {
+	expectedSize := file.SizeBytes
+	if session.ExpectedSizeBytes != nil {
+		expectedSize = *session.ExpectedSizeBytes
+	}
+	if objectInfo.SizeBytes != expectedSize {
+		if objectInfo.SizeBytes > expectedSize {
+			return ErrFileTooLarge
+		}
+		return ErrValidation
+	}
+	mimeType := objectInfo.ContentType
+	if strings.TrimSpace(mimeType) == "" {
+		mimeType = file.MimeType
+	}
+	_, _, err := validateTargetPolicy(session.TargetType, file.OriginalFileName, mimeType, objectInfo.SizeBytes)
+	return err
 }
 
 func normalizeText(value string) string {

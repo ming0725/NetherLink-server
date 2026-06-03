@@ -63,6 +63,7 @@ type imageProcessingResult struct {
 	Format             string  `json:"format"`
 	ThumbnailVariantID *string `json:"thumbnailVariantId,omitempty"`
 	ThumbnailSkipped   *string `json:"thumbnailSkipped,omitempty"`
+	EXIFStripped       bool    `json:"exifStripped"`
 }
 
 type videoProcessingResult struct {
@@ -222,15 +223,10 @@ func (w *ProcessingWorker) processImage(ctx context.Context, job repository.File
 	}
 
 	result := imageProcessingResult{
-		Width:  cfg.Width,
-		Height: cfg.Height,
-		Format: format,
-	}
-
-	if cfg.Width <= thumbnailMaxSide && cfg.Height <= thumbnailMaxSide {
-		value := "source_within_thumbnail_bounds"
-		result.ThumbnailSkipped = &value
-		return w.finishImageJob(ctx, job, file, result, nil)
+		Width:        cfg.Width,
+		Height:       cfg.Height,
+		Format:       format,
+		EXIFStripped: true,
 	}
 	if file.SizeBytes > maxThumbnailSourceBytes {
 		value := "source_too_large"
@@ -896,6 +892,9 @@ func firstNonEmpty(values ...string) string {
 
 func resizeNearest(source image.Image, width int, height int, maxSide int) *image.RGBA {
 	scale := float64(maxSide) / float64(max(width, height))
+	if scale > 1 {
+		scale = 1
+	}
 	targetWidth := max(1, int(math.Round(float64(width)*scale)))
 	targetHeight := max(1, int(math.Round(float64(height)*scale)))
 	target := image.NewRGBA(image.Rect(0, 0, targetWidth, targetHeight))

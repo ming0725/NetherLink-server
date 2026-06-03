@@ -587,6 +587,12 @@ func writeFileError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, filesvc.ErrValidation):
 		writeError(w, r, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid file request")
+	case errors.Is(err, filesvc.ErrFileTooLarge), errors.Is(err, filesvc.ErrFileQuotaExceeded):
+		writeError(w, r, http.StatusRequestEntityTooLarge, "FILE_TOO_LARGE", "File exceeds target size or user quota")
+	case errors.Is(err, filesvc.ErrFileTypeNotAllowed):
+		writeError(w, r, http.StatusUnsupportedMediaType, "FILE_TYPE_NOT_ALLOWED", "File type is not allowed")
+	case errors.Is(err, filesvc.ErrFileScanRejected):
+		writeError(w, r, http.StatusUnprocessableEntity, "FILE_SCAN_REJECTED", "File failed content scanning")
 	case errors.Is(err, filesvc.ErrUploadMode):
 		writeError(w, r, http.StatusBadRequest, "UPLOAD_MODE_INVALID", "Invalid upload mode")
 	case errors.Is(err, filesvc.ErrStorageUnavailable):

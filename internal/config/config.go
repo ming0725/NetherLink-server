@@ -60,6 +60,7 @@ type StorageConfig struct {
 	SecretKey        string
 	UseSSL           bool
 	PresignTTL       time.Duration
+	UserQuotaBytes   int64
 	Buckets          StorageBuckets
 }
 
@@ -124,6 +125,7 @@ func Load() (Config, error) {
 			SecretKey:        requiredEnv(&validationErrors, "NETHERLINK_OBJECT_STORAGE_SECRET_KEY"),
 			UseSSL:           getEnvBool(&validationErrors, "NETHERLINK_OBJECT_STORAGE_USE_SSL", false),
 			PresignTTL:       getEnvDuration(&validationErrors, "NETHERLINK_OBJECT_STORAGE_PRESIGN_TTL", 10*time.Minute),
+			UserQuotaBytes:   getEnvNonNegativeInt64(&validationErrors, "NETHERLINK_FILE_USER_QUOTA_BYTES", 10*1024*1024*1024),
 			Buckets: StorageBuckets{
 				Public:    getEnv("NETHERLINK_OBJECT_STORAGE_PUBLIC_BUCKET", "netherlink-public"),
 				Protected: getEnv("NETHERLINK_OBJECT_STORAGE_PROTECTED_BUCKET", "netherlink-protected"),
@@ -189,6 +191,24 @@ func getEnvNonNegativeInt(validationErrors *[]string, key string, fallback int) 
 		return fallback
 	}
 	return value
+}
+
+func getEnvNonNegativeInt64(validationErrors *[]string, key string, fallback int64) int64 {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		*validationErrors = append(*validationErrors, key+" must be an integer")
+		return fallback
+	}
+	if parsed < 0 {
+		*validationErrors = append(*validationErrors, key+" must be non-negative")
+		return fallback
+	}
+	return parsed
 }
 
 func getEnvPositiveInt(validationErrors *[]string, key string, fallback int) int {

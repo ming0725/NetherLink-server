@@ -363,6 +363,19 @@ func (r *FileRepository) CanUserAccessFile(ctx context.Context, userID string, f
 	return allowed, translateReadError(err)
 }
 
+func (r *FileRepository) SumActiveBytesByOwner(ctx context.Context, userID string) (int64, error) {
+	var bytes int64
+	err := r.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(size_bytes), 0)
+		FROM files
+		WHERE owner_user_id = $1::uuid
+		  AND deleted_at IS NULL
+		  AND storage_status NOT IN ('deleted', 'aborted', 'cleanup_pending')`,
+		normalizeText(userID),
+	).Scan(&bytes)
+	return bytes, translateReadError(err)
+}
+
 func (r *FileRepository) ListVariants(ctx context.Context, fileID string) ([]FileVariant, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT `+fileVariantSelectColumns+`
