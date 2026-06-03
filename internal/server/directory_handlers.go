@@ -24,9 +24,10 @@ type createFriendGroupRequest struct {
 }
 
 type patchFriendRequest struct {
-	Remark  *string `json:"remark"`
-	GroupID *string `json:"groupId"`
-	IsDND   *bool   `json:"isDnd"`
+	Remark            *string `json:"remark"`
+	GroupID           *string `json:"groupId"`
+	IsDND             *bool   `json:"isDnd"`
+	ClientOperationID string  `json:"clientOperationId"`
 }
 
 type createFriendRequestRequest struct {
@@ -39,8 +40,9 @@ type createFriendRequestRequest struct {
 }
 
 type acceptFriendRequestRequest struct {
-	Remark  *string `json:"remark"`
-	GroupID *string `json:"groupId"`
+	Remark            *string `json:"remark"`
+	GroupID           *string `json:"groupId"`
+	ClientOperationID string  `json:"clientOperationId"`
 }
 
 type createGroupRequest struct {
@@ -51,11 +53,12 @@ type createGroupRequest struct {
 }
 
 type patchGroupRequest struct {
-	Name            *string `json:"name"`
-	Introduction    *string `json:"introduction"`
-	Announcement    *string `json:"announcement"`
-	AvatarFileID    *string `json:"avatarFileId"`
-	ExpectedVersion *int    `json:"expectedVersion"`
+	Name              *string `json:"name"`
+	Introduction      *string `json:"introduction"`
+	Announcement      *string `json:"announcement"`
+	AvatarFileID      *string `json:"avatarFileId"`
+	ExpectedVersion   *int    `json:"expectedVersion"`
+	ClientOperationID string  `json:"clientOperationId"`
 }
 
 type addGroupMembersRequest struct {
@@ -64,20 +67,23 @@ type addGroupMembersRequest struct {
 }
 
 type patchGroupMemberRequest struct {
-	Role     *string `json:"role"`
-	Nickname *string `json:"nickname"`
-	IsDND    *bool   `json:"isDnd"`
+	Role              *string `json:"role"`
+	Nickname          *string `json:"nickname"`
+	IsDND             *bool   `json:"isDnd"`
+	ClientOperationID string  `json:"clientOperationId"`
 }
 
 type transferGroupOwnerRequest struct {
-	UserUUID string `json:"userUuid"`
+	UserUUID          string `json:"userUuid"`
+	ClientOperationID string `json:"clientOperationId"`
 }
 
 type patchGroupMySettingsRequest struct {
-	Remark        *string `json:"remark"`
-	ListGroupID   *string `json:"listGroupId"`
-	ListGroupName *string `json:"listGroupName"`
-	IsDND         *bool   `json:"isDnd"`
+	Remark            *string `json:"remark"`
+	ListGroupID       *string `json:"listGroupId"`
+	ListGroupName     *string `json:"listGroupName"`
+	IsDND             *bool   `json:"isDnd"`
+	ClientOperationID string  `json:"clientOperationId"`
 }
 
 type createGroupJoinRequestRequest struct {
@@ -467,23 +473,30 @@ func (s *Server) handlePatchFriend(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	friend, err := s.friendService.UpdateFriend(r.Context(), friendsvc.UpdateFriendInput{
-		UserID:       principal.UserID,
-		FriendUserID: friendUserID,
-		RemarkSet:    req.Remark != nil,
-		Remark:       req.Remark,
-		GroupIDSet:   req.GroupID != nil,
-		GroupID:      req.GroupID,
-		IsDND:        req.IsDND,
-	})
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "friend.update:"+friendUserID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writeFriendServiceError(w, r, err)
-		return
-	}
-
-	response := friendshipResponse{Friendship: makeFriendResponse(friend)}
-	s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "friend.updated", response)
-	writeJSON(w, http.StatusOK, response)
+	}, func() (idempotentHTTPResult, error) {
+		friend, err := s.friendService.UpdateFriend(r.Context(), friendsvc.UpdateFriendInput{
+			UserID:       principal.UserID,
+			FriendUserID: friendUserID,
+			RemarkSet:    req.Remark != nil,
+			Remark:       req.Remark,
+			GroupIDSet:   req.GroupID != nil,
+			GroupID:      req.GroupID,
+			IsDND:        req.IsDND,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		response := friendshipResponse{Friendship: makeFriendResponse(friend)}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   response,
+			After: func() {
+				s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "friend.updated", response)
+			},
+		}, nil
+	})
 }
 
 func (s *Server) handleDeleteFriend(w http.ResponseWriter, r *http.Request) {
@@ -502,16 +515,24 @@ func (s *Server) handleDeleteFriend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.friendService.DeleteFriend(r.Context(), principal.UserID, friendUserID); err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "friend.delete:"+friendUserID, idempotencyKeyFromRequest(r, r.URL.Query().Get("clientOperationId")), func(err error) {
 		writeFriendServiceError(w, r, err)
-		return
-	}
-
-	s.publishRealtimeEvent(r.Context(), []string{principal.UserID, friendUserID}, "friend.deleted", map[string]any{
-		"userUuid":       principal.UserID,
-		"friendUserUuid": friendUserID,
+	}, func() (idempotentHTTPResult, error) {
+		if err := s.friendService.DeleteFriend(r.Context(), principal.UserID, friendUserID); err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		payload := map[string]any{
+			"userUuid":       principal.UserID,
+			"friendUserUuid": friendUserID,
+		}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   okResponse{OK: true},
+			After: func() {
+				s.publishRealtimeEvent(r.Context(), []string{principal.UserID, friendUserID}, "friend.deleted", payload)
+			},
+		}, nil
 	})
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) handleCreateFriendRequest(w http.ResponseWriter, r *http.Request) {
@@ -633,20 +654,27 @@ func (s *Server) handleAcceptFriendRequest(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	friend, err := s.friendService.AcceptRequest(r.Context(), friendsvc.AcceptRequestInput{
-		UserID:    principal.UserID,
-		RequestID: requestID,
-		Remark:    req.Remark,
-		GroupID:   req.GroupID,
-	})
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "friend.request.accept:"+requestID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writeFriendServiceError(w, r, err)
-		return
-	}
-
-	response := friendshipResponse{Friendship: makeFriendResponse(friend)}
-	s.publishRealtimeEvent(r.Context(), []string{principal.UserID, friend.User.ID}, "friend.request.accepted", response)
-	writeJSON(w, http.StatusOK, response)
+	}, func() (idempotentHTTPResult, error) {
+		friend, err := s.friendService.AcceptRequest(r.Context(), friendsvc.AcceptRequestInput{
+			UserID:    principal.UserID,
+			RequestID: requestID,
+			Remark:    req.Remark,
+			GroupID:   req.GroupID,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		response := friendshipResponse{Friendship: makeFriendResponse(friend)}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   response,
+			After: func() {
+				s.publishRealtimeEvent(r.Context(), []string{principal.UserID, friend.User.ID}, "friend.request.accepted", response)
+			},
+		}, nil
+	})
 }
 
 func (s *Server) handleRejectFriendRequest(w http.ResponseWriter, r *http.Request) {
@@ -665,15 +693,22 @@ func (s *Server) handleRejectFriendRequest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	request, err := s.friendService.RejectRequest(r.Context(), principal.UserID, requestID)
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "friend.request.reject:"+requestID, idempotencyKeyFromRequest(r, r.URL.Query().Get("clientOperationId")), func(err error) {
 		writeFriendServiceError(w, r, err)
-		return
-	}
-
-	response := friendRequestDetailResponse{Request: makeFriendRequestResponse(request)}
-	s.publishRealtimeEvent(r.Context(), []string{request.FromUser.ID, request.ToUser.ID}, "friend.request.rejected", response)
-	writeJSON(w, http.StatusOK, response)
+	}, func() (idempotentHTTPResult, error) {
+		request, err := s.friendService.RejectRequest(r.Context(), principal.UserID, requestID)
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		response := friendRequestDetailResponse{Request: makeFriendRequestResponse(request)}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   response,
+			After: func() {
+				s.publishRealtimeEvent(r.Context(), []string{request.FromUser.ID, request.ToUser.ID}, "friend.request.rejected", response)
+			},
+		}, nil
+	})
 }
 
 func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
@@ -810,32 +845,38 @@ func (s *Server) handlePatchGroup(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	current, err := s.repos.Groups.GetForUser(r.Context(), principal.UserID, groupID)
-	if err != nil {
-		writeRepositoryError(w, r, err)
-		return
-	}
-	if !checkResourceVersion(w, r, resourceETag("group", current.Group.ID, current.Group.Version), current.Group.Version, req.ExpectedVersion) {
-		return
-	}
-
-	group, err := s.groupService.UpdateGroup(r.Context(), groupsvc.UpdateGroupInput{
-		UserID:          principal.UserID,
-		GroupID:         groupID,
-		Name:            req.Name,
-		Introduction:    req.Introduction,
-		Announcement:    req.Announcement,
-		AvatarFileIDSet: req.AvatarFileID != nil,
-		AvatarFileID:    req.AvatarFileID,
+	s.handleIdempotentWrite(w, r, principal.UserID, "group.update:"+groupID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
+		writeVersionedGroupOperationError(w, r, err)
+	}, func() (idempotentHTTPResult, error) {
+		current, err := s.repos.Groups.GetForUser(r.Context(), principal.UserID, groupID)
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		if !resourceVersionMatches(r, resourceETag("group", current.Group.ID, current.Group.Version), current.Group.Version, req.ExpectedVersion) {
+			return idempotentHTTPResult{}, errResourceVersionConflict
+		}
+		group, err := s.groupService.UpdateGroup(r.Context(), groupsvc.UpdateGroupInput{
+			UserID:          principal.UserID,
+			GroupID:         groupID,
+			Name:            req.Name,
+			Introduction:    req.Introduction,
+			Announcement:    req.Announcement,
+			AvatarFileIDSet: req.AvatarFileID != nil,
+			AvatarFileID:    req.AvatarFileID,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		response := groupDetailResponse{Group: makeGroupResponse(group)}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			ETag:   response.Group.ETag,
+			Body:   response,
+			After: func() {
+				s.publishGroupRealtimeEvent(r.Context(), groupID, "group.updated", response)
+			},
+		}, nil
 	})
-	if err != nil {
-		writeGroupServiceError(w, r, err)
-		return
-	}
-
-	response := groupDetailResponse{Group: makeGroupResponse(group)}
-	s.publishGroupRealtimeEvent(r.Context(), groupID, "group.updated", response)
-	writeJSONWithETag(w, r, http.StatusOK, response.Group.ETag, response)
 }
 
 func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
@@ -857,37 +898,43 @@ func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, r, reqErr)
 		return
 	}
-	current, err := s.repos.Groups.GetForUser(r.Context(), principal.UserID, groupID)
-	if err != nil {
-		writeRepositoryError(w, r, err)
-		return
-	}
-	if !checkResourceVersion(w, r, resourceETag("group", current.Group.ID, current.Group.Version), current.Group.Version, expectedVersion) {
-		return
-	}
-
-	recipients := []string{}
-	action := "group.member.removed"
-	if s.repos.Groups != nil {
-		if userIDs, err := s.repos.Groups.ListActiveMemberUserIDs(r.Context(), groupID); err == nil {
-			recipients = userIDs
-		} else {
-			s.logger.WarnContext(r.Context(), "failed to list group delete realtime recipients", "error", err, "group_id", groupID)
+	s.handleIdempotentWrite(w, r, principal.UserID, "group.delete:"+groupID, idempotencyKeyFromRequest(r, r.URL.Query().Get("clientOperationId")), func(err error) {
+		writeVersionedGroupOperationError(w, r, err)
+	}, func() (idempotentHTTPResult, error) {
+		current, err := s.repos.Groups.GetForUser(r.Context(), principal.UserID, groupID)
+		if err != nil {
+			return idempotentHTTPResult{}, err
 		}
-		if member, err := s.repos.Groups.GetMember(r.Context(), groupID, principal.UserID); err == nil && member.Role == "owner" {
-			action = "group.deleted"
+		if !resourceVersionMatches(r, resourceETag("group", current.Group.ID, current.Group.Version), current.Group.Version, expectedVersion) {
+			return idempotentHTTPResult{}, errResourceVersionConflict
 		}
-	}
-	if err := s.groupService.DeleteOrLeaveGroup(r.Context(), principal.UserID, groupID); err != nil {
-		writeGroupServiceError(w, r, err)
-		return
-	}
-
-	s.publishGroupRealtimeEventTo(r.Context(), recipients, action, map[string]any{
-		"groupId":      groupID,
-		"operatorUuid": principal.UserID,
+		recipients := []string{}
+		action := "group.member.removed"
+		if s.repos.Groups != nil {
+			if userIDs, err := s.repos.Groups.ListActiveMemberUserIDs(r.Context(), groupID); err == nil {
+				recipients = userIDs
+			} else {
+				s.logger.WarnContext(r.Context(), "failed to list group delete realtime recipients", "error", err, "group_id", groupID)
+			}
+			if member, err := s.repos.Groups.GetMember(r.Context(), groupID, principal.UserID); err == nil && member.Role == "owner" {
+				action = "group.deleted"
+			}
+		}
+		if err := s.groupService.DeleteOrLeaveGroup(r.Context(), principal.UserID, groupID); err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		payload := map[string]any{
+			"groupId":      groupID,
+			"operatorUuid": principal.UserID,
+		}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   okResponse{OK: true},
+			After: func() {
+				s.publishGroupRealtimeEventTo(r.Context(), recipients, action, payload)
+			},
+		}, nil
 	})
-	writeJSON(w, http.StatusOK, okResponse{OK: true})
 }
 
 func (s *Server) handleGroupMembers(w http.ResponseWriter, r *http.Request) {
@@ -997,29 +1044,37 @@ func (s *Server) handleRemoveGroupMember(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	recipients := []string{}
-	if s.repos.Groups != nil {
-		if userIDs, err := s.repos.Groups.ListActiveMemberUserIDs(r.Context(), groupID); err == nil {
-			recipients = userIDs
-		} else {
-			s.logger.WarnContext(r.Context(), "failed to list group member remove realtime recipients", "error", err, "group_id", groupID)
-		}
-	}
-	if err := s.groupService.RemoveMember(r.Context(), groupsvc.RemoveMemberInput{
-		UserID:       principal.UserID,
-		GroupID:      groupID,
-		TargetUserID: userID,
-	}); err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "group.member.remove:"+groupID+":"+userID, idempotencyKeyFromRequest(r, r.URL.Query().Get("clientOperationId")), func(err error) {
 		writeGroupServiceError(w, r, err)
-		return
-	}
-
-	s.publishGroupRealtimeEventTo(r.Context(), recipients, "group.member.removed", map[string]any{
-		"groupId":      groupID,
-		"userUuid":     userID,
-		"operatorUuid": principal.UserID,
+	}, func() (idempotentHTTPResult, error) {
+		recipients := []string{}
+		if s.repos.Groups != nil {
+			if userIDs, err := s.repos.Groups.ListActiveMemberUserIDs(r.Context(), groupID); err == nil {
+				recipients = userIDs
+			} else {
+				s.logger.WarnContext(r.Context(), "failed to list group member remove realtime recipients", "error", err, "group_id", groupID)
+			}
+		}
+		if err := s.groupService.RemoveMember(r.Context(), groupsvc.RemoveMemberInput{
+			UserID:       principal.UserID,
+			GroupID:      groupID,
+			TargetUserID: userID,
+		}); err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		payload := map[string]any{
+			"groupId":      groupID,
+			"userUuid":     userID,
+			"operatorUuid": principal.UserID,
+		}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   okResponse{OK: true},
+			After: func() {
+				s.publishGroupRealtimeEventTo(r.Context(), recipients, "group.member.removed", payload)
+			},
+		}, nil
 	})
-	writeJSON(w, http.StatusOK, okResponse{OK: true})
 }
 
 func (s *Server) handlePatchGroupMember(w http.ResponseWriter, r *http.Request) {
@@ -1047,23 +1102,30 @@ func (s *Server) handlePatchGroupMember(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	member, err := s.groupService.UpdateMember(r.Context(), groupsvc.UpdateMemberInput{
-		UserID:       principal.UserID,
-		GroupID:      groupID,
-		TargetUserID: userID,
-		Role:         req.Role,
-		Nickname:     req.Nickname,
-		NicknameSet:  req.Nickname != nil,
-		IsDND:        req.IsDND,
-	})
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "group.member.update:"+groupID+":"+userID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writeGroupServiceError(w, r, err)
-		return
-	}
-
-	response := groupMemberDetailResponse{Member: makeGroupMemberResponse(member)}
-	s.publishGroupRealtimeEvent(r.Context(), groupID, "group.member.updated", response)
-	writeJSON(w, http.StatusOK, response)
+	}, func() (idempotentHTTPResult, error) {
+		member, err := s.groupService.UpdateMember(r.Context(), groupsvc.UpdateMemberInput{
+			UserID:       principal.UserID,
+			GroupID:      groupID,
+			TargetUserID: userID,
+			Role:         req.Role,
+			Nickname:     req.Nickname,
+			NicknameSet:  req.Nickname != nil,
+			IsDND:        req.IsDND,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		response := groupMemberDetailResponse{Member: makeGroupMemberResponse(member)}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   response,
+			After: func() {
+				s.publishGroupRealtimeEvent(r.Context(), groupID, "group.member.updated", response)
+			},
+		}, nil
+	})
 }
 
 func (s *Server) handleTransferGroupOwner(w http.ResponseWriter, r *http.Request) {
@@ -1090,19 +1152,27 @@ func (s *Server) handleTransferGroupOwner(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	group, err := s.groupService.TransferOwner(r.Context(), groupsvc.TransferOwnerInput{
-		UserID:       principal.UserID,
-		GroupID:      groupID,
-		TargetUserID: req.UserUUID,
-	})
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "group.owner.transfer:"+groupID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writeGroupServiceError(w, r, err)
-		return
-	}
-
-	response := groupDetailResponse{Group: makeGroupResponse(group)}
-	s.publishGroupRealtimeEvent(r.Context(), groupID, "group.owner.transferred", response)
-	writeJSON(w, http.StatusOK, response)
+	}, func() (idempotentHTTPResult, error) {
+		group, err := s.groupService.TransferOwner(r.Context(), groupsvc.TransferOwnerInput{
+			UserID:       principal.UserID,
+			GroupID:      groupID,
+			TargetUserID: req.UserUUID,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		response := groupDetailResponse{Group: makeGroupResponse(group)}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			ETag:   response.Group.ETag,
+			Body:   response,
+			After: func() {
+				s.publishGroupRealtimeEvent(r.Context(), groupID, "group.owner.transferred", response)
+			},
+		}, nil
+	})
 }
 
 func (s *Server) handlePatchGroupMySettings(w http.ResponseWriter, r *http.Request) {
@@ -1131,25 +1201,32 @@ func (s *Server) handlePatchGroupMySettings(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	settings, err := s.groupService.UpdateMySettings(r.Context(), groupsvc.UpdateMySettingsInput{
-		UserID:           principal.UserID,
-		GroupID:          groupID,
-		Remark:           req.Remark,
-		RemarkSet:        req.Remark != nil,
-		ListGroupID:      req.ListGroupID,
-		ListGroupIDSet:   req.ListGroupID != nil,
-		ListGroupName:    req.ListGroupName,
-		ListGroupNameSet: req.ListGroupName != nil,
-		IsDND:            req.IsDND,
-	})
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "group.my_settings.update:"+groupID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writeGroupServiceError(w, r, err)
-		return
-	}
-
-	response := groupSettingsDetailResponse{Settings: makeGroupSettingsResponse(settings)}
-	s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "group.my_settings.updated", response)
-	writeJSON(w, http.StatusOK, response)
+	}, func() (idempotentHTTPResult, error) {
+		settings, err := s.groupService.UpdateMySettings(r.Context(), groupsvc.UpdateMySettingsInput{
+			UserID:           principal.UserID,
+			GroupID:          groupID,
+			Remark:           req.Remark,
+			RemarkSet:        req.Remark != nil,
+			ListGroupID:      req.ListGroupID,
+			ListGroupIDSet:   req.ListGroupID != nil,
+			ListGroupName:    req.ListGroupName,
+			ListGroupNameSet: req.ListGroupName != nil,
+			IsDND:            req.IsDND,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		response := groupSettingsDetailResponse{Settings: makeGroupSettingsResponse(settings)}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   response,
+			After: func() {
+				s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "group.my_settings.updated", response)
+			},
+		}, nil
+	})
 }
 
 func (s *Server) handleCreateGroupJoinRequest(w http.ResponseWriter, r *http.Request) {
@@ -1248,23 +1325,30 @@ func (s *Server) handleAcceptGroupJoinRequest(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	request, err := s.groupService.AcceptJoinRequest(r.Context(), principal.UserID, requestID)
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "group.join_request.accept:"+requestID, idempotencyKeyFromRequest(r, r.URL.Query().Get("clientOperationId")), func(err error) {
 		writeGroupServiceError(w, r, err)
-		return
-	}
-
-	response := groupJoinRequestDetailResponse{Request: makeGroupJoinRequestResponse(request)}
-	recipients := []string{request.ActorUser.ID, principal.UserID}
-	if s.repos.Groups != nil {
-		if userIDs, err := s.repos.Groups.ListActiveMemberUserIDs(r.Context(), request.Group.ID); err == nil {
-			recipients = append(recipients, userIDs...)
-		} else {
-			s.logger.WarnContext(r.Context(), "failed to list group join accept realtime recipients", "error", err, "group_id", request.Group.ID)
+	}, func() (idempotentHTTPResult, error) {
+		request, err := s.groupService.AcceptJoinRequest(r.Context(), principal.UserID, requestID)
+		if err != nil {
+			return idempotentHTTPResult{}, err
 		}
-	}
-	s.publishGroupRealtimeEventTo(r.Context(), recipients, "group.join_request.accepted", response)
-	writeJSON(w, http.StatusOK, response)
+		response := groupJoinRequestDetailResponse{Request: makeGroupJoinRequestResponse(request)}
+		recipients := []string{request.ActorUser.ID, principal.UserID}
+		if s.repos.Groups != nil {
+			if userIDs, err := s.repos.Groups.ListActiveMemberUserIDs(r.Context(), request.Group.ID); err == nil {
+				recipients = append(recipients, userIDs...)
+			} else {
+				s.logger.WarnContext(r.Context(), "failed to list group join accept realtime recipients", "error", err, "group_id", request.Group.ID)
+			}
+		}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   response,
+			After: func() {
+				s.publishGroupRealtimeEventTo(r.Context(), recipients, "group.join_request.accepted", response)
+			},
+		}, nil
+	})
 }
 
 func (s *Server) handleRejectGroupJoinRequest(w http.ResponseWriter, r *http.Request) {
@@ -1282,23 +1366,30 @@ func (s *Server) handleRejectGroupJoinRequest(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	request, err := s.groupService.RejectJoinRequest(r.Context(), principal.UserID, requestID)
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "group.join_request.reject:"+requestID, idempotencyKeyFromRequest(r, r.URL.Query().Get("clientOperationId")), func(err error) {
 		writeGroupServiceError(w, r, err)
-		return
-	}
-
-	response := groupJoinRequestDetailResponse{Request: makeGroupJoinRequestResponse(request)}
-	recipients := []string{request.ActorUser.ID, principal.UserID}
-	if s.repos.Groups != nil {
-		if userIDs, err := s.repos.Groups.ListPrivilegedMemberUserIDs(r.Context(), request.Group.ID); err == nil {
-			recipients = append(recipients, userIDs...)
-		} else {
-			s.logger.WarnContext(r.Context(), "failed to list group join reject realtime recipients", "error", err, "group_id", request.Group.ID)
+	}, func() (idempotentHTTPResult, error) {
+		request, err := s.groupService.RejectJoinRequest(r.Context(), principal.UserID, requestID)
+		if err != nil {
+			return idempotentHTTPResult{}, err
 		}
-	}
-	s.publishGroupRealtimeEventTo(r.Context(), recipients, "group.join_request.rejected", response)
-	writeJSON(w, http.StatusOK, response)
+		response := groupJoinRequestDetailResponse{Request: makeGroupJoinRequestResponse(request)}
+		recipients := []string{request.ActorUser.ID, principal.UserID}
+		if s.repos.Groups != nil {
+			if userIDs, err := s.repos.Groups.ListPrivilegedMemberUserIDs(r.Context(), request.Group.ID); err == nil {
+				recipients = append(recipients, userIDs...)
+			} else {
+				s.logger.WarnContext(r.Context(), "failed to list group join reject realtime recipients", "error", err, "group_id", request.Group.ID)
+			}
+		}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   response,
+			After: func() {
+				s.publishGroupRealtimeEventTo(r.Context(), recipients, "group.join_request.rejected", response)
+			},
+		}, nil
+	})
 }
 
 func makeUserDetailResponse(ctx context.Context, repos repository.Repositories, viewerUserID string, user repository.User) (userDetailResponse, error) {
@@ -1543,4 +1634,12 @@ func writeGroupServiceError(w http.ResponseWriter, r *http.Request, err error) {
 	default:
 		writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error")
 	}
+}
+
+func writeVersionedGroupOperationError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, errResourceVersionConflict) {
+		writeError(w, r, http.StatusConflict, "VERSION_CONFLICT", "Resource version conflict")
+		return
+	}
+	writeGroupServiceError(w, r, err)
 }

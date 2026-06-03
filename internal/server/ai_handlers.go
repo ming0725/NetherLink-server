@@ -33,7 +33,8 @@ type aiBindFileRequest struct {
 }
 
 type aiFeedbackRequest struct {
-	Feedback string `json:"feedback"`
+	Feedback          string `json:"feedback"`
+	ClientOperationID string `json:"clientOperationId"`
 }
 
 type aiTitleRequest struct {
@@ -547,11 +548,17 @@ func (s *Server) handleAIDeleteFile(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, r, reqErr)
 		return
 	}
-	if err := s.repos.AI.DeleteUploadedFile(r.Context(), principal.UserID, aiFileID); err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "ai.file.delete:"+aiFileID, idempotencyKeyFromRequest(r, r.URL.Query().Get("clientOperationId")), func(err error) {
 		writeRepositoryError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, okResponse{OK: true})
+	}, func() (idempotentHTTPResult, error) {
+		if err := s.repos.AI.DeleteUploadedFile(r.Context(), principal.UserID, aiFileID); err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   okResponse{OK: true},
+		}, nil
+	})
 }
 
 func (s *Server) handleAIContext(w http.ResponseWriter, r *http.Request) {
@@ -607,12 +614,18 @@ func (s *Server) handleAIMessageFeedback(w http.ResponseWriter, r *http.Request)
 		writeError(w, r, http.StatusBadRequest, "VALIDATION_ERROR", "feedback must be liked, disliked, or none")
 		return
 	}
-	message, err := s.repos.AI.SetMessageFeedback(r.Context(), principal.UserID, messageID, req.Feedback)
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "ai.message.feedback:"+messageID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writeRepositoryError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, aiMessageDetailResponse{Message: makeAIMessageResponse(message)})
+	}, func() (idempotentHTTPResult, error) {
+		message, err := s.repos.AI.SetMessageFeedback(r.Context(), principal.UserID, messageID, req.Feedback)
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   aiMessageDetailResponse{Message: makeAIMessageResponse(message)},
+		}, nil
+	})
 }
 
 func (s *Server) handleAITitle(w http.ResponseWriter, r *http.Request) {

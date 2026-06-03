@@ -34,11 +34,12 @@ type createPostRequest struct {
 }
 
 type patchPostRequest struct {
-	Title           *string             `json:"title"`
-	Content         *string             `json:"content"`
-	Visibility      *string             `json:"visibility"`
-	Media           *[]postMediaRequest `json:"media"`
-	ExpectedVersion *int                `json:"expectedVersion"`
+	Title             *string             `json:"title"`
+	Content           *string             `json:"content"`
+	Visibility        *string             `json:"visibility"`
+	Media             *[]postMediaRequest `json:"media"`
+	ExpectedVersion   *int                `json:"expectedVersion"`
+	ClientOperationID string              `json:"clientOperationId"`
 }
 
 type setLikedRequest struct {
@@ -283,36 +284,44 @@ func (s *Server) handlePatchPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	current, err := s.repos.Posts.GetPost(r.Context(), principal.UserID, postID)
-	if err != nil {
-		writeRepositoryError(w, r, err)
-		return
-	}
-	if !checkResourceVersion(w, r, resourceETag("post", current.Post.ID, current.Post.Version), current.Post.Version, req.ExpectedVersion) {
-		return
-	}
-	content := ""
-	if req.Content != nil {
-		content = *req.Content
-	}
-	post, err := s.postService.UpdatePost(r.Context(), postsvc.UpdatePostInput{
-		PostID:     postID,
-		AuthorID:   principal.UserID,
-		TitleSet:   req.Title != nil,
-		Title:      req.Title,
-		ContentSet: req.Content != nil,
-		Content:    content,
-		Visibility: req.Visibility,
-		MediaSet:   req.Media != nil,
-		Media:      makePostMediaInputs(media),
+	s.handleIdempotentWrite(w, r, principal.UserID, "post.update:"+postID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
+		writeVersionedPostOperationError(w, r, err)
+	}, func() (idempotentHTTPResult, error) {
+		current, err := s.repos.Posts.GetPost(r.Context(), principal.UserID, postID)
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		if !resourceVersionMatches(r, resourceETag("post", current.Post.ID, current.Post.Version), current.Post.Version, req.ExpectedVersion) {
+			return idempotentHTTPResult{}, errResourceVersionConflict
+		}
+		content := ""
+		if req.Content != nil {
+			content = *req.Content
+		}
+		post, err := s.postService.UpdatePost(r.Context(), postsvc.UpdatePostInput{
+			PostID:     postID,
+			AuthorID:   principal.UserID,
+			TitleSet:   req.Title != nil,
+			Title:      req.Title,
+			ContentSet: req.Content != nil,
+			Content:    content,
+			Visibility: req.Visibility,
+			MediaSet:   req.Media != nil,
+			Media:      makePostMediaInputs(media),
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		response := postDetailResponse{Post: makePostResponse(post, true)}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			ETag:   response.Post.ETag,
+			Body:   response,
+			After: func() {
+				s.publishRealtimeEvent(r.Context(), []string{principal.UserID, post.Post.AuthorID}, "post.updated", response)
+			},
+		}, nil
 	})
-	if err != nil {
-		writePostServiceError(w, r, err)
-		return
-	}
-	response := postDetailResponse{Post: makePostResponse(post, true)}
-	s.publishRealtimeEvent(r.Context(), []string{principal.UserID, post.Post.AuthorID}, "post.updated", response)
-	writeJSONWithETag(w, r, http.StatusOK, response.Post.ETag, response)
 }
 
 func (s *Server) handleDeletePost(w http.ResponseWriter, r *http.Request) {
