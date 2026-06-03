@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"math"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -43,14 +45,18 @@ const (
 )
 
 var (
-	ErrValidation         = errors.New("files: validation error")
-	ErrStorageUnavailable = errors.New("files: storage unavailable")
-	ErrForbidden          = errors.New("files: forbidden")
-	ErrUploadExpired      = errors.New("files: upload session expired")
-	ErrUploadCompleted    = errors.New("files: upload session completed")
-	ErrUploadAborted      = errors.New("files: upload session aborted")
-	ErrUploadMode         = errors.New("files: unsupported upload mode")
-	ErrFileReferenced     = errors.New("files: file is referenced")
+	ErrValidation          = errors.New("files: validation error")
+	ErrStorageUnavailable  = errors.New("files: storage unavailable")
+	ErrForbidden           = errors.New("files: forbidden")
+	ErrUploadExpired       = errors.New("files: upload session expired")
+	ErrUploadCompleted     = errors.New("files: upload session completed")
+	ErrUploadAborted       = errors.New("files: upload session aborted")
+	ErrUploadMode          = errors.New("files: unsupported upload mode")
+	ErrFileReferenced      = errors.New("files: file is referenced")
+	ErrUploadPartMissing   = errors.New("files: upload part missing")
+	ErrUploadPartETag      = errors.New("files: upload part etag mismatch")
+	ErrUploadInvalid       = errors.New("files: upload session invalid")
+	ErrContentHashMismatch = errors.New("files: content hash mismatch")
 )
 
 var targetTypePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
@@ -123,6 +129,39 @@ type CompletedPart struct {
 	PartNumber int    `json:"partNumber"`
 	ETag       string `json:"etag"`
 	SizeBytes  int64  `json:"sizeBytes,omitempty"`
+}
+
+type UploadPartError struct {
+	Cause              error
+	MissingPartNumbers []int
+	PartNumbers        []int
+}
+
+func (e *UploadPartError) Error() string {
+	if e == nil || e.Cause == nil {
+		return "files: upload part error"
+	}
+	return e.Cause.Error()
+}
+
+func (e *UploadPartError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+type ContentHashMismatchError struct {
+	Expected string
+	Actual   string
+}
+
+func (e *ContentHashMismatchError) Error() string {
+	return ErrContentHashMismatch.Error()
+}
+
+func (e *ContentHashMismatchError) Unwrap() error {
+	return ErrContentHashMismatch
 }
 
 type UploadedPart struct {
@@ -581,22 +620,16 @@ func (s *Service) CompleteUploadSession(ctx context.Context, req CompleteUploadS
 		if session.S3UploadID == nil {
 			return CompleteUploadSessionResult{}, ErrUploadMode
 		}
-		if len(req.Parts) == 0 {
-			return CompleteUploadSessionResult{}, ErrValidation
+
+		normalizedParts, err := validateCompletedMultipartParts(session, req.Parts)
+		if err != nil {
+			return CompleteUploadSessionResult{}, err
 		}
 
-		storageParts := make([]storage.CompletedPart, 0, len(req.Parts))
-		for _, part := range req.Parts {
-			if part.PartNumber < 1 || strings.TrimSpace(part.ETag) == "" {
-				return CompleteUploadSessionResult{}, ErrValidation
-			}
-			storageParts = append(storageParts, storage.CompletedPart{
-				PartNumber: part.PartNumber,
-				ETag:       part.ETag,
-				SizeBytes:  part.SizeBytes,
-			})
+		storageParts := make([]storage.CompletedPart, 0, len(normalizedParts))
+		for _, part := range normalizedParts {
+			storageParts = append(storageParts, storage.CompletedPart(part))
 		}
-
 		objectInfo, err = s.storage.CompleteMultipartUpload(ctx, storage.CompleteMultipartUploadInput{
 			Bucket:    file.Bucket,
 			ObjectKey: file.ObjectKey,
@@ -604,11 +637,11 @@ func (s *Service) CompleteUploadSession(ctx context.Context, req CompleteUploadS
 			Parts:     storageParts,
 		})
 		if err != nil {
-			return CompleteUploadSessionResult{}, err
+			return CompleteUploadSessionResult{}, mapMultipartCompletionError(err)
 		}
 
-		uploadedPartValues := make([]UploadedPart, 0, len(req.Parts))
-		for _, part := range req.Parts {
+		uploadedPartValues := make([]UploadedPart, 0, len(normalizedParts))
+		for _, part := range normalizedParts {
 			uploadedPartValues = append(uploadedPartValues, UploadedPart(part))
 		}
 		uploadedParts, _ = json.Marshal(uploadedPartValues)
@@ -622,6 +655,11 @@ func (s *Service) CompleteUploadSession(ctx context.Context, req CompleteUploadS
 	contentHash := normalizeOptional(req.ContentHash)
 	if contentHash == nil {
 		contentHash = file.ContentHash
+	}
+	if contentHash != nil {
+		if err := s.verifyObjectContentHash(ctx, file, *contentHash); err != nil {
+			return CompleteUploadSessionResult{}, err
+		}
 	}
 	etag := normalizeOptional(&objectInfo.ETag)
 
@@ -1087,6 +1125,142 @@ func validateCompletedObject(session repository.FileUploadSession, file reposito
 	}
 	_, _, err := validateTargetPolicy(session.TargetType, file.OriginalFileName, mimeType, objectInfo.SizeBytes)
 	return err
+}
+
+func validateCompletedMultipartParts(session repository.FileUploadSession, parts []CompletedPart) ([]CompletedPart, error) {
+	if len(parts) == 0 || session.TotalParts == nil || *session.TotalParts <= 0 {
+		return nil, ErrValidation
+	}
+
+	totalParts := *session.TotalParts
+	byNumber := make(map[int]CompletedPart, len(parts))
+	duplicatePartNumbers := []int{}
+	for _, part := range parts {
+		part.ETag = normalizeETagValue(part.ETag)
+		if part.PartNumber < 1 || part.PartNumber > totalParts || part.ETag == "" || part.SizeBytes < 0 {
+			return nil, ErrValidation
+		}
+		if existing, ok := byNumber[part.PartNumber]; ok {
+			if existing.ETag != part.ETag || existing.SizeBytes != part.SizeBytes {
+				duplicatePartNumbers = append(duplicatePartNumbers, part.PartNumber)
+			}
+			continue
+		}
+		byNumber[part.PartNumber] = part
+	}
+	if len(duplicatePartNumbers) > 0 {
+		sort.Ints(duplicatePartNumbers)
+		return nil, &UploadPartError{Cause: ErrUploadPartETag, PartNumbers: compactInts(duplicatePartNumbers)}
+	}
+
+	missingPartNumbers := []int{}
+	normalized := make([]CompletedPart, 0, totalParts)
+	for partNumber := 1; partNumber <= totalParts; partNumber++ {
+		part, ok := byNumber[partNumber]
+		if !ok {
+			missingPartNumbers = append(missingPartNumbers, partNumber)
+			continue
+		}
+		if err := validateCompletedPartSize(session, part); err != nil {
+			return nil, err
+		}
+		normalized = append(normalized, part)
+	}
+	if len(missingPartNumbers) > 0 {
+		return nil, &UploadPartError{Cause: ErrUploadPartMissing, MissingPartNumbers: missingPartNumbers}
+	}
+
+	return normalized, nil
+}
+
+func validateCompletedPartSize(session repository.FileUploadSession, part CompletedPart) error {
+	if part.SizeBytes == 0 || session.PartSizeBytes == nil || session.TotalParts == nil || session.ExpectedSizeBytes == nil {
+		return nil
+	}
+	expectedSize := *session.PartSizeBytes
+	if part.PartNumber == *session.TotalParts {
+		previousPartBytes := int64(*session.TotalParts-1) * *session.PartSizeBytes
+		expectedSize = *session.ExpectedSizeBytes - previousPartBytes
+	}
+	if expectedSize <= 0 || part.SizeBytes != expectedSize {
+		return ErrValidation
+	}
+	return nil
+}
+
+func (s *Service) verifyObjectContentHash(ctx context.Context, file repository.File, expectedHash string) error {
+	expected, ok := normalizeSHA256Hash(expectedHash)
+	if !ok {
+		return ErrValidation
+	}
+
+	object, err := s.storage.GetObject(ctx, storage.GetObjectInput{
+		Bucket:    file.Bucket,
+		ObjectKey: file.ObjectKey,
+	})
+	if err != nil {
+		return err
+	}
+	defer object.Body.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, object.Body); err != nil {
+		return err
+	}
+	actual := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
+	if actual != expected {
+		return &ContentHashMismatchError{
+			Expected: expected,
+			Actual:   actual,
+		}
+	}
+	return nil
+}
+
+func mapMultipartCompletionError(err error) error {
+	if err == nil {
+		return nil
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "nosuchupload"), strings.Contains(message, "no such upload"), strings.Contains(message, "upload does not exist"):
+		return fmt.Errorf("%w: %v", ErrUploadInvalid, err)
+	case strings.Contains(message, "invalidpart"), strings.Contains(message, "etag"), strings.Contains(message, "part"):
+		return &UploadPartError{Cause: ErrUploadPartETag}
+	default:
+		return err
+	}
+}
+
+func normalizeSHA256Hash(value string) (string, bool) {
+	trimmed := strings.ToLower(strings.TrimSpace(value))
+	trimmed = strings.TrimPrefix(trimmed, "sha256:")
+	if len(trimmed) != sha256.Size*2 {
+		return "", false
+	}
+	for _, r := range trimmed {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return "", false
+		}
+	}
+	return "sha256:" + trimmed, true
+}
+
+func normalizeETagValue(value string) string {
+	return strings.Trim(strings.TrimSpace(value), `"`)
+}
+
+func compactInts(values []int) []int {
+	if len(values) < 2 {
+		return values
+	}
+	out := values[:1]
+	for _, value := range values[1:] {
+		if value != out[len(out)-1] {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func normalizeText(value string) string {

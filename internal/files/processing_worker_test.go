@@ -3,6 +3,7 @@ package files
 import (
 	"archive/zip"
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 
@@ -161,6 +162,91 @@ func TestExtractAITextPPTX(t *testing.T) {
 		if !strings.Contains(parsed.Text, want) {
 			t.Fatalf("text = %q, want %q", parsed.Text, want)
 		}
+	}
+}
+
+func TestValidateCompletedMultipartPartsReportsMissingParts(t *testing.T) {
+	partSize := int64(8)
+	totalParts := 3
+	expectedSize := int64(20)
+	_, err := validateCompletedMultipartParts(repository.FileUploadSession{
+		PartSizeBytes:     &partSize,
+		TotalParts:        &totalParts,
+		ExpectedSizeBytes: &expectedSize,
+	}, []CompletedPart{
+		{PartNumber: 1, ETag: `"etag-1"`, SizeBytes: 8},
+		{PartNumber: 3, ETag: "etag-3", SizeBytes: 4},
+	})
+	if !errors.Is(err, ErrUploadPartMissing) {
+		t.Fatalf("error = %v, want ErrUploadPartMissing", err)
+	}
+	var partErr *UploadPartError
+	if !errors.As(err, &partErr) {
+		t.Fatalf("error = %T, want UploadPartError", err)
+	}
+	if len(partErr.MissingPartNumbers) != 1 || partErr.MissingPartNumbers[0] != 2 {
+		t.Fatalf("missing parts = %v, want [2]", partErr.MissingPartNumbers)
+	}
+}
+
+func TestValidateCompletedMultipartPartsNormalizesAndSortsParts(t *testing.T) {
+	partSize := int64(8)
+	totalParts := 3
+	expectedSize := int64(20)
+	parts, err := validateCompletedMultipartParts(repository.FileUploadSession{
+		PartSizeBytes:     &partSize,
+		TotalParts:        &totalParts,
+		ExpectedSizeBytes: &expectedSize,
+	}, []CompletedPart{
+		{PartNumber: 3, ETag: `"etag-3"`, SizeBytes: 4},
+		{PartNumber: 1, ETag: "etag-1", SizeBytes: 8},
+		{PartNumber: 2, ETag: "etag-2", SizeBytes: 8},
+	})
+	if err != nil {
+		t.Fatalf("validateCompletedMultipartParts() error = %v", err)
+	}
+	for index, part := range parts {
+		wantPartNumber := index + 1
+		if part.PartNumber != wantPartNumber {
+			t.Fatalf("parts[%d].PartNumber = %d, want %d", index, part.PartNumber, wantPartNumber)
+		}
+		if strings.Contains(part.ETag, `"`) {
+			t.Fatalf("parts[%d].ETag = %q, want normalized ETag", index, part.ETag)
+		}
+	}
+}
+
+func TestValidateCompletedMultipartPartsReportsConflictingDuplicate(t *testing.T) {
+	totalParts := 1
+	_, err := validateCompletedMultipartParts(repository.FileUploadSession{
+		TotalParts: &totalParts,
+	}, []CompletedPart{
+		{PartNumber: 1, ETag: "etag-1"},
+		{PartNumber: 1, ETag: "etag-2"},
+	})
+	if !errors.Is(err, ErrUploadPartETag) {
+		t.Fatalf("error = %v, want ErrUploadPartETag", err)
+	}
+	var partErr *UploadPartError
+	if !errors.As(err, &partErr) {
+		t.Fatalf("error = %T, want UploadPartError", err)
+	}
+	if len(partErr.PartNumbers) != 1 || partErr.PartNumbers[0] != 1 {
+		t.Fatalf("part numbers = %v, want [1]", partErr.PartNumbers)
+	}
+}
+
+func TestNormalizeSHA256Hash(t *testing.T) {
+	hash := strings.Repeat("a", 64)
+	normalized, ok := normalizeSHA256Hash("SHA256:" + hash)
+	if !ok {
+		t.Fatal("normalizeSHA256Hash() ok = false, want true")
+	}
+	if normalized != "sha256:"+hash {
+		t.Fatalf("normalized = %q, want sha256:%s", normalized, hash)
+	}
+	if _, ok := normalizeSHA256Hash("not-a-hash"); ok {
+		t.Fatal("normalizeSHA256Hash() ok = true, want false")
 	}
 }
 

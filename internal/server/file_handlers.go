@@ -601,6 +601,30 @@ func writeFileError(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Forbidden")
 	case errors.Is(err, filesvc.ErrUploadExpired):
 		writeError(w, r, http.StatusConflict, "UPLOAD_SESSION_EXPIRED", "Upload session expired")
+	case errors.Is(err, filesvc.ErrUploadInvalid):
+		writeError(w, r, http.StatusConflict, "UPLOAD_SESSION_INVALID", "Upload session is invalid")
+	case errors.Is(err, filesvc.ErrUploadPartMissing):
+		var partErr *filesvc.UploadPartError
+		details := map[string]any{}
+		if errors.As(err, &partErr) {
+			details["missingPartNumbers"] = partErr.MissingPartNumbers
+		}
+		writeErrorDetails(w, r, http.StatusConflict, "UPLOAD_PART_MISSING", "Upload is missing required parts", details)
+	case errors.Is(err, filesvc.ErrUploadPartETag):
+		var partErr *filesvc.UploadPartError
+		details := map[string]any{}
+		if errors.As(err, &partErr) && len(partErr.PartNumbers) > 0 {
+			details["partNumbers"] = partErr.PartNumbers
+		}
+		writeErrorDetails(w, r, http.StatusConflict, "UPLOAD_PART_ETAG_MISMATCH", "Upload part ETag mismatch", details)
+	case errors.Is(err, filesvc.ErrContentHashMismatch):
+		var hashErr *filesvc.ContentHashMismatchError
+		details := map[string]any{}
+		if errors.As(err, &hashErr) {
+			details["expectedContentHash"] = hashErr.Expected
+			details["actualContentHash"] = hashErr.Actual
+		}
+		writeErrorDetails(w, r, http.StatusConflict, "CONTENT_HASH_MISMATCH", "Content hash does not match uploaded object", details)
 	case errors.Is(err, filesvc.ErrUploadCompleted):
 		writeError(w, r, http.StatusConflict, "UPLOAD_SESSION_COMPLETED", "Upload session already completed")
 	case errors.Is(err, filesvc.ErrUploadAborted):

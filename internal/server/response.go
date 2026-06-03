@@ -9,6 +9,7 @@ type errorResponse struct {
 	Code      string `json:"code"`
 	Message   string `json:"message"`
 	RequestID string `json:"requestId"`
+	Details   any    `json:"details,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -18,9 +19,14 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 func writeError(w http.ResponseWriter, r *http.Request, status int, code string, message string) {
+	writeErrorDetails(w, r, status, code, message, nil)
+}
+
+func writeErrorDetails(w http.ResponseWriter, r *http.Request, status int, code string, message string, details any) {
 	writeJSON(w, status, errorResponse{
 		Code:      code,
 		Message:   message,
 		RequestID: requestIDFromContext(r.Context()),
+		Details:   details,
 	})
 }
