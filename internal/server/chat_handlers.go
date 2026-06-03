@@ -409,6 +409,7 @@ func (s *Server) handleMarkConversationRead(w http.ResponseWriter, r *http.Reque
 	}
 	response := conversationSettingsResponse{SyncState: makeConversationSyncStateResponse(participant)}
 	s.publishConversationSyncState(r.Context(), participant, "read")
+	s.publishChatReadUpdated(r.Context(), participant)
 	writeJSON(w, http.StatusOK, response)
 }
 
@@ -883,6 +884,15 @@ func (s *Server) publishConversationSyncState(ctx context.Context, participant r
 		UserUUID:       participant.UserID,
 		Reason:         reason,
 		SyncState:      makeConversationSyncStateResponse(participant),
+	})
+}
+
+func (s *Server) publishChatReadUpdated(ctx context.Context, participant repository.ConversationParticipant) {
+	s.publishRealtimeEvent(ctx, []string{participant.UserID}, "chat.read.updated", websocketChatReadUpdatedPayload{
+		ConversationID:    participant.ConversationID,
+		UserUUID:          participant.UserID,
+		LastReadMessageID: participant.LastReadMessageID,
+		UnreadCount:       participant.UnreadCount,
 	})
 }
 

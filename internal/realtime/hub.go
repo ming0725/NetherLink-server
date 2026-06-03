@@ -18,6 +18,13 @@ type Event struct {
 	Payload   json.RawMessage `json:"payload"`
 }
 
+type PresenceState struct {
+	UserID     string    `json:"userUuid"`
+	Status     string    `json:"status"`
+	LastSeenAt time.Time `json:"lastSeenAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+}
+
 type Connection struct {
 	id        string
 	userID    string
@@ -45,12 +52,14 @@ type Hub struct {
 	connections     map[string]*Connection
 	userConnections map[string]map[string]*Connection
 	userEvents      map[string][]Event
+	presence        map[string]PresenceState
 }
 
 type HubSnapshot struct {
 	OnlineConnections         int    `json:"onlineConnections"`
 	OnlineUsers               int    `json:"onlineUsers"`
 	BufferedUsers             int    `json:"bufferedUsers"`
+	PresenceUsers             int    `json:"presenceUsers"`
 	LatestEventSeq            uint64 `json:"latestEventSeq"`
 	MaxReplayEvents           int    `json:"maxReplayEvents"`
 	MemoryReplayRequests      uint64 `json:"memoryReplayRequests"`
@@ -68,6 +77,7 @@ func NewHub() *Hub {
 		connections:     make(map[string]*Connection),
 		userConnections: make(map[string]map[string]*Connection),
 		userEvents:      make(map[string][]Event),
+		presence:        make(map[string]PresenceState),
 	}
 }
 
@@ -99,6 +109,19 @@ func (h *Hub) Connect(userID string, sessionID string, deviceID string, lastEven
 	return conn, replay, syncRequired
 }
 
+func (h *Hub) ReplayForUser(userID string, lastEventSeq uint64) ([]Event, bool) {
+	if h == nil {
+		return nil, false
+	}
+
+	h.mu.Lock()
+	replay, syncRequired := replayEvents(h.userEvents[userID], h.maxUserEvents, lastEventSeq)
+	h.mu.Unlock()
+	h.recordMemoryReplay(len(replay), syncRequired)
+
+	return replay, syncRequired
+}
+
 func (h *Hub) Disconnect(conn *Connection) {
 	if h == nil || conn == nil {
 		return
@@ -116,6 +139,37 @@ func (h *Hub) Disconnect(conn *Connection) {
 		close(conn.done)
 	}
 	h.mu.Unlock()
+}
+
+func (h *Hub) SetPresence(userID string, status string, lastSeenAt time.Time) PresenceState {
+	if h == nil {
+		return PresenceState{}
+	}
+	if lastSeenAt.IsZero() {
+		lastSeenAt = time.Now().UTC()
+	}
+	state := PresenceState{
+		UserID:     userID,
+		Status:     status,
+		LastSeenAt: lastSeenAt.UTC(),
+		UpdatedAt:  time.Now().UTC(),
+	}
+
+	h.mu.Lock()
+	h.presence[userID] = state
+	h.mu.Unlock()
+
+	return state
+}
+
+func (h *Hub) Presence(userID string) (PresenceState, bool) {
+	if h == nil {
+		return PresenceState{}, false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	state, ok := h.presence[userID]
+	return state, ok
 }
 
 func (h *Hub) Publish(userIDs []string, eventType string, payload any) Event {
@@ -209,12 +263,14 @@ func (h *Hub) Snapshot() HubSnapshot {
 	onlineConnections := len(h.connections)
 	onlineUsers := len(h.userConnections)
 	bufferedUsers := len(h.userEvents)
+	presenceUsers := len(h.presence)
 	h.mu.Unlock()
 
 	return HubSnapshot{
 		OnlineConnections:         onlineConnections,
 		OnlineUsers:               onlineUsers,
 		BufferedUsers:             bufferedUsers,
+		PresenceUsers:             presenceUsers,
 		LatestEventSeq:            h.nextSeq.Load(),
 		MaxReplayEvents:           h.maxUserEvents,
 		MemoryReplayRequests:      h.memoryReplayRequests.Load(),

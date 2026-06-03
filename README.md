@@ -26,7 +26,7 @@ Current scope is intentionally small:
 - File metadata and download URLs now enforce business-aware access checks: chat attachments require visible conversation participation, group avatars require group membership or upload ownership, and post media follows public/author visibility.
 - Chat conversation list/open/detail/settings/read/unread endpoints are available, along with message send, history, sender recall, and current-user hidden-history clearing; image attachments require and return `width` and `height` for frontend preview placeholders.
 - Profile, preference, group, file, and post detail resources now return HTTP `ETag` headers; GET detail endpoints honor `If-None-Match` with `304 Not Modified`, and mutable profile/group/file/post writes can reject stale `If-Match` or `expectedVersion` inputs with `409 VERSION_CONFLICT`.
-- WebSocket realtime foundation is available at `GET /api/v1/ws`: access-token auth, per-user connection management, PostgreSQL-backed global event IDs, durable replay, Redis pub/sub fanout, replay metrics, fanout operational counters, `ping`/`realtime.pong`, chat events, notification read sync, friend/group change events, profile/preference change events, post count/version update events, hidden-history sync, and `chat.message.send`.
+- WebSocket realtime foundation is available at `GET /api/v1/ws`: access-token auth, per-user connection management, PostgreSQL-backed global event IDs, durable replay, `resume` / `event.replay`, Redis pub/sub fanout, replay metrics, fanout operational counters, `ping`/`realtime.pong`, chat events, notification read sync, friend/group change events, profile/preference change events, post count/version update events, hidden-history sync, in-process presence state, and `chat.message.send`, `chat.message.recall`, `chat.read`, and `presence.update`.
 - Realtime event cleanup is available: `realtime_events` are retained for the configured window, old events are deleted in batches, and `/readyz` exposes hub, fanout, and cleanup snapshots.
 - Post HTTP handlers are available for feed/detail/create/edit/delete, media binding, likes, follows, comments, replies, comment/reply likes, and comment/reply deletion.
 - Notification HTTP handlers are available for listing notifications, marking all notifications read, and marking one notification read.
@@ -239,7 +239,7 @@ Image message attachments must include positive `width` and `height`. The same f
 
 ## Realtime Boundary
 
-`internal/realtime` is the WebSocket hub plus Redis fanout transport and realtime event cleanup worker. PostgreSQL `realtime_events` assigns globally increasing `evt_N` IDs and stores per-user recipients for durable replay. The in-process hub still tracks online connections by user/session/device and keeps a short per-user replay window as fallback. Connection-control events such as `realtime.ready`, `realtime.pong`, `chat.message.sent`, and `client.error` use `eventSeq: 0` and are not replayed.
+`internal/realtime` is the WebSocket hub plus Redis fanout transport and realtime event cleanup worker. PostgreSQL `realtime_events` assigns globally increasing `evt_N` IDs and stores per-user recipients for durable replay. The in-process hub still tracks online connections by user/session/device, keeps a short per-user replay window as fallback, and stores process-local presence state. Connection-control events such as `realtime.ready`, `realtime.pong`, `event.replay`, `chat.message.sent`, and `client.error` use `eventSeq: 0` and are not replayed.
 
 The realtime cleanup worker deletes `realtime_events` older than `NETHERLINK_REALTIME_EVENT_RETENTION` in batches of `NETHERLINK_REALTIME_EVENT_CLEANUP_BATCH` every `NETHERLINK_REALTIME_EVENT_CLEANUP_INTERVAL`; recipient rows are removed by cascade. `/readyz` includes hub online counts, memory/durable replay counters, Redis fanout publish/receive/error counters, and cleanup last-run state.
 
@@ -247,19 +247,27 @@ Current pushed events:
 
 - `realtime.ready` after successful WebSocket auth.
 - `realtime.pong` when the client sends `{"type":"ping"}`.
-- `chat.message.created` after REST message send succeeds.
-- `chat.message.recalled` after REST sender recall succeeds.
+- `event.replay` after a successful `resume` command when the event backlog is available.
+- `sync.required` when initial replay or `resume` cannot cover the requested backlog window.
+- `chat.message.created` after REST or WebSocket message send succeeds.
+- `chat.message.recalled` after REST or WebSocket sender recall succeeds.
 - `chat.conversation.sync.updated` after read/unread/settings/hidden-history changes and after new messages update participant unread state.
+- `chat.read.updated` after REST or WebSocket read-state updates.
 - `user.profile.updated` and `user.preferences.updated` after profile, avatar, public ID, or preference changes.
 - `friend.group.created`, `friend.updated`, `friend.deleted`, and `friend.request.*` after friend list and request changes.
 - `group.created`, `group.updated`, `group.deleted`, `group.members.added`, `group.member.removed`, `group.member.updated`, `group.owner.transferred`, `group.my_settings.updated`, and `group.join_request.*` after group changes.
 - `notification.read` and `notification.read_all` after notification read-state changes.
 - `post.created`, `post.updated`, `post.deleted`, `post.like.updated`, `post.comment.created`, `post.comment.deleted`, `post.reply.created`, `post.reply.deleted`, `post.comment.like.updated`, `post.reply.like.updated`, and `post.author.follow.updated` after post/count/viewer-state changes.
+- `presence.updated` after `presence.update`; recipients are the user and active friends.
 - `ai.stream.started`, `ai.stream.chunk`, `ai.stream.done`, and `ai.stream.cancelled` as connection-control events for WebSocket AI generation.
 
 Incoming WebSocket command:
 
+- `resume` with `lastEventSeq` or `lastEventId`; it prefers PostgreSQL durable replay and falls back to the in-process replay buffer.
 - `chat.message.send` with `conversationId`, `clientMessageId`, `type`, `content`, `attachments`, `clientSentAt`, and `referencedMessageId`; it reuses the REST chat service validation and idempotency path.
+- `chat.message.recall` with `conversationId` and `messageId`; it reuses REST sender-only recall validation and broadcasts `chat.message.recalled`.
+- `chat.read` with `conversationId`, `lastReadMessageId`, and `lastReadAt`; it marks the conversation read and publishes both sync-state and read-state events.
+- `presence.update` with `status` (`online`, `away`, `busy`, `dnd`, `invisible`, or `offline`); it updates process-local presence, touches `users.last_seen_at` when available, and publishes `presence.updated`.
 - `ai.message.send` with `conversationId`, `clientMessageId`, `message`, and `aiFileIds`; it stores the user message, streams OpenAI-compatible provider chunks, and stores the final assistant message on success.
 - `ai.stream.cancel` with `streamId`; it cancels a same-user in-flight AI stream.
 
@@ -292,4 +300,7 @@ The former `internal/database/postgres_test.go` was a single DSN unit test, not 
 
 ## Next Build Steps
 
-1. Add optional provider embeddings for AI chunk search when a deployment needs semantic retrieval beyond the current BM25-style local scorer.
+1. Add production file-governance controls: MIME and extension allowlists per `targetType`, size and quota enforcement, image EXIF stripping or orientation normalization, and a pluggable malicious-content scanning hook before business binding.
+2. Add lifecycle cleanup for user and AI conversation deletion: soft-delete related metadata, revoke future signed URL access, and queue asynchronous object cleanup according to retention policy.
+3. Add batch compensation sync endpoints or workflows for clients that miss realtime replay windows, building on the existing durable realtime events and operation receipts.
+4. Add optional provider embeddings for AI chunk search when a deployment needs semantic retrieval beyond the current BM25-style local scorer.

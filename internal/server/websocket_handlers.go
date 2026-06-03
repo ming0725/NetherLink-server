@@ -37,15 +37,52 @@ type websocketSyncRequiredPayload struct {
 	LastEventSeq uint64 `json:"lastEventSeq"`
 }
 
+type websocketEventReplayPayload struct {
+	LastEventSeq uint64           `json:"lastEventSeq"`
+	Events       []realtime.Event `json:"events"`
+}
+
 type websocketErrorPayload struct {
 	RequestType string `json:"requestType"`
 	Code        string `json:"code"`
 	Message     string `json:"message"`
 }
 
+type websocketResumePayload struct {
+	LastEventID  string `json:"lastEventId"`
+	LastEventSeq uint64 `json:"lastEventSeq"`
+}
+
 type websocketSendMessagePayload struct {
 	ConversationID string `json:"conversationId"`
 	sendMessageRequest
+}
+
+type websocketRecallMessagePayload struct {
+	ConversationID string `json:"conversationId"`
+	MessageID      string `json:"messageId"`
+}
+
+type websocketChatReadPayload struct {
+	ConversationID string `json:"conversationId"`
+	markConversationReadRequest
+}
+
+type websocketChatReadUpdatedPayload struct {
+	ConversationID    string  `json:"conversationId"`
+	UserUUID          string  `json:"userUuid"`
+	LastReadMessageID *string `json:"lastReadMessageId"`
+	UnreadCount       int     `json:"unreadCount"`
+}
+
+type websocketPresenceUpdatePayload struct {
+	Status string `json:"status"`
+}
+
+type websocketPresenceUpdatedPayload struct {
+	UserUUID   string    `json:"userUuid"`
+	Status     string    `json:"status"`
+	LastSeenAt time.Time `json:"lastSeenAt"`
 }
 
 type websocketMessageSentPayload struct {
@@ -186,8 +223,16 @@ func (s *Server) serveWebSocket(ctx context.Context, conn *websocket.Conn, princ
 			s.realtimeHub.Send(connection, "realtime.pong", map[string]any{
 				"receivedAt": time.Now().UTC(),
 			})
+		case "resume":
+			s.handleWebSocketResume(ctx, connection, principal, message.Payload)
 		case "chat.message.send":
 			s.handleWebSocketSendMessage(ctx, connection, principal, message.Payload)
+		case "chat.message.recall":
+			s.handleWebSocketRecallMessage(ctx, connection, principal, message.Payload)
+		case "chat.read":
+			s.handleWebSocketChatRead(ctx, connection, principal, message.Payload)
+		case "presence.update":
+			s.handleWebSocketPresenceUpdate(ctx, connection, principal, message.Payload)
 		case "ai.message.send":
 			s.handleWebSocketAIMessageSend(ctx, connection, principal, message.Payload)
 		case "ai.stream.cancel":
@@ -238,6 +283,39 @@ func (s *Server) latestRealtimeEventSeq(ctx context.Context) uint64 {
 		s.logger.WarnContext(ctx, "failed to load latest realtime event seq", "error", err)
 	}
 	return s.realtimeHub.LatestEventSeq()
+}
+
+func (s *Server) handleWebSocketResume(ctx context.Context, conn *realtime.Connection, principal AuthPrincipal, payload json.RawMessage) {
+	var req websocketResumePayload
+	if err := json.Unmarshal(payload, &req); err != nil {
+		s.sendWebSocketError(conn, "resume", "VALIDATION_ERROR", "Invalid resume payload")
+		return
+	}
+	lastEventSeq := req.LastEventSeq
+	if lastEventSeq == 0 {
+		lastEventSeq = parseEventSeq(req.LastEventID)
+	}
+	if lastEventSeq == 0 {
+		s.sendWebSocketError(conn, "resume", "VALIDATION_ERROR", "lastEventSeq or lastEventId is required")
+		return
+	}
+
+	replay, syncRequired, ok := s.loadDurableReplay(ctx, principal.UserID, lastEventSeq)
+	if !ok {
+		replay, syncRequired = s.realtimeHub.ReplayForUser(principal.UserID, lastEventSeq)
+	}
+	if syncRequired {
+		s.realtimeHub.Send(conn, "sync.required", websocketSyncRequiredPayload{
+			Reason:       "event backlog expired",
+			LastEventSeq: lastEventSeq,
+		})
+		return
+	}
+
+	s.realtimeHub.Send(conn, "event.replay", websocketEventReplayPayload{
+		LastEventSeq: lastEventSeq,
+		Events:       replay,
+	})
 }
 
 func (s *Server) handleWebSocketSendMessage(ctx context.Context, conn *realtime.Connection, principal AuthPrincipal, payload json.RawMessage) {
@@ -293,6 +371,111 @@ func (s *Server) handleWebSocketSendMessage(ctx context.Context, conn *realtime.
 	s.realtimeHub.Send(conn, "chat.message.sent", websocketMessageSentPayload{
 		ClientMessageID: req.ClientMessageID,
 		Message:         response,
+	})
+}
+
+func (s *Server) handleWebSocketRecallMessage(ctx context.Context, conn *realtime.Connection, principal AuthPrincipal, payload json.RawMessage) {
+	if s.chatService == nil {
+		s.sendWebSocketError(conn, "chat.message.recall", "SERVICE_NOT_READY", "Chat service is not configured")
+		return
+	}
+
+	var req websocketRecallMessagePayload
+	if err := json.Unmarshal(payload, &req); err != nil {
+		s.sendWebSocketError(conn, "chat.message.recall", "VALIDATION_ERROR", "Invalid recall payload")
+		return
+	}
+	if err := validateUUID(req.ConversationID, "conversationId"); err != nil {
+		s.sendWebSocketError(conn, "chat.message.recall", err.Code, err.Message)
+		return
+	}
+	if err := validateUUID(req.MessageID, "messageId"); err != nil {
+		s.sendWebSocketError(conn, "chat.message.recall", err.Code, err.Message)
+		return
+	}
+
+	message, err := s.chatService.RecallMessage(ctx, chatsvc.RecallMessageInput{
+		UserID:         principal.UserID,
+		ConversationID: req.ConversationID,
+		MessageID:      req.MessageID,
+	})
+	if err != nil {
+		code, message := chatErrorCodeAndMessage(err)
+		s.sendWebSocketError(conn, "chat.message.recall", code, message)
+		return
+	}
+
+	response, err := s.makeMessageResponseFromContext(ctx, message)
+	if err != nil {
+		s.logger.WarnContext(ctx, "failed to build websocket recall response", "error", err)
+		s.sendWebSocketError(conn, "chat.message.recall", "INTERNAL_ERROR", "Internal server error")
+		return
+	}
+
+	s.publishConversationMessage(ctx, req.ConversationID, "chat.message.recalled", response)
+}
+
+func (s *Server) handleWebSocketChatRead(ctx context.Context, conn *realtime.Connection, principal AuthPrincipal, payload json.RawMessage) {
+	if s.chatService == nil {
+		s.sendWebSocketError(conn, "chat.read", "SERVICE_NOT_READY", "Chat service is not configured")
+		return
+	}
+
+	var req websocketChatReadPayload
+	if err := json.Unmarshal(payload, &req); err != nil {
+		s.sendWebSocketError(conn, "chat.read", "VALIDATION_ERROR", "Invalid read payload")
+		return
+	}
+	if err := validateUUID(req.ConversationID, "conversationId"); err != nil {
+		s.sendWebSocketError(conn, "chat.read", err.Code, err.Message)
+		return
+	}
+	if req.LastReadMessageID != nil {
+		if err := validateUUID(*req.LastReadMessageID, "lastReadMessageId"); err != nil {
+			s.sendWebSocketError(conn, "chat.read", err.Code, err.Message)
+			return
+		}
+	}
+
+	participant, err := s.chatService.MarkConversationRead(ctx, chatsvc.MarkConversationReadInput{
+		UserID:            principal.UserID,
+		ConversationID:    req.ConversationID,
+		LastReadMessageID: req.LastReadMessageID,
+		LastReadAt:        req.LastReadAt,
+	})
+	if err != nil {
+		code, message := chatErrorCodeAndMessage(err)
+		s.sendWebSocketError(conn, "chat.read", code, message)
+		return
+	}
+
+	s.publishConversationSyncState(ctx, participant, "read")
+	s.publishChatReadUpdated(ctx, participant)
+}
+
+func (s *Server) handleWebSocketPresenceUpdate(ctx context.Context, conn *realtime.Connection, principal AuthPrincipal, payload json.RawMessage) {
+	var req websocketPresenceUpdatePayload
+	if err := json.Unmarshal(payload, &req); err != nil {
+		s.sendWebSocketError(conn, "presence.update", "VALIDATION_ERROR", "Invalid presence payload")
+		return
+	}
+	status := normalizePresenceStatus(req.Status)
+	if status == "" {
+		s.sendWebSocketError(conn, "presence.update", "VALIDATION_ERROR", "Invalid presence status")
+		return
+	}
+
+	now := time.Now().UTC()
+	if s.repos.Users != nil {
+		if err := s.repos.Users.TouchLastSeen(ctx, principal.UserID, now); err != nil {
+			s.logger.WarnContext(ctx, "failed to touch user last seen for presence update", "error", err, "user_id", principal.UserID)
+		}
+	}
+	state := s.realtimeHub.SetPresence(principal.UserID, status, now)
+	s.publishPresenceRealtimeEvent(ctx, principal.UserID, websocketPresenceUpdatedPayload{
+		UserUUID:   principal.UserID,
+		Status:     state.Status,
+		LastSeenAt: state.LastSeenAt,
 	})
 }
 
@@ -453,6 +636,15 @@ func parseEventSeq(value string) uint64 {
 		return 0
 	}
 	return parsed
+}
+
+func normalizePresenceStatus(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "online", "away", "busy", "dnd", "invisible", "offline":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
 }
 
 func (s *Server) publishRealtimeEvent(ctx context.Context, userIDs []string, eventType string, payload any) realtime.Event {

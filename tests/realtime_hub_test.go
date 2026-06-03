@@ -114,6 +114,46 @@ func TestRealtimeHubSnapshotTracksReplayMetrics(t *testing.T) {
 	}
 }
 
+func TestRealtimeHubReplayForUser(t *testing.T) {
+	hub := realtime.NewHub()
+	first := hub.Publish([]string{"user_a"}, "event.first", nil)
+	second := hub.Publish([]string{"user_a"}, "event.second", nil)
+	hub.Publish([]string{"user_b"}, "event.other", nil)
+
+	replay, syncRequired := hub.ReplayForUser("user_a", first.EventSeq)
+	if syncRequired {
+		t.Fatal("syncRequired = true, want false")
+	}
+	if len(replay) != 1 || replay[0].EventSeq != second.EventSeq {
+		t.Fatalf("replay = %+v, want second event", replay)
+	}
+
+	snapshot := hub.Snapshot()
+	if snapshot.MemoryReplayRequests != 1 || snapshot.MemoryReplayEvents != 1 {
+		t.Fatalf("memory replay snapshot = %+v, want one request and one event", snapshot)
+	}
+}
+
+func TestRealtimeHubPresenceState(t *testing.T) {
+	hub := realtime.NewHub()
+	seenAt := time.Date(2026, 6, 3, 10, 20, 30, 0, time.UTC)
+
+	state := hub.SetPresence("user_a", "away", seenAt)
+	if state.UserID != "user_a" || state.Status != "away" || !state.LastSeenAt.Equal(seenAt) {
+		t.Fatalf("presence state = %+v, want user_a away at seenAt", state)
+	}
+
+	stored, ok := hub.Presence("user_a")
+	if !ok || stored.Status != "away" {
+		t.Fatalf("stored presence = %+v ok=%v, want away", stored, ok)
+	}
+
+	snapshot := hub.Snapshot()
+	if snapshot.PresenceUsers != 1 {
+		t.Fatalf("presence users = %d, want 1", snapshot.PresenceUsers)
+	}
+}
+
 func TestRedisFanoutSnapshotReportsConfiguredChannel(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 	defer client.Close()

@@ -8,6 +8,19 @@ func (s *Server) publishSelfRealtimeEvent(ctx context.Context, userID string, ev
 	s.publishRealtimeEvent(ctx, []string{userID}, eventType, payload)
 }
 
+func (s *Server) publishPresenceRealtimeEvent(ctx context.Context, userID string, payload any) {
+	userIDs := []string{userID}
+	if s.repos.Friends != nil {
+		friendUserIDs, err := s.repos.Friends.ListActiveFriendUserIDs(ctx, userID)
+		if err != nil {
+			s.logger.WarnContext(ctx, "failed to list presence realtime recipients", "error", err, "user_id", userID)
+		} else {
+			userIDs = append(userIDs, friendUserIDs...)
+		}
+	}
+	s.publishRealtimeEvent(ctx, uniqueRealtimeUserIDs(userIDs), "presence.updated", payload)
+}
+
 func (s *Server) publishProfileRealtimeEvent(ctx context.Context, userID string, payload any) {
 	userIDs := []string{userID}
 	if s.repos.Friends != nil {
