@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
@@ -28,6 +29,7 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 
+	"nlserver/internal/config"
 	"nlserver/internal/repository"
 	"nlserver/internal/storage"
 )
@@ -48,6 +50,7 @@ const (
 )
 
 type ProcessingWorker struct {
+	cfg     config.StorageConfig
 	repos   repository.Repositories
 	db      repository.TxBeginner
 	storage storage.ObjectStorageProvider
@@ -76,12 +79,13 @@ type audioProcessingResult struct {
 }
 
 type aiParseResult struct {
-	UploadedFileIDs       []string `json:"uploadedFileIds"`
-	ChunkCount            int      `json:"chunkCount"`
-	TokenCount            int      `json:"tokenCount"`
-	Truncated             bool     `json:"truncated"`
-	Parser                string   `json:"parser"`
-	SourceDeleteRequested bool     `json:"sourceDeleteRequested"`
+	UploadedFileIDs       []string          `json:"uploadedFileIds"`
+	ExtractedTextFileIDs  map[string]string `json:"extractedTextFileIds,omitempty"`
+	ChunkCount            int               `json:"chunkCount"`
+	TokenCount            int               `json:"tokenCount"`
+	Truncated             bool              `json:"truncated"`
+	Parser                string            `json:"parser"`
+	SourceDeleteRequested bool              `json:"sourceDeleteRequested"`
 }
 
 type ffprobeOutput struct {
@@ -97,11 +101,24 @@ type ffprobeOutput struct {
 	} `json:"format"`
 }
 
-func NewProcessingWorker(repos repository.Repositories, db repository.TxBeginner, provider storage.ObjectStorageProvider, logger *slog.Logger) *ProcessingWorker {
+type aiExtractedTextObject struct {
+	UploadedFileID string
+	FileID         string
+	OwnerUserID    string
+	Bucket         string
+	ObjectKey      string
+	FileName       string
+	SizeBytes      int64
+	ETag           *string
+	ContentHash    *string
+}
+
+func NewProcessingWorker(cfg config.StorageConfig, repos repository.Repositories, db repository.TxBeginner, provider storage.ObjectStorageProvider, logger *slog.Logger) *ProcessingWorker {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &ProcessingWorker{
+		cfg:     cfg,
 		repos:   repos,
 		db:      db,
 		storage: provider,
@@ -317,7 +334,7 @@ func (w *ProcessingWorker) processAIParse(ctx context.Context, job repository.Fi
 	}
 	if len(uploadedFiles) == 0 {
 		result := aiParseResult{UploadedFileIDs: []string{}}
-		return w.finishAIParseJob(ctx, job, file.ID, uploadedFiles, nil, "", result)
+		return w.finishAIParseJob(ctx, job, file.ID, uploadedFiles, nil, nil, "", result)
 	}
 	if err := w.repos.AI.SetUploadedFilesParseStatusByFileID(ctx, file.ID, "processing", 0); err != nil {
 		return w.failAIParseJob(ctx, job, file.ID, "AI_PARSE_STATUS_FAILED", map[string]string{"error": err.Error()})
@@ -338,6 +355,10 @@ func (w *ProcessingWorker) processAIParse(ctx context.Context, job repository.Fi
 	for _, uploadedFile := range uploadedFiles {
 		uploadedFileIDs = append(uploadedFileIDs, uploadedFile.ID)
 	}
+	extractedTextObjects, err := w.createAIExtractedTextObjects(ctx, file, uploadedFiles, parsed.Text)
+	if err != nil {
+		return w.failAIParseJob(ctx, job, file.ID, "AI_EXTRACTED_TEXT_STORE_FAILED", map[string]string{"error": err.Error()})
+	}
 	result := aiParseResult{
 		UploadedFileIDs:       uploadedFileIDs,
 		ChunkCount:            len(chunks),
@@ -346,7 +367,8 @@ func (w *ProcessingWorker) processAIParse(ctx context.Context, job repository.Fi
 		Parser:                parsed.Parser,
 		SourceDeleteRequested: shouldDeleteAIParseSource(uploadedFiles),
 	}
-	if err := w.finishAIParseJob(ctx, job, file.ID, uploadedFiles, chunks, parsed.Parser, result); err != nil {
+	if err := w.finishAIParseJob(ctx, job, file.ID, uploadedFiles, extractedTextObjects, chunks, parsed.Parser, result); err != nil {
+		w.deleteAIExtractedTextObjects(ctx, extractedTextObjects)
 		return err
 	}
 	if result.SourceDeleteRequested {
@@ -551,7 +573,16 @@ func (w *ProcessingWorker) finishAudioJob(ctx context.Context, job repository.Fi
 	})
 }
 
-func (w *ProcessingWorker) finishAIParseJob(ctx context.Context, job repository.FileProcessingJob, fileID string, uploadedFiles []repository.AIUploadedFile, chunkTexts []string, parser string, result aiParseResult) error {
+func (w *ProcessingWorker) finishAIParseJob(ctx context.Context, job repository.FileProcessingJob, fileID string, uploadedFiles []repository.AIUploadedFile, extractedTextObjects []aiExtractedTextObject, chunkTexts []string, parser string, result aiParseResult) error {
+	extractedTextByAIFileID := map[string]aiExtractedTextObject{}
+	for _, object := range extractedTextObjects {
+		extractedTextByAIFileID[object.UploadedFileID] = object
+		if result.ExtractedTextFileIDs == nil {
+			result.ExtractedTextFileIDs = map[string]string{}
+		}
+		result.ExtractedTextFileIDs[object.UploadedFileID] = object.FileID
+	}
+
 	resultJSON, err := json.Marshal(result)
 	if err != nil {
 		return err
@@ -562,6 +593,41 @@ func (w *ProcessingWorker) finishAIParseJob(ctx context.Context, job repository.
 			return errors.New("ai repository unavailable")
 		}
 		for _, uploadedFile := range uploadedFiles {
+			if object, ok := extractedTextByAIFileID[uploadedFile.ID]; ok {
+				createdFile, err := repos.Files.Create(ctx, repository.CreateFileParams{
+					ID:               object.FileID,
+					OwnerUserID:      object.OwnerUserID,
+					OriginalFileName: object.FileName,
+					Bucket:           object.Bucket,
+					ObjectKey:        object.ObjectKey,
+					MimeType:         "text/plain; charset=utf-8",
+					SizeBytes:        object.SizeBytes,
+					ContentHash:      object.ContentHash,
+					Visibility:       "private",
+				})
+				if err != nil {
+					return err
+				}
+				if _, err := repos.Files.MarkUploaded(ctx, createdFile.ID, object.ETag, object.ContentHash, object.SizeBytes); err != nil {
+					return err
+				}
+				if _, err := repos.Files.MarkStatus(ctx, createdFile.ID, fileStatusReady); err != nil {
+					return err
+				}
+				if _, err := repos.Files.CreateUsage(ctx, repository.CreateFileUsageParams{
+					FileID:      createdFile.ID,
+					UsageType:   "ai_extracted_text",
+					BusinessID:  uploadedFile.ID,
+					OwnerUserID: object.OwnerUserID,
+					Visibility:  "private",
+				}); err != nil {
+					return err
+				}
+				if _, err := repos.AI.SetUploadedFileExtractedTextFile(ctx, uploadedFile.ID, createdFile.ID); err != nil {
+					return err
+				}
+			}
+
 			chunks := make([]repository.CreateAIFileChunkParams, 0, len(chunkTexts))
 			for index, content := range chunkTexts {
 				metadata, err := json.Marshal(map[string]any{
@@ -590,6 +656,83 @@ func (w *ProcessingWorker) finishAIParseJob(ctx context.Context, job repository.
 		_, err := repos.Files.MarkProcessingJobSucceeded(ctx, job.ID, resultJSON)
 		return err
 	})
+}
+
+func (w *ProcessingWorker) createAIExtractedTextObjects(ctx context.Context, sourceFile repository.File, uploadedFiles []repository.AIUploadedFile, text string) ([]aiExtractedTextObject, error) {
+	if len(uploadedFiles) == 0 {
+		return []aiExtractedTextObject{}, nil
+	}
+	if sourceFile.OwnerUserID == nil || strings.TrimSpace(*sourceFile.OwnerUserID) == "" {
+		return nil, errors.New("source file owner is required")
+	}
+
+	textBytes := []byte(text)
+	sum := sha256.Sum256(textBytes)
+	contentHash := "sha256:" + hex.EncodeToString(sum[:])
+	bucket := strings.TrimSpace(w.cfg.Buckets.Private)
+	if bucket == "" {
+		bucket = sourceFile.Bucket
+	}
+
+	objects := make([]aiExtractedTextObject, 0, len(uploadedFiles))
+	for _, uploadedFile := range uploadedFiles {
+		if uploadedFile.ExtractedTextFileID != nil && strings.TrimSpace(*uploadedFile.ExtractedTextFileID) != "" {
+			continue
+		}
+		fileID, err := newUUIDString()
+		if err != nil {
+			w.deleteAIExtractedTextObjects(ctx, objects)
+			return nil, err
+		}
+		objectKey := fmt.Sprintf("ai/extracted-text/%s/%s/%s.txt", normalizePathSegment(*sourceFile.OwnerUserID), uploadedFile.ID, fileID)
+		put, err := w.storage.PutObject(ctx, storage.PutObjectInput{
+			Bucket:      bucket,
+			ObjectKey:   objectKey,
+			Body:        bytes.NewReader(textBytes),
+			SizeBytes:   int64(len(textBytes)),
+			ContentType: "text/plain; charset=utf-8",
+			Metadata: map[string]string{
+				"content-hash":   contentHash,
+				"source-file-id": sourceFile.ID,
+				"ai-file-id":     uploadedFile.ID,
+			},
+		})
+		if err != nil {
+			w.deleteAIExtractedTextObjects(ctx, objects)
+			return nil, err
+		}
+
+		etag := strings.TrimSpace(put.ETag)
+		object := aiExtractedTextObject{
+			UploadedFileID: uploadedFile.ID,
+			FileID:         fileID,
+			OwnerUserID:    *sourceFile.OwnerUserID,
+			Bucket:         bucket,
+			ObjectKey:      objectKey,
+			FileName:       extractedTextFileName(sourceFile.OriginalFileName),
+			SizeBytes:      int64(len(textBytes)),
+			ContentHash:    &contentHash,
+		}
+		if etag != "" {
+			object.ETag = &etag
+		}
+		objects = append(objects, object)
+	}
+	return objects, nil
+}
+
+func (w *ProcessingWorker) deleteAIExtractedTextObjects(ctx context.Context, objects []aiExtractedTextObject) {
+	for _, object := range objects {
+		if object.Bucket == "" || object.ObjectKey == "" {
+			continue
+		}
+		if err := w.storage.DeleteObject(ctx, storage.DeleteObjectInput{
+			Bucket:    object.Bucket,
+			ObjectKey: object.ObjectKey,
+		}); err != nil {
+			w.logger.Warn("AI extracted text object cleanup failed", "file_id", object.FileID, "error", err)
+		}
+	}
 }
 
 func (w *ProcessingWorker) failAIParseJob(ctx context.Context, job repository.FileProcessingJob, fileID string, errorCode string, payload any) error {
@@ -783,6 +926,15 @@ func videoCoverObjectKey(sourceObjectKey string) string {
 		dir = "variants"
 	}
 	return strings.TrimRight(dir, "/") + "/video_cover_512.jpg"
+}
+
+func extractedTextFileName(sourceFileName string) string {
+	name := safeFileName(sourceFileName)
+	extension := filepath.Ext(name)
+	if extension == "" {
+		return name + ".extracted.txt"
+	}
+	return strings.TrimSuffix(name, extension) + ".extracted.txt"
 }
 
 func shouldDeleteAIParseSource(uploadedFiles []repository.AIUploadedFile) bool {

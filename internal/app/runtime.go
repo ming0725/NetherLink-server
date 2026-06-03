@@ -102,7 +102,7 @@ func NewRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*R
 	case err == nil:
 		runtime.StorageProvider = storageProvider
 		runtime.FileService = filesvc.NewService(cfg.Storage, repos, db, storageProvider)
-		runtime.FileWorker = filesvc.NewProcessingWorker(repos, db, storageProvider, logger)
+		runtime.FileWorker = filesvc.NewProcessingWorker(cfg.Storage, repos, db, storageProvider, logger)
 		runtime.FileCleanup = filesvc.NewCleanupWorker(repos, storageProvider, logger)
 		runtime.fileWorkerDone = runtime.FileWorker.Start(runtimeCtx)
 		runtime.fileCleanupDone = runtime.FileCleanup.Start(runtimeCtx)

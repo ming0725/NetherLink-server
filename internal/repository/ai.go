@@ -479,6 +479,20 @@ func (r *AIRepository) SetUploadedFileParseStatus(ctx context.Context, aiFileID 
 	return file, translateWriteError(err)
 }
 
+func (r *AIRepository) SetUploadedFileExtractedTextFile(ctx context.Context, aiFileID string, extractedTextFileID string) (AIUploadedFile, error) {
+	file, err := scanAIUploadedFile(r.db.QueryRow(ctx, `
+		UPDATE ai_uploaded_files
+		SET extracted_text_file_id = $2::uuid,
+		    updated_at = now()
+		WHERE id = $1::uuid
+		  AND deleted_at IS NULL
+		RETURNING `+aiUploadedFileSelectColumns,
+		normalizeText(aiFileID),
+		normalizeText(extractedTextFileID),
+	))
+	return file, translateWriteError(err)
+}
+
 func (r *AIRepository) SetUploadedFilesParseStatusByFileID(ctx context.Context, fileID string, status string, tokenCount int) error {
 	_, err := r.db.Exec(ctx, `
 		UPDATE ai_uploaded_files
@@ -599,7 +613,7 @@ func (r *AIRepository) DeleteUploadedFile(ctx context.Context, userID string, ai
 			UPDATE file_usages fu
 			SET deleted_at = now()
 			FROM deleted
-			WHERE fu.usage_type = 'ai_upload'
+			WHERE fu.usage_type IN ('ai_upload', 'ai_extracted_text')
 			  AND fu.business_id = deleted.id
 			  AND fu.deleted_at IS NULL
 			RETURNING fu.id
