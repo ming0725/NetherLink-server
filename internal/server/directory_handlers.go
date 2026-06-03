@@ -18,8 +18,9 @@ type batchUsersRequest struct {
 }
 
 type createFriendGroupRequest struct {
-	Name      string `json:"name"`
-	SortOrder int    `json:"sortOrder"`
+	Name              string `json:"name"`
+	SortOrder         int    `json:"sortOrder"`
+	ClientOperationID string `json:"clientOperationId"`
 }
 
 type patchFriendRequest struct {
@@ -29,11 +30,12 @@ type patchFriendRequest struct {
 }
 
 type createFriendRequestRequest struct {
-	ToUserUUID       string  `json:"toUserUuid"`
-	Message          *string `json:"message"`
-	SourceType       *string `json:"sourceType"`
-	SourceGroupID    *string `json:"sourceGroupId"`
-	SourceFriendUUID *string `json:"sourceFriendUuid"`
+	ToUserUUID        string  `json:"toUserUuid"`
+	Message           *string `json:"message"`
+	SourceType        *string `json:"sourceType"`
+	SourceGroupID     *string `json:"sourceGroupId"`
+	SourceFriendUUID  *string `json:"sourceFriendUuid"`
+	ClientOperationID string  `json:"clientOperationId"`
 }
 
 type acceptFriendRequestRequest struct {
@@ -42,9 +44,10 @@ type acceptFriendRequestRequest struct {
 }
 
 type createGroupRequest struct {
-	Name         string   `json:"name"`
-	MemberIDs    []string `json:"memberIds"`
-	AvatarFileID *string  `json:"avatarFileId"`
+	Name              string   `json:"name"`
+	MemberIDs         []string `json:"memberIds"`
+	AvatarFileID      *string  `json:"avatarFileId"`
+	ClientOperationID string   `json:"clientOperationId"`
 }
 
 type patchGroupRequest struct {
@@ -56,7 +59,8 @@ type patchGroupRequest struct {
 }
 
 type addGroupMembersRequest struct {
-	UserUUIDs []string `json:"userUuids"`
+	UserUUIDs         []string `json:"userUuids"`
+	ClientOperationID string   `json:"clientOperationId"`
 }
 
 type patchGroupMemberRequest struct {
@@ -77,8 +81,9 @@ type patchGroupMySettingsRequest struct {
 }
 
 type createGroupJoinRequestRequest struct {
-	GroupID string  `json:"groupId"`
-	Message *string `json:"message"`
+	GroupID           string  `json:"groupId"`
+	Message           *string `json:"message"`
+	ClientOperationID string  `json:"clientOperationId"`
 }
 
 type usersListResponse struct {
@@ -379,19 +384,26 @@ func (s *Server) handleCreateFriendGroup(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	group, err := s.friendService.CreateGroup(r.Context(), friendsvc.CreateGroupInput{
-		UserID:    principal.UserID,
-		Name:      req.Name,
-		SortOrder: req.SortOrder,
-	})
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "friend.group.create", idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writeFriendServiceError(w, r, err)
-		return
-	}
-
-	response := friendGroupDetailResponse{Group: makeFriendGroupResponse(group)}
-	s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "friend.group.created", response)
-	writeJSON(w, http.StatusCreated, response)
+	}, func() (idempotentHTTPResult, error) {
+		group, err := s.friendService.CreateGroup(r.Context(), friendsvc.CreateGroupInput{
+			UserID:    principal.UserID,
+			Name:      req.Name,
+			SortOrder: req.SortOrder,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		response := friendGroupDetailResponse{Group: makeFriendGroupResponse(group)}
+		return idempotentHTTPResult{
+			Status: http.StatusCreated,
+			Body:   response,
+			After: func() {
+				s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "friend.group.created", response)
+			},
+		}, nil
+	})
 }
 
 func (s *Server) handleFriends(w http.ResponseWriter, r *http.Request) {
@@ -534,22 +546,29 @@ func (s *Server) handleCreateFriendRequest(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	request, err := s.friendService.CreateRequest(r.Context(), friendsvc.CreateRequestInput{
-		FromUserID:     principal.UserID,
-		ToUserID:       req.ToUserUUID,
-		Message:        req.Message,
-		SourceType:     req.SourceType,
-		SourceGroupID:  req.SourceGroupID,
-		SourceFriendID: req.SourceFriendUUID,
-	})
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "friend.request.create:"+req.ToUserUUID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writeFriendServiceError(w, r, err)
-		return
-	}
-
-	response := friendRequestDetailResponse{Request: makeFriendRequestResponse(request)}
-	s.publishRealtimeEvent(r.Context(), []string{request.FromUser.ID, request.ToUser.ID}, "friend.request.created", response)
-	writeJSON(w, http.StatusCreated, response)
+	}, func() (idempotentHTTPResult, error) {
+		request, err := s.friendService.CreateRequest(r.Context(), friendsvc.CreateRequestInput{
+			FromUserID:     principal.UserID,
+			ToUserID:       req.ToUserUUID,
+			Message:        req.Message,
+			SourceType:     req.SourceType,
+			SourceGroupID:  req.SourceGroupID,
+			SourceFriendID: req.SourceFriendUUID,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		response := friendRequestDetailResponse{Request: makeFriendRequestResponse(request)}
+		return idempotentHTTPResult{
+			Status: http.StatusCreated,
+			Body:   response,
+			After: func() {
+				s.publishRealtimeEvent(r.Context(), []string{request.FromUser.ID, request.ToUser.ID}, "friend.request.created", response)
+			},
+		}, nil
+	})
 }
 
 func (s *Server) handleFriendRequests(w http.ResponseWriter, r *http.Request) {
@@ -718,20 +737,28 @@ func (s *Server) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	group, err := s.groupService.CreateGroup(r.Context(), groupsvc.CreateGroupInput{
-		UserID:       principal.UserID,
-		Name:         req.Name,
-		MemberIDs:    req.MemberIDs,
-		AvatarFileID: req.AvatarFileID,
-	})
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "group.create", idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writeGroupServiceError(w, r, err)
-		return
-	}
-
-	response := groupDetailResponse{Group: makeGroupResponse(group)}
-	s.publishGroupRealtimeEvent(r.Context(), group.Group.ID, "group.created", response)
-	writeJSONWithETag(w, r, http.StatusCreated, response.Group.ETag, response)
+	}, func() (idempotentHTTPResult, error) {
+		group, err := s.groupService.CreateGroup(r.Context(), groupsvc.CreateGroupInput{
+			UserID:       principal.UserID,
+			Name:         req.Name,
+			MemberIDs:    req.MemberIDs,
+			AvatarFileID: req.AvatarFileID,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		response := groupDetailResponse{Group: makeGroupResponse(group)}
+		return idempotentHTTPResult{
+			Status: http.StatusCreated,
+			ETag:   response.Group.ETag,
+			Body:   response,
+			After: func() {
+				s.publishGroupRealtimeEvent(r.Context(), group.Group.ID, "group.created", response)
+			},
+		}, nil
+	})
 }
 
 func (s *Server) handleGroupDetail(w http.ResponseWriter, r *http.Request) {
@@ -928,19 +955,26 @@ func (s *Server) handleAddGroupMembers(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	members, err := s.groupService.AddMembers(r.Context(), groupsvc.AddMembersInput{
-		UserID:  principal.UserID,
-		GroupID: groupID,
-		UserIDs: req.UserUUIDs,
-	})
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "group.members.add:"+groupID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writeGroupServiceError(w, r, err)
-		return
-	}
-
-	response := groupMembersResponse{Members: makeGroupMemberResponses(members), Total: len(members)}
-	s.publishGroupRealtimeEvent(r.Context(), groupID, "group.members.added", response)
-	writeJSON(w, http.StatusCreated, response)
+	}, func() (idempotentHTTPResult, error) {
+		members, err := s.groupService.AddMembers(r.Context(), groupsvc.AddMembersInput{
+			UserID:  principal.UserID,
+			GroupID: groupID,
+			UserIDs: req.UserUUIDs,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		response := groupMembersResponse{Members: makeGroupMemberResponses(members), Total: len(members)}
+		return idempotentHTTPResult{
+			Status: http.StatusCreated,
+			Body:   response,
+			After: func() {
+				s.publishGroupRealtimeEvent(r.Context(), groupID, "group.members.added", response)
+			},
+		}, nil
+	})
 }
 
 func (s *Server) handleRemoveGroupMember(w http.ResponseWriter, r *http.Request) {
@@ -1137,27 +1171,34 @@ func (s *Server) handleCreateGroupJoinRequest(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	request, err := s.groupService.CreateJoinRequest(r.Context(), groupsvc.CreateJoinRequestInput{
-		UserID:  principal.UserID,
-		GroupID: req.GroupID,
-		Message: req.Message,
-	})
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "group.join_request.create:"+req.GroupID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writeGroupServiceError(w, r, err)
-		return
-	}
-
-	response := groupJoinRequestDetailResponse{Request: makeGroupJoinRequestResponse(request)}
-	recipients := []string{request.ActorUser.ID}
-	if s.repos.Groups != nil {
-		if userIDs, err := s.repos.Groups.ListPrivilegedMemberUserIDs(r.Context(), request.Group.ID); err == nil {
-			recipients = append(recipients, userIDs...)
-		} else {
-			s.logger.WarnContext(r.Context(), "failed to list group join request realtime recipients", "error", err, "group_id", request.Group.ID)
+	}, func() (idempotentHTTPResult, error) {
+		request, err := s.groupService.CreateJoinRequest(r.Context(), groupsvc.CreateJoinRequestInput{
+			UserID:  principal.UserID,
+			GroupID: req.GroupID,
+			Message: req.Message,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
 		}
-	}
-	s.publishGroupRealtimeEventTo(r.Context(), recipients, "group.join_request.created", response)
-	writeJSON(w, http.StatusCreated, response)
+		response := groupJoinRequestDetailResponse{Request: makeGroupJoinRequestResponse(request)}
+		return idempotentHTTPResult{
+			Status: http.StatusCreated,
+			Body:   response,
+			After: func() {
+				recipients := []string{request.ActorUser.ID}
+				if s.repos.Groups != nil {
+					if userIDs, err := s.repos.Groups.ListPrivilegedMemberUserIDs(r.Context(), request.Group.ID); err == nil {
+						recipients = append(recipients, userIDs...)
+					} else {
+						s.logger.WarnContext(r.Context(), "failed to list group join request realtime recipients", "error", err, "group_id", request.Group.ID)
+					}
+				}
+				s.publishGroupRealtimeEventTo(r.Context(), recipients, "group.join_request.created", response)
+			},
+		}, nil
+	})
 }
 
 func (s *Server) handleGroupNotifications(w http.ResponseWriter, r *http.Request) {

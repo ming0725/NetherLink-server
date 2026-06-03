@@ -25,11 +25,12 @@ type postMediaRequest struct {
 }
 
 type createPostRequest struct {
-	Title            *string            `json:"title"`
-	Content          string             `json:"content"`
-	ContentCreatedAt *time.Time         `json:"contentCreatedAt"`
-	Visibility       string             `json:"visibility"`
-	Media            []postMediaRequest `json:"media"`
+	Title             *string            `json:"title"`
+	Content           string             `json:"content"`
+	ContentCreatedAt  *time.Time         `json:"contentCreatedAt"`
+	Visibility        string             `json:"visibility"`
+	Media             []postMediaRequest `json:"media"`
+	ClientOperationID string             `json:"clientOperationId"`
 }
 
 type patchPostRequest struct {
@@ -49,13 +50,15 @@ type setFollowedRequest struct {
 }
 
 type createPostCommentRequest struct {
-	Content string `json:"content"`
+	Content           string `json:"content"`
+	ClientOperationID string `json:"clientOperationId"`
 }
 
 type createPostReplyRequest struct {
-	Content        string  `json:"content"`
-	TargetUserUUID *string `json:"targetUserUuid"`
-	TargetReplyID  *string `json:"targetReplyId"`
+	Content           string  `json:"content"`
+	TargetUserUUID    *string `json:"targetUserUuid"`
+	TargetReplyID     *string `json:"targetReplyId"`
+	ClientOperationID string  `json:"clientOperationId"`
 }
 
 type postsResponse struct {
@@ -207,21 +210,30 @@ func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, r, reqErr)
 		return
 	}
-	post, err := s.postService.CreatePost(r.Context(), postsvc.CreatePostInput{
-		AuthorID:         principal.UserID,
-		Title:            req.Title,
-		Content:          req.Content,
-		ContentCreatedAt: req.ContentCreatedAt,
-		Visibility:       req.Visibility,
-		Media:            makePostMediaInputs(req.Media),
-	})
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "post.create", idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writePostServiceError(w, r, err)
-		return
-	}
-	response := postDetailResponse{Post: makePostResponse(post, true)}
-	s.publishRealtimeEvent(r.Context(), []string{principal.UserID}, "post.created", response)
-	writeJSONWithETag(w, r, http.StatusCreated, response.Post.ETag, response)
+	}, func() (idempotentHTTPResult, error) {
+		post, err := s.postService.CreatePost(r.Context(), postsvc.CreatePostInput{
+			AuthorID:         principal.UserID,
+			Title:            req.Title,
+			Content:          req.Content,
+			ContentCreatedAt: req.ContentCreatedAt,
+			Visibility:       req.Visibility,
+			Media:            makePostMediaInputs(req.Media),
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		response := postDetailResponse{Post: makePostResponse(post, true)}
+		return idempotentHTTPResult{
+			Status: http.StatusCreated,
+			ETag:   response.Post.ETag,
+			Body:   response,
+			After: func() {
+				s.publishRealtimeEvent(r.Context(), []string{principal.UserID}, "post.created", response)
+			},
+		}, nil
+	})
 }
 
 func (s *Server) handleGetPost(w http.ResponseWriter, r *http.Request) {
@@ -461,20 +473,28 @@ func (s *Server) handleCreatePostComment(w http.ResponseWriter, r *http.Request)
 		writeRequestError(w, r, err)
 		return
 	}
-	comment, err := s.postService.CreateComment(r.Context(), postsvc.CreateCommentInput{
-		PostID:   postID,
-		AuthorID: principal.UserID,
-		Content:  req.Content,
-	})
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "post.comment.create:"+postID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writePostServiceError(w, r, err)
-		return
-	}
-	response := postCommentDetailResponse{Comment: makePostCommentResponse(comment)}
-	s.publishPostSnapshotRealtimeEvent(r.Context(), principal.UserID, postID, "post.comment.created", "comment.created", map[string]any{
-		"comment": response.Comment,
+	}, func() (idempotentHTTPResult, error) {
+		comment, err := s.postService.CreateComment(r.Context(), postsvc.CreateCommentInput{
+			PostID:   postID,
+			AuthorID: principal.UserID,
+			Content:  req.Content,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		response := postCommentDetailResponse{Comment: makePostCommentResponse(comment)}
+		return idempotentHTTPResult{
+			Status: http.StatusCreated,
+			Body:   response,
+			After: func() {
+				s.publishPostSnapshotRealtimeEvent(r.Context(), principal.UserID, postID, "post.comment.created", "comment.created", map[string]any{
+					"comment": response.Comment,
+				})
+			},
+		}, nil
 	})
-	writeJSON(w, http.StatusCreated, response)
 }
 
 func (s *Server) handleSetCommentLike(w http.ResponseWriter, r *http.Request) {
@@ -540,22 +560,30 @@ func (s *Server) handleCreateCommentReply(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
-	reply, err := s.postService.CreateReply(r.Context(), postsvc.CreateReplyInput{
-		CommentID:     commentID,
-		AuthorID:      principal.UserID,
-		TargetUserID:  req.TargetUserUUID,
-		TargetReplyID: req.TargetReplyID,
-		Content:       req.Content,
-	})
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "post.reply.create:"+commentID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writePostServiceError(w, r, err)
-		return
-	}
-	response := postReplyDetailResponse{Reply: makePostReplyResponse(reply)}
-	s.publishPostSnapshotRealtimeEvent(r.Context(), principal.UserID, reply.PostID, "post.reply.created", "reply.created", map[string]any{
-		"reply": response.Reply,
+	}, func() (idempotentHTTPResult, error) {
+		reply, err := s.postService.CreateReply(r.Context(), postsvc.CreateReplyInput{
+			CommentID:     commentID,
+			AuthorID:      principal.UserID,
+			TargetUserID:  req.TargetUserUUID,
+			TargetReplyID: req.TargetReplyID,
+			Content:       req.Content,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		response := postReplyDetailResponse{Reply: makePostReplyResponse(reply)}
+		return idempotentHTTPResult{
+			Status: http.StatusCreated,
+			Body:   response,
+			After: func() {
+				s.publishPostSnapshotRealtimeEvent(r.Context(), principal.UserID, reply.PostID, "post.reply.created", "reply.created", map[string]any{
+					"reply": response.Reply,
+				})
+			},
+		}, nil
 	})
-	writeJSON(w, http.StatusCreated, response)
 }
 
 func (s *Server) handleSetReplyLike(w http.ResponseWriter, r *http.Request) {

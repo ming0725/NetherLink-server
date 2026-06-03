@@ -14,8 +14,9 @@ import (
 )
 
 type aiCreateConversationRequest struct {
-	Title        *string `json:"title"`
-	FirstMessage *string `json:"firstMessage"`
+	Title             *string `json:"title"`
+	FirstMessage      *string `json:"firstMessage"`
+	ClientOperationID string  `json:"clientOperationId"`
 }
 
 type aiSendMessageRequest struct {
@@ -25,9 +26,10 @@ type aiSendMessageRequest struct {
 }
 
 type aiBindFileRequest struct {
-	FileID          string  `json:"fileId"`
-	Purpose         string  `json:"purpose"`
-	RetentionPolicy *string `json:"retentionPolicy"`
+	FileID            string  `json:"fileId"`
+	Purpose           string  `json:"purpose"`
+	RetentionPolicy   *string `json:"retentionPolicy"`
+	ClientOperationID string  `json:"clientOperationId"`
 }
 
 type aiFeedbackRequest struct {
@@ -186,16 +188,22 @@ func (s *Server) handleAICreateConversation(w http.ResponseWriter, r *http.Reque
 		writeRequestError(w, r, err)
 		return
 	}
-	conversation, err := s.aiService.CreateConversation(r.Context(), aisvc.CreateConversationInput{
-		UserID:       principal.UserID,
-		Title:        req.Title,
-		FirstMessage: req.FirstMessage,
-	})
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "ai.conversation.create", idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writeAIServiceError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, aiConversationDetailResponse{Conversation: makeAIConversationResponse(conversation)})
+	}, func() (idempotentHTTPResult, error) {
+		conversation, err := s.aiService.CreateConversation(r.Context(), aisvc.CreateConversationInput{
+			UserID:       principal.UserID,
+			Title:        req.Title,
+			FirstMessage: req.FirstMessage,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		return idempotentHTTPResult{
+			Status: http.StatusCreated,
+			Body:   aiConversationDetailResponse{Conversation: makeAIConversationResponse(conversation)},
+		}, nil
+	})
 }
 
 func (s *Server) handleAIListMessages(w http.ResponseWriter, r *http.Request) {
@@ -249,22 +257,28 @@ func (s *Server) handleAISendMessage(w http.ResponseWriter, r *http.Request) {
 		s.handleAISendMessageStream(w, r, principal, conversationID, req)
 		return
 	}
-	result, err := s.aiService.SendMessage(r.Context(), aisvc.SendMessageInput{
-		UserID:          principal.UserID,
-		ConversationID:  conversationID,
-		Message:         req.Message,
-		ClientMessageID: req.ClientMessageID,
-		AIFileIDs:       req.AIFileIDs,
-	})
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "ai.message.send:"+conversationID, idempotencyKeyFromRequest(r, req.ClientMessageID), func(err error) {
 		writeAIServiceError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, aiSendMessageResponse{
-		UserMessage:        makeAIMessageResponse(result.UserMessage),
-		AssistantMessageID: result.AssistantMessageID,
-		StreamID:           result.StreamID,
-		UsedFiles:          makeAIUploadedFileResponses(result.UsedFiles),
+	}, func() (idempotentHTTPResult, error) {
+		result, err := s.aiService.SendMessage(r.Context(), aisvc.SendMessageInput{
+			UserID:          principal.UserID,
+			ConversationID:  conversationID,
+			Message:         req.Message,
+			ClientMessageID: req.ClientMessageID,
+			AIFileIDs:       req.AIFileIDs,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		return idempotentHTTPResult{
+			Status: http.StatusCreated,
+			Body: aiSendMessageResponse{
+				UserMessage:        makeAIMessageResponse(result.UserMessage),
+				AssistantMessageID: result.AssistantMessageID,
+				StreamID:           result.StreamID,
+				UsedFiles:          makeAIUploadedFileResponses(result.UsedFiles),
+			},
+		}, nil
 	})
 }
 
@@ -366,21 +380,27 @@ func (s *Server) handleAIBindFile(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, r, reqErr)
 		return
 	}
-	file, err := s.aiService.BindFile(r.Context(), aisvc.BindFileInput{
-		UserID:          principal.UserID,
-		ConversationID:  conversationID,
-		FileID:          req.FileID,
-		Purpose:         req.Purpose,
-		RetentionPolicy: req.RetentionPolicy,
-	})
-	if err != nil {
+	s.handleIdempotentWrite(w, r, principal.UserID, "ai.file.bind:"+conversationID+":"+req.FileID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writeAIServiceError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, aiFileDetailResponse{
-		AIFile:      makeAIUploadedFileResponse(file),
-		ParseStatus: file.ParseStatus,
-		TokenCount:  file.TokenCount,
+	}, func() (idempotentHTTPResult, error) {
+		file, err := s.aiService.BindFile(r.Context(), aisvc.BindFileInput{
+			UserID:          principal.UserID,
+			ConversationID:  conversationID,
+			FileID:          req.FileID,
+			Purpose:         req.Purpose,
+			RetentionPolicy: req.RetentionPolicy,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		return idempotentHTTPResult{
+			Status: http.StatusCreated,
+			Body: aiFileDetailResponse{
+				AIFile:      makeAIUploadedFileResponse(file),
+				ParseStatus: file.ParseStatus,
+				TokenCount:  file.TokenCount,
+			},
+		}, nil
 	})
 }
 
