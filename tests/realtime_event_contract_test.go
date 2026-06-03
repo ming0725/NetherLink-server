@@ -9,6 +9,8 @@ import (
 func TestRealtimeEventContractNames(t *testing.T) {
 	files := []string{
 		"../internal/server/auth_handlers.go",
+		"../internal/server/chat_handlers.go",
+		"../internal/server/directory_handlers.go",
 		"../internal/server/file_handlers.go",
 		"../internal/server/notification_handlers.go",
 		"../internal/server/realtime_event_helpers.go",
@@ -26,6 +28,9 @@ func TestRealtimeEventContractNames(t *testing.T) {
 		`"profile.updated"`,
 		`"preference.updated"`,
 		`"notification.read.updated"`,
+		`"notification":`,
+		`"chat.conversation.updated"`,
+		`"group.notification.created"`,
 	}
 	for _, eventName := range required {
 		if !strings.Contains(combined, eventName) {

@@ -586,7 +586,10 @@ func (s *Server) handleCreateFriendRequest(w http.ResponseWriter, r *http.Reques
 			Status: http.StatusCreated,
 			Body:   response,
 			After: func() {
-				s.publishRealtimeEvent(r.Context(), []string{request.FromUser.ID, request.ToUser.ID}, "friend.request.created", response)
+				s.publishRealtimeEvent(r.Context(), []string{request.FromUser.ID, request.ToUser.ID}, "friend.request.created", map[string]any{
+					"request":      response.Request,
+					"notification": response.Request,
+				})
 			},
 		}, nil
 	})
@@ -1273,6 +1276,10 @@ func (s *Server) handleCreateGroupJoinRequest(w http.ResponseWriter, r *http.Req
 					}
 				}
 				s.publishGroupRealtimeEventTo(r.Context(), recipients, "group.join_request.created", response)
+				s.publishGroupRealtimeEventTo(r.Context(), recipients, "group.notification.created", map[string]any{
+					"notification": response.Request,
+					"request":      response.Request,
+				})
 			},
 		}, nil
 	})

@@ -197,6 +197,18 @@ type realtimeConversationSyncPayload struct {
 	SyncState      conversationSyncStateResponse `json:"syncState"`
 }
 
+type realtimeConversationUpdatedPayload struct {
+	ConversationID string                        `json:"conversationId"`
+	Reason         string                        `json:"reason"`
+	Summary        conversationSummaryResponse   `json:"summary"`
+	SyncState      conversationSyncStateResponse `json:"syncState"`
+	LastMessage    *messageResponse              `json:"lastMessage,omitempty"`
+	LastMessageAt  *time.Time                    `json:"lastMessageAt,omitempty"`
+	Version        int                           `json:"version"`
+	ETag           string                        `json:"etag"`
+	UpdatedAt      time.Time                     `json:"updatedAt"`
+}
+
 func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request) {
 	principal, ok := authPrincipalFromContext(r.Context())
 	if !ok {
@@ -389,6 +401,7 @@ func (s *Server) handleUpdateConversationSettings(w http.ResponseWriter, r *http
 		UpdatedAt: &current.Conversation.UpdatedAt,
 	}
 	s.publishConversationSyncState(r.Context(), participant, "settings.updated")
+	s.publishConversationUpdatedForParticipant(r.Context(), principal.UserID, conversationID, "settings.updated")
 	writeJSONWithETag(w, r, http.StatusOK, conversationETag, response)
 }
 
@@ -518,6 +531,7 @@ func (s *Server) handleRecallMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.publishConversationMessage(r.Context(), conversationID, "chat.message.recalled", response)
+	s.publishAllConversationUpdated(r.Context(), conversationID, "message.recalled")
 	writeJSON(w, http.StatusOK, messageDetailResponse{Message: response})
 }
 
@@ -564,6 +578,7 @@ func (s *Server) handleHideConversationHistory(w http.ResponseWriter, r *http.Re
 		return
 	}
 	s.publishConversationSyncState(r.Context(), participant, "history.hidden")
+	s.publishConversationUpdatedForParticipant(r.Context(), principal.UserID, conversationID, "history.hidden")
 	writeJSONWithETag(w, r, http.StatusOK, conversationETag, okResponse{OK: true})
 }
 
@@ -621,6 +636,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	s.publishConversationMessage(r.Context(), conversationID, "chat.message.created", response)
 	s.publishAllConversationSyncStates(r.Context(), conversationID, "message.created")
+	s.publishAllConversationUpdated(r.Context(), conversationID, "message.created")
 	writeJSON(w, http.StatusCreated, messageDetailResponse{Message: response})
 }
 
@@ -732,9 +748,13 @@ func (s *Server) makeConversationResponses(r *http.Request, entries []repository
 }
 
 func (s *Server) makeConversationResponse(r *http.Request, entry repository.ConversationEntry) (conversationResponse, error) {
+	return s.makeConversationResponseFromContext(r.Context(), entry)
+}
+
+func (s *Server) makeConversationResponseFromContext(ctx context.Context, entry repository.ConversationEntry) (conversationResponse, error) {
 	var lastMessage *messageResponse
 	if entry.LastMessage != nil {
-		response, err := s.makeMessageResponse(r, *entry.LastMessage)
+		response, err := s.makeMessageResponseFromContext(ctx, *entry.LastMessage)
 		if err != nil {
 			return conversationResponse{}, err
 		}
@@ -927,6 +947,33 @@ func (s *Server) publishConversationSyncState(ctx context.Context, participant r
 	})
 }
 
+func (s *Server) publishConversationUpdatedForParticipant(ctx context.Context, userID string, conversationID string, reason string) {
+	if s.realtimeHub == nil || s.repos.Chat == nil {
+		return
+	}
+	entry, err := s.repos.Chat.GetConversationForUser(ctx, userID, conversationID)
+	if err != nil {
+		s.logger.WarnContext(ctx, "failed to load realtime conversation snapshot", "error", err, "conversation_id", conversationID, "user_id", userID)
+		return
+	}
+	response, err := s.makeConversationResponseFromContext(ctx, entry)
+	if err != nil {
+		s.logger.WarnContext(ctx, "failed to build realtime conversation snapshot", "error", err, "conversation_id", conversationID, "user_id", userID)
+		return
+	}
+	s.publishRealtimeEvent(ctx, []string{userID}, "chat.conversation.updated", realtimeConversationUpdatedPayload{
+		ConversationID: response.ConversationID,
+		Reason:         reason,
+		Summary:        response.Summary,
+		SyncState:      response.SyncState,
+		LastMessage:    response.LastMessage,
+		LastMessageAt:  response.LastMessageAt,
+		Version:        response.Version,
+		ETag:           response.ETag,
+		UpdatedAt:      response.UpdatedAt,
+	})
+}
+
 func (s *Server) publishChatReadUpdated(ctx context.Context, participant repository.ConversationParticipant) {
 	s.publishRealtimeEvent(ctx, []string{participant.UserID}, "chat.read.updated", websocketChatReadUpdatedPayload{
 		ConversationID:    participant.ConversationID,
@@ -947,6 +994,20 @@ func (s *Server) publishAllConversationSyncStates(ctx context.Context, conversat
 	}
 	for _, participant := range participants {
 		s.publishConversationSyncState(ctx, participant, reason)
+	}
+}
+
+func (s *Server) publishAllConversationUpdated(ctx context.Context, conversationID string, reason string) {
+	if s.realtimeHub == nil || s.repos.Chat == nil {
+		return
+	}
+	userIDs, err := s.repos.Chat.ListConversationParticipantUserIDs(ctx, conversationID)
+	if err != nil {
+		s.logger.WarnContext(ctx, "failed to list realtime conversation update recipients", "error", err, "conversation_id", conversationID)
+		return
+	}
+	for _, userID := range userIDs {
+		s.publishConversationUpdatedForParticipant(ctx, userID, conversationID, reason)
 	}
 }
 
