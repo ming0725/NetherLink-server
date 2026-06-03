@@ -127,6 +127,23 @@ func (r *NotificationRepository) MarkAllRead(ctx context.Context, userID string,
 	return tag.RowsAffected(), unread, nil
 }
 
+func (r *NotificationRepository) CountUnread(ctx context.Context, userID string, notificationType string) (int, error) {
+	var unread int
+	err := r.db.QueryRow(ctx, `
+		SELECT count(*)::int
+		FROM notifications
+		WHERE user_id = $1::uuid
+		  AND read_at IS NULL
+		  AND ($2 = '' OR type = $2)`,
+		normalizeText(userID),
+		normalizeText(notificationType),
+	).Scan(&unread)
+	if err != nil {
+		return 0, translateReadError(err)
+	}
+	return unread, nil
+}
+
 func scanNotification(row scanner) (Notification, error) {
 	var (
 		notification Notification

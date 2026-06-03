@@ -301,10 +301,7 @@ func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := makeUserResponse(user)
-	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, map[string]any{
-		"reason": "profile.updated",
-		"user":   response,
-	})
+	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, makeProfileUpdatedPayload("profile.updated", response))
 	writeJSONWithETag(w, r, http.StatusOK, response.ETag, response)
 }
 
@@ -359,10 +356,7 @@ func (s *Server) handlePatchMeUserID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := makeUserResponse(user)
-	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, map[string]any{
-		"reason": "public_id.updated",
-		"user":   response,
-	})
+	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, makeProfileUpdatedPayload("public_id.updated", response))
 	writeJSONWithETag(w, r, http.StatusOK, response.ETag, response)
 }
 
@@ -413,10 +407,6 @@ func (s *Server) handleGetMePreferences(w http.ResponseWriter, r *http.Request) 
 	}
 
 	response := makePreferencesResponse(preferences)
-	s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "user.preferences.updated", map[string]any{
-		"reason":      "preferences.updated",
-		"preferences": response,
-	})
 	writeJSONWithETag(w, r, http.StatusOK, response.ETag, response)
 }
 
@@ -454,6 +444,11 @@ func (s *Server) handlePatchMePreferences(w http.ResponseWriter, r *http.Request
 	}
 
 	response := makePreferencesResponse(preferences)
+	s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "preference.updated", map[string]any{
+		"reason":      "preferences.updated",
+		"preferences": response,
+		"version":     response.Version,
+	})
 	writeJSONWithETag(w, r, http.StatusOK, response.ETag, response)
 }
 

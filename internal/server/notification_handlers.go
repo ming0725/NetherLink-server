@@ -38,6 +38,13 @@ type markNotificationsReadAllResponse struct {
 	UnreadCount int   `json:"unreadCount"`
 }
 
+type notificationReadUpdatedPayload struct {
+	Type         string                `json:"type,omitempty"`
+	UnreadCount  int                   `json:"unreadCount"`
+	Updated      int64                 `json:"updated,omitempty"`
+	Notification *notificationResponse `json:"notification,omitempty"`
+}
+
 func (s *Server) handleNotifications(w http.ResponseWriter, r *http.Request) {
 	principal, ok := authPrincipalFromContext(r.Context())
 	if !ok {
@@ -102,7 +109,11 @@ func (s *Server) handleNotificationsReadAll(w http.ResponseWriter, r *http.Reque
 		Updated:     updated,
 		UnreadCount: unread,
 	}
-	s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "notification.read_all", response)
+	s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "notification.read.updated", notificationReadUpdatedPayload{
+		Type:        notificationType,
+		UnreadCount: unread,
+		Updated:     updated,
+	})
 	writeJSON(w, http.StatusOK, response)
 }
 
@@ -129,8 +140,18 @@ func (s *Server) handleNotificationRead(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	response := notificationDetailResponse{Notification: makeNotificationResponse(notification)}
-	s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "notification.read", response)
+	notificationResponse := makeNotificationResponse(notification)
+	unread, err := s.repos.Notifications.CountUnread(r.Context(), principal.UserID, notification.Type)
+	if err != nil {
+		writeRepositoryError(w, r, err)
+		return
+	}
+	response := notificationDetailResponse{Notification: notificationResponse}
+	s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "notification.read.updated", notificationReadUpdatedPayload{
+		Type:         notification.Type,
+		UnreadCount:  unread,
+		Notification: &notificationResponse,
+	})
 	writeJSON(w, http.StatusOK, response)
 }
 

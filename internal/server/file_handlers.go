@@ -453,10 +453,15 @@ func (s *Server) handleUploadMeAvatar(w http.ResponseWriter, r *http.Request) {
 		AvatarContentHash: result.AvatarContentHash,
 		FileID:            result.FileID,
 	}
-	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, map[string]any{
-		"reason": "avatar.updated",
-		"avatar": response,
-	})
+	user, err := s.repos.Users.GetByID(r.Context(), principal.UserID)
+	if err != nil {
+		writeRepositoryError(w, r, err)
+		return
+	}
+	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, makeAvatarUpdatedPayload("avatar.updated", profileEventIdentity{
+		UserUUID: user.ID,
+		UserID:   user.PublicID,
+	}, response))
 	writeJSONWithETag(w, r, http.StatusCreated, resourceETag("user", principal.UserID, result.AvatarVersion), response)
 }
 

@@ -31,7 +31,38 @@ func (s *Server) publishProfileRealtimeEvent(ctx context.Context, userID string,
 			userIDs = append(userIDs, friendUserIDs...)
 		}
 	}
-	s.publishRealtimeEvent(ctx, uniqueRealtimeUserIDs(userIDs), "user.profile.updated", payload)
+	s.publishRealtimeEvent(ctx, uniqueRealtimeUserIDs(userIDs), "profile.updated", payload)
+}
+
+func makeProfileUpdatedPayload(reason string, user userResponse) map[string]any {
+	return map[string]any{
+		"reason":            reason,
+		"userUuid":          user.UserUUID,
+		"userId":            user.UserID,
+		"profile":           user,
+		"avatarUrl":         user.AvatarURL,
+		"avatarVersion":     user.AvatarVersion,
+		"avatarEtag":        user.AvatarEtag,
+		"avatarContentHash": user.AvatarContentHash,
+	}
+}
+
+func makeAvatarUpdatedPayload(reason string, user profileEventIdentity, avatar avatarUploadResponse) map[string]any {
+	return map[string]any{
+		"reason":            reason,
+		"userUuid":          user.UserUUID,
+		"userId":            user.UserID,
+		"avatar":            avatar,
+		"avatarUrl":         avatar.AvatarURL,
+		"avatarVersion":     avatar.AvatarVersion,
+		"avatarEtag":        avatar.AvatarEtag,
+		"avatarContentHash": avatar.AvatarContentHash,
+	}
+}
+
+type profileEventIdentity struct {
+	UserUUID string
+	UserID   string
 }
 
 func (s *Server) publishGroupRealtimeEvent(ctx context.Context, groupID string, eventType string, payload any) {
