@@ -39,9 +39,10 @@ type openGroupConversationRequest struct {
 }
 
 type updateConversationSettingsRequest struct {
-	IsPinned *bool `json:"isPinned"`
-	IsDND    *bool `json:"isDnd"`
-	Hidden   *bool `json:"hidden"`
+	IsPinned        *bool `json:"isPinned"`
+	IsDND           *bool `json:"isDnd"`
+	Hidden          *bool `json:"hidden"`
+	ExpectedVersion *int  `json:"expectedVersion"`
 }
 
 type markConversationReadRequest struct {
@@ -64,6 +65,9 @@ type conversationDetailResponse struct {
 
 type conversationSettingsResponse struct {
 	SyncState conversationSyncStateResponse `json:"syncState"`
+	Version   *int                          `json:"version,omitempty"`
+	ETag      string                        `json:"etag,omitempty"`
+	UpdatedAt *time.Time                    `json:"updatedAt,omitempty"`
 }
 
 type conversationResponse struct {
@@ -74,6 +78,7 @@ type conversationResponse struct {
 	LastMessage    *messageResponse              `json:"lastMessage,omitempty"`
 	LastMessageAt  *time.Time                    `json:"lastMessageAt,omitempty"`
 	Version        int                           `json:"version"`
+	ETag           string                        `json:"etag"`
 	CreatedAt      time.Time                     `json:"createdAt"`
 	UpdatedAt      time.Time                     `json:"updatedAt"`
 }
@@ -261,7 +266,7 @@ func (s *Server) handleOpenDirectConversation(w http.ResponseWriter, r *http.Req
 		writeChatError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, conversationDetailResponse{Conversation: response})
+	writeJSONWithETag(w, r, http.StatusOK, response.ETag, conversationDetailResponse{Conversation: response})
 }
 
 func (s *Server) handleOpenGroupConversation(w http.ResponseWriter, r *http.Request) {
@@ -298,7 +303,7 @@ func (s *Server) handleOpenGroupConversation(w http.ResponseWriter, r *http.Requ
 		writeChatError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, conversationDetailResponse{Conversation: response})
+	writeJSONWithETag(w, r, http.StatusOK, response.ETag, conversationDetailResponse{Conversation: response})
 }
 
 func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
@@ -330,7 +335,7 @@ func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
 		writeChatError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, conversationDetailResponse{Conversation: response})
+	writeJSONWithETag(w, r, http.StatusOK, response.ETag, conversationDetailResponse{Conversation: response})
 }
 
 func (s *Server) handleUpdateConversationSettings(w http.ResponseWriter, r *http.Request) {
@@ -354,6 +359,18 @@ func (s *Server) handleUpdateConversationSettings(w http.ResponseWriter, r *http
 		writeRequestError(w, r, err)
 		return
 	}
+	current, err := s.chatService.GetConversation(r.Context(), chatsvc.GetConversationInput{
+		UserID:         principal.UserID,
+		ConversationID: conversationID,
+	})
+	if err != nil {
+		writeChatError(w, r, err)
+		return
+	}
+	conversationETag := resourceETag("conversation", current.Conversation.ID, current.Conversation.Version)
+	if !checkResourceVersion(w, r, conversationETag, current.Conversation.Version, req.ExpectedVersion) {
+		return
+	}
 	participant, err := s.chatService.UpdateConversationSettings(r.Context(), chatsvc.UpdateConversationSettingsInput{
 		UserID:         principal.UserID,
 		ConversationID: conversationID,
@@ -365,9 +382,14 @@ func (s *Server) handleUpdateConversationSettings(w http.ResponseWriter, r *http
 		writeChatError(w, r, err)
 		return
 	}
-	response := conversationSettingsResponse{SyncState: makeConversationSyncStateResponse(participant)}
+	response := conversationSettingsResponse{
+		SyncState: makeConversationSyncStateResponse(participant),
+		Version:   &current.Conversation.Version,
+		ETag:      conversationETag,
+		UpdatedAt: &current.Conversation.UpdatedAt,
+	}
 	s.publishConversationSyncState(r.Context(), participant, "settings.updated")
-	writeJSON(w, http.StatusOK, response)
+	writeJSONWithETag(w, r, http.StatusOK, conversationETag, response)
 }
 
 func (s *Server) handleMarkConversationRead(w http.ResponseWriter, r *http.Request) {
@@ -515,6 +537,23 @@ func (s *Server) handleHideConversationHistory(w http.ResponseWriter, r *http.Re
 		writeRequestError(w, r, err)
 		return
 	}
+	expectedVersion, reqErr := expectedVersionFromQuery(r)
+	if reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+	current, err := s.chatService.GetConversation(r.Context(), chatsvc.GetConversationInput{
+		UserID:         principal.UserID,
+		ConversationID: conversationID,
+	})
+	if err != nil {
+		writeChatError(w, r, err)
+		return
+	}
+	conversationETag := resourceETag("conversation", current.Conversation.ID, current.Conversation.Version)
+	if !checkResourceVersion(w, r, conversationETag, current.Conversation.Version, expectedVersion) {
+		return
+	}
 
 	participant, err := s.chatService.HideConversationHistory(r.Context(), chatsvc.HideConversationHistoryInput{
 		UserID:         principal.UserID,
@@ -525,7 +564,7 @@ func (s *Server) handleHideConversationHistory(w http.ResponseWriter, r *http.Re
 		return
 	}
 	s.publishConversationSyncState(r.Context(), participant, "history.hidden")
-	writeJSON(w, http.StatusOK, okResponse{OK: true})
+	writeJSONWithETag(w, r, http.StatusOK, conversationETag, okResponse{OK: true})
 }
 
 func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
@@ -710,6 +749,7 @@ func (s *Server) makeConversationResponse(r *http.Request, entry repository.Conv
 		LastMessage:    lastMessage,
 		LastMessageAt:  entry.Conversation.LastMessageAt,
 		Version:        entry.Conversation.Version,
+		ETag:           resourceETag("conversation", entry.Conversation.ID, entry.Conversation.Version),
 		CreatedAt:      entry.Conversation.CreatedAt,
 		UpdatedAt:      entry.Conversation.UpdatedAt,
 	}, nil
