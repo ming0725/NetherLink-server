@@ -116,6 +116,12 @@ type AIFileChunk struct {
 	UpdatedAt  time.Time
 }
 
+type ExpiredAIUploadedFileCleanupCandidate struct {
+	AIFileID            string
+	FileID              string
+	ExtractedTextFileID *string
+}
+
 type CreateAIConversationParams struct {
 	UserID           string
 	Title            *string
@@ -629,6 +635,79 @@ func (r *AIRepository) DeleteUploadedFile(ctx context.Context, userID string, ai
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (r *AIRepository) CleanupExpiredTemporaryUploadedFiles(ctx context.Context, limit int) ([]ExpiredAIUploadedFileCleanupCandidate, error) {
+	if limit <= 0 {
+		limit = 25
+	}
+
+	rows, err := r.db.Query(ctx, `
+		WITH candidates AS (
+			SELECT auf.id
+			FROM ai_uploaded_files auf
+			JOIN ai_conversations c ON c.id = auf.conversation_id
+			WHERE auf.deleted_at IS NULL
+			  AND c.deleted_at IS NULL
+			  AND COALESCE(NULLIF(auf.retention_policy, ''), 'conversation') = 'temporary'
+			  AND auf.expires_at IS NOT NULL
+			  AND auf.expires_at < now()
+			ORDER BY auf.expires_at ASC, auf.created_at ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT $1
+		),
+		marked AS (
+			UPDATE ai_uploaded_files auf
+			SET deleted_at = now(),
+			    updated_at = now()
+			FROM candidates
+			WHERE auf.id = candidates.id
+			RETURNING auf.id, auf.file_id, auf.extracted_text_file_id
+		),
+		deleted_chunks AS (
+			DELETE FROM ai_file_chunks chunk
+			USING marked
+			WHERE chunk.ai_file_id = marked.id
+		),
+		deleted_usages AS (
+			UPDATE file_usages fu
+			SET deleted_at = now(),
+			    updated_at = now()
+			FROM marked
+			WHERE fu.usage_type IN ('ai_upload', 'ai_extracted_text')
+			  AND fu.business_id = marked.id
+			  AND fu.deleted_at IS NULL
+		)
+		SELECT id, file_id, extracted_text_file_id
+		FROM marked
+		ORDER BY id`,
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	candidates := []ExpiredAIUploadedFileCleanupCandidate{}
+	for rows.Next() {
+		var (
+			aiFileID            pgtype.UUID
+			fileID              pgtype.UUID
+			extractedTextFileID pgtype.UUID
+		)
+		if err := rows.Scan(&aiFileID, &fileID, &extractedTextFileID); err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, ExpiredAIUploadedFileCleanupCandidate{
+			AIFileID:            uuidString(aiFileID),
+			FileID:              uuidString(fileID),
+			ExtractedTextFileID: uuidStringPtr(extractedTextFileID),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return candidates, nil
 }
 
 func scanAIConversation(row scanner) (AIConversation, error) {

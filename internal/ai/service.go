@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"nlserver/internal/config"
@@ -26,6 +27,7 @@ const (
 	maxAITitleLength   = 120
 	maxAIContextChunks = 8
 	maxAIContextChars  = 12000
+	temporaryFileTTL   = 24 * time.Hour
 )
 
 type Service struct {
@@ -343,6 +345,7 @@ func (s *Service) BindFile(ctx context.Context, input BindFileInput) (repository
 	if retentionPolicy != nil && *retentionPolicy == "" {
 		return repository.AIUploadedFile{}, ErrValidation
 	}
+	expiresAt := aiFileExpiresAt(retentionPolicy)
 	if s.tx != nil {
 		var uploadedFile repository.AIUploadedFile
 		err := repository.WithTx(ctx, s.tx, func(repos repository.Repositories) error {
@@ -351,6 +354,7 @@ func (s *Service) BindFile(ctx context.Context, input BindFileInput) (repository
 				FileID:          input.FileID,
 				Purpose:         purpose,
 				RetentionPolicy: retentionPolicy,
+				ExpiresAt:       expiresAt,
 			})
 			if err != nil {
 				return err
@@ -385,6 +389,7 @@ func (s *Service) BindFile(ctx context.Context, input BindFileInput) (repository
 		FileID:          input.FileID,
 		Purpose:         purpose,
 		RetentionPolicy: retentionPolicy,
+		ExpiresAt:       expiresAt,
 	})
 	if err != nil {
 		return repository.AIUploadedFile{}, mapRepositoryError(err)
@@ -720,6 +725,14 @@ func normalizeRetentionPolicy(policy *string) *string {
 		empty := ""
 		return &empty
 	}
+}
+
+func aiFileExpiresAt(policy *string) *time.Time {
+	if policy == nil || strings.TrimSpace(*policy) != "temporary" {
+		return nil
+	}
+	expiresAt := time.Now().UTC().Add(temporaryFileTTL)
+	return &expiresAt
 }
 
 func roughTokenCount(text string) int {

@@ -62,6 +62,36 @@ func TestAIParseSourceDeleteEligibility(t *testing.T) {
 	assertAIParseSourceDeleteAllowed(t, repos, aiSourceDeleteFile, false, "already deleted source is not eligible")
 }
 
+func TestExpiredTemporaryAIUploadedFileCleanup(t *testing.T) {
+	pool := newPostgresIntegrationPool(t)
+	repos := repository.New(pool)
+	ctx := context.Background()
+
+	seedExpiredTemporaryAIFileFixtures(t, pool)
+
+	candidates, err := repos.AI.CleanupExpiredTemporaryUploadedFiles(ctx, 10)
+	if err != nil {
+		t.Fatalf("CleanupExpiredTemporaryUploadedFiles() error = %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("cleaned candidates = %d, want 1", len(candidates))
+	}
+	if candidates[0].AIFileID != aiExpiredTemporaryUploadID {
+		t.Fatalf("cleaned AI file ID = %s, want %s", candidates[0].AIFileID, aiExpiredTemporaryUploadID)
+	}
+	if candidates[0].ExtractedTextFileID == nil || *candidates[0].ExtractedTextFileID != aiExpiredExtractedTextFile {
+		t.Fatalf("cleaned extracted text file ID = %v, want %s", candidates[0].ExtractedTextFileID, aiExpiredExtractedTextFile)
+	}
+
+	assertAIUploadedFileDeleted(t, pool, aiExpiredTemporaryUploadID, true)
+	assertAIUploadedFileDeleted(t, pool, aiActiveTemporaryUploadID, false)
+	assertAIUploadedFileDeleted(t, pool, aiConversationRetentionUploadID, false)
+	assertAIFileUsageDeleted(t, pool, aiExpiredTemporaryUploadID, true)
+	assertAIFileUsageDeleted(t, pool, aiActiveTemporaryUploadID, false)
+	assertAIFileChunkCount(t, pool, aiExpiredTemporaryUploadID, 0)
+	assertAIFileChunkCount(t, pool, aiActiveTemporaryUploadID, 1)
+}
+
 func newPostgresIntegrationPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
@@ -152,6 +182,58 @@ func assertAIParseSourceDeleteAllowed(t *testing.T, repos repository.Repositorie
 	}
 	if got != want {
 		t.Fatalf("%s: allowed = %v, want %v", label, got, want)
+	}
+}
+
+func assertAIUploadedFileDeleted(t *testing.T, pool *pgxpool.Pool, aiFileID string, want bool) {
+	t.Helper()
+
+	var got bool
+	if err := pool.QueryRow(context.Background(), `
+		SELECT deleted_at IS NOT NULL
+		FROM ai_uploaded_files
+		WHERE id = $1::uuid`,
+		aiFileID,
+	).Scan(&got); err != nil {
+		t.Fatalf("read AI uploaded file deleted state: %v", err)
+	}
+	if got != want {
+		t.Fatalf("AI uploaded file %s deleted = %v, want %v", aiFileID, got, want)
+	}
+}
+
+func assertAIFileUsageDeleted(t *testing.T, pool *pgxpool.Pool, businessID string, want bool) {
+	t.Helper()
+
+	var got bool
+	if err := pool.QueryRow(context.Background(), `
+		SELECT bool_and(deleted_at IS NOT NULL)
+		FROM file_usages
+		WHERE business_id = $1::uuid
+		  AND usage_type IN ('ai_upload', 'ai_extracted_text')`,
+		businessID,
+	).Scan(&got); err != nil {
+		t.Fatalf("read AI file usage deleted state: %v", err)
+	}
+	if got != want {
+		t.Fatalf("AI file usages for %s deleted = %v, want %v", businessID, got, want)
+	}
+}
+
+func assertAIFileChunkCount(t *testing.T, pool *pgxpool.Pool, aiFileID string, want int) {
+	t.Helper()
+
+	var got int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*)
+		FROM ai_file_chunks
+		WHERE ai_file_id = $1::uuid`,
+		aiFileID,
+	).Scan(&got); err != nil {
+		t.Fatalf("read AI file chunk count: %v", err)
+	}
+	if got != want {
+		t.Fatalf("AI file chunks for %s = %d, want %d", aiFileID, got, want)
 	}
 }
 
@@ -270,6 +352,55 @@ func seedAIParseSourceRetentionFixtures(t *testing.T, pool *pgxpool.Pool) {
 	}
 }
 
+func seedExpiredTemporaryAIFileFixtures(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+
+	ctx := context.Background()
+	_, err := pool.Exec(ctx, `
+		INSERT INTO users (id, public_id, email, password_hash, nick)
+		VALUES ($1::uuid, 'ai_temp_owner', 'ai-temp-owner@example.test', 'hash', 'AI Temp Owner');
+
+		INSERT INTO files (id, owner_user_id, original_file_name, bucket, object_key, mime_type, size_bytes, storage_status, visibility)
+		VALUES
+		  ($2::uuid, $1::uuid, 'expired.txt', 'netherlink-private', 'expired.txt', 'text/plain', 10, 'ready', 'private'),
+		  ($3::uuid, $1::uuid, 'active.txt', 'netherlink-private', 'active.txt', 'text/plain', 10, 'ready', 'private'),
+		  ($4::uuid, $1::uuid, 'conversation.txt', 'netherlink-private', 'conversation.txt', 'text/plain', 10, 'ready', 'private'),
+		  ($5::uuid, $1::uuid, 'expired.extracted.txt', 'netherlink-private', 'expired.extracted.txt', 'text/plain', 10, 'ready', 'private');
+
+		INSERT INTO ai_conversations (id, user_id, title)
+		VALUES ($6::uuid, $1::uuid, 'AI temp cleanup');
+		INSERT INTO ai_uploaded_files (id, conversation_id, file_id, purpose, parse_status, extracted_text_file_id, retention_policy, expires_at)
+		VALUES
+		  ($7::uuid, $6::uuid, $2::uuid, 'reference', 'ready', $5::uuid, 'temporary', now() - interval '1 minute'),
+		  ($8::uuid, $6::uuid, $3::uuid, 'reference', 'ready', NULL, 'temporary', now() + interval '1 hour'),
+		  ($9::uuid, $6::uuid, $4::uuid, 'reference', 'ready', NULL, 'conversation', now() - interval '1 minute');
+		INSERT INTO file_usages (file_id, usage_type, business_id, owner_user_id, visibility)
+		VALUES
+		  ($2::uuid, 'ai_upload', $7::uuid, $1::uuid, 'private'),
+		  ($5::uuid, 'ai_extracted_text', $7::uuid, $1::uuid, 'private'),
+		  ($3::uuid, 'ai_upload', $8::uuid, $1::uuid, 'private'),
+		  ($4::uuid, 'ai_upload', $9::uuid, $1::uuid, 'private');
+		INSERT INTO ai_file_chunks (ai_file_id, chunk_index, content, token_count)
+		VALUES
+		  ($7::uuid, 0, 'expired chunk', 3),
+		  ($8::uuid, 0, 'active chunk', 3),
+		  ($9::uuid, 0, 'conversation chunk', 3);
+		`,
+		aiTempOwnerID,
+		aiExpiredTemporaryFile,
+		aiActiveTemporaryFile,
+		aiConversationRetentionFile,
+		aiExpiredExtractedTextFile,
+		aiTemporaryConversationID,
+		aiExpiredTemporaryUploadID,
+		aiActiveTemporaryUploadID,
+		aiConversationRetentionUploadID,
+	)
+	if err != nil {
+		t.Fatalf("seed expired temporary AI file fixtures: %v", err)
+	}
+}
+
 const (
 	userOwner    = "00000000-0000-0000-0000-000000000001"
 	userMember   = "00000000-0000-0000-0000-000000000002"
@@ -300,4 +431,14 @@ const (
 	aiSharedChatUploadID           = "63000000-0000-0000-0000-000000000003"
 	aiSharedConversationID         = "64000000-0000-0000-0000-000000000001"
 	aiSharedMessageID              = "64000000-0000-0000-0000-000000000002"
+
+	aiTempOwnerID                   = "70000000-0000-0000-0000-000000000001"
+	aiExpiredTemporaryFile          = "71000000-0000-0000-0000-000000000001"
+	aiActiveTemporaryFile           = "71000000-0000-0000-0000-000000000002"
+	aiConversationRetentionFile     = "71000000-0000-0000-0000-000000000003"
+	aiExpiredExtractedTextFile      = "71000000-0000-0000-0000-000000000004"
+	aiTemporaryConversationID       = "72000000-0000-0000-0000-000000000001"
+	aiExpiredTemporaryUploadID      = "73000000-0000-0000-0000-000000000001"
+	aiActiveTemporaryUploadID       = "73000000-0000-0000-0000-000000000002"
+	aiConversationRetentionUploadID = "73000000-0000-0000-0000-000000000003"
 )

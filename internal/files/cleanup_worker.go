@@ -53,12 +53,17 @@ func (w *CleanupWorker) RunOnce(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
-	unusedCount, err := w.cleanupUnusedFiles(ctx)
+	expiredAIFileCount, err := w.cleanupExpiredAIUploadedFiles(ctx)
 	if err != nil {
 		return expiredCount > 0, err
 	}
 
-	return expiredCount+unusedCount > 0, nil
+	unusedCount, err := w.cleanupUnusedFiles(ctx)
+	if err != nil {
+		return expiredCount+expiredAIFileCount > 0, err
+	}
+
+	return expiredCount+expiredAIFileCount+unusedCount > 0, nil
 }
 
 func (w *CleanupWorker) run(ctx context.Context) {
@@ -123,6 +128,25 @@ func (w *CleanupWorker) cleanupExpiredUploadSession(ctx context.Context, candida
 	}
 
 	return w.repos.Files.MarkExpiredUploadSessionCleaned(ctx, candidate.SessionID, candidate.FileID)
+}
+
+func (w *CleanupWorker) cleanupExpiredAIUploadedFiles(ctx context.Context) (int, error) {
+	if w.repos.AI == nil {
+		return 0, nil
+	}
+	candidates, err := w.repos.AI.CleanupExpiredTemporaryUploadedFiles(ctx, defaultCleanupBatchSize)
+	if err != nil {
+		return 0, err
+	}
+	for _, candidate := range candidates {
+		w.logger.Info(
+			"expired temporary AI file binding cleaned",
+			"ai_file_id", candidate.AIFileID,
+			"file_id", candidate.FileID,
+			"extracted_text_file_id", candidate.ExtractedTextFileID,
+		)
+	}
+	return len(candidates), nil
 }
 
 func (w *CleanupWorker) cleanupUnusedFiles(ctx context.Context) (int, error) {
