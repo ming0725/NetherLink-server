@@ -508,6 +508,24 @@ func (s *Server) handleWebSocketAIMessageSend(ctx context.Context, conn *realtim
 		}
 	}
 
+	receiptClaim, reqErr, err := s.claimAIStreamReceipt(ctx, principal.UserID, aiStreamOperationType(req.ConversationID), req.ClientMessageID)
+	if reqErr != nil {
+		s.sendWebSocketError(conn, "ai.message.send", reqErr.Code, reqErr.Message)
+		return
+	}
+	if err != nil {
+		if req.ClientMessageID != "" && s.repos.OperationReceipts == nil {
+			s.sendWebSocketError(conn, "ai.message.send", "SERVICE_NOT_READY", "Operation receipt repository is not configured")
+			return
+		}
+		s.sendWebSocketError(conn, "ai.message.send", "INTERNAL_ERROR", "Internal server error")
+		return
+	}
+	if receiptClaim.Key != "" && !receiptClaim.Claimed {
+		s.replayWebSocketAIStreamReceipt(conn, req, receiptClaim.Receipt)
+		return
+	}
+
 	if s.aiStreams == nil {
 		s.aiStreams = newAIStreamRegistry()
 	}
@@ -524,10 +542,31 @@ func (s *Server) handleWebSocketAIMessageSend(ctx context.Context, conn *realtim
 		ClientMessageID: req.ClientMessageID,
 	})
 
-	go s.runWebSocketAIStream(streamCtx, conn, principal, streamID, req)
+	go s.runWebSocketAIStream(streamCtx, conn, principal, streamID, req, receiptClaim)
 }
 
-func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connection, principal AuthPrincipal, streamID string, req websocketAIMessagePayload) {
+func (s *Server) replayWebSocketAIStreamReceipt(conn *realtime.Connection, req websocketAIMessagePayload, receipt repository.OperationReceipt) {
+	streamID := newAIStreamID()
+	done, code, message := aiStreamDoneFromReceipt(receipt, streamID)
+	if code != "" {
+		s.sendWebSocketError(conn, "ai.message.send", code, message)
+		return
+	}
+	s.realtimeHub.Send(conn, "ai.stream.started", websocketAIStreamStartedPayload{
+		StreamID:        streamID,
+		ConversationID:  req.ConversationID,
+		ClientMessageID: req.ClientMessageID,
+	})
+	s.realtimeHub.Send(conn, "ai.stream.done", websocketAIStreamDonePayload{
+		StreamID:         done.StreamID,
+		UserMessage:      done.UserMessage,
+		AssistantMessage: done.AssistantMessage,
+		UsedFiles:        done.UsedFiles,
+		FinishReason:     done.FinishReason,
+	})
+}
+
+func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connection, principal AuthPrincipal, streamID string, req websocketAIMessagePayload, receiptClaim aiStreamReceiptClaim) {
 	defer func() {
 		if s.aiStreams != nil {
 			s.aiStreams.Remove(streamID)
@@ -555,6 +594,7 @@ func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connec
 		},
 	})
 	if err != nil {
+		s.deleteAIStreamReceipt(principal.UserID, receiptClaim)
 		if errors.Is(err, context.Canceled) {
 			s.realtimeHub.Send(conn, "ai.stream.cancelled", websocketAIStreamCancelledPayload{StreamID: streamID})
 			return
@@ -563,12 +603,24 @@ func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connec
 		s.sendWebSocketError(conn, "ai.message.send", code, message)
 		return
 	}
-	s.realtimeHub.Send(conn, "ai.stream.done", websocketAIStreamDonePayload{
+	done := aiStreamDoneResponse{
 		StreamID:         streamID,
 		UserMessage:      makeAIMessageResponse(result.UserMessage),
 		AssistantMessage: makeAIMessageResponse(result.AssistantMessage),
 		UsedFiles:        makeAIUploadedFileResponses(result.UsedFiles),
 		FinishReason:     result.FinishReason,
+	}
+	completeCtx, completeCancel := context.WithTimeout(context.Background(), aiStreamReceiptCleanupTimeout)
+	if err := s.completeAIStreamReceipt(completeCtx, principal.UserID, receiptClaim, done); err != nil {
+		s.logger.WarnContext(completeCtx, "failed to complete AI websocket stream receipt", "error", err, "operation_type", receiptClaim.OperationType)
+	}
+	completeCancel()
+	s.realtimeHub.Send(conn, "ai.stream.done", websocketAIStreamDonePayload{
+		StreamID:         done.StreamID,
+		UserMessage:      done.UserMessage,
+		AssistantMessage: done.AssistantMessage,
+		UsedFiles:        done.UsedFiles,
+		FinishReason:     done.FinishReason,
 	})
 }
 

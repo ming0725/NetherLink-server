@@ -288,6 +288,25 @@ func (s *Server) handleAISendMessageStream(w http.ResponseWriter, r *http.Reques
 		writeError(w, r, http.StatusInternalServerError, "STREAM_UNAVAILABLE", "Streaming response is unavailable")
 		return
 	}
+	idempotencyKey := idempotencyKeyFromRequest(r, req.ClientMessageID)
+	receiptClaim, reqErr, err := s.claimAIStreamReceipt(r.Context(), principal.UserID, aiStreamOperationType(conversationID), idempotencyKey)
+	if reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+	if err != nil {
+		if idempotencyKey != "" && s.repos.OperationReceipts == nil {
+			writeAIStreamServiceNotReady(w, r)
+			return
+		}
+		writeRepositoryError(w, r, err)
+		return
+	}
+	if receiptClaim.Key != "" && !receiptClaim.Claimed {
+		s.replayAISSEStreamReceipt(w, flusher, r, conversationID, req.ClientMessageID, receiptClaim.Receipt)
+		return
+	}
+
 	if s.aiStreams == nil {
 		s.aiStreams = newAIStreamRegistry()
 	}
@@ -335,6 +354,7 @@ func (s *Server) handleAISendMessageStream(w http.ResponseWriter, r *http.Reques
 		},
 	})
 	if err != nil {
+		s.deleteAIStreamReceipt(principal.UserID, receiptClaim)
 		if errors.Is(err, context.Canceled) {
 			_ = writeSSE(w, flusher, "ai.stream.cancelled", aiStreamCancelledResponse{StreamID: streamID})
 			return
@@ -348,13 +368,47 @@ func (s *Server) handleAISendMessageStream(w http.ResponseWriter, r *http.Reques
 		})
 		return
 	}
-	_ = writeSSE(w, flusher, "ai.stream.done", aiStreamDoneResponse{
+	done := aiStreamDoneResponse{
 		StreamID:         streamID,
 		UserMessage:      makeAIMessageResponse(result.UserMessage),
 		AssistantMessage: makeAIMessageResponse(result.AssistantMessage),
 		UsedFiles:        makeAIUploadedFileResponses(result.UsedFiles),
 		FinishReason:     result.FinishReason,
-	})
+	}
+	completeCtx, completeCancel := context.WithTimeout(context.Background(), aiStreamReceiptCleanupTimeout)
+	if err := s.completeAIStreamReceipt(completeCtx, principal.UserID, receiptClaim, done); err != nil {
+		s.logger.WarnContext(completeCtx, "failed to complete AI stream receipt", "error", err, "operation_type", receiptClaim.OperationType)
+	}
+	completeCancel()
+	_ = writeSSE(w, flusher, "ai.stream.done", done)
+}
+
+func (s *Server) replayAISSEStreamReceipt(w http.ResponseWriter, flusher http.Flusher, r *http.Request, conversationID string, clientMessageID string, receipt repository.OperationReceipt) {
+	streamID := newAIStreamID()
+	done, code, message := aiStreamDoneFromReceipt(receipt, streamID)
+
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	if code != "" {
+		_ = writeSSE(w, flusher, "client.error", aiStreamErrorResponse{
+			RequestType: "ai.message.send",
+			Code:        code,
+			Message:     message,
+			RequestID:   requestIDFromContext(r.Context()),
+		})
+		return
+	}
+	if err := writeSSE(w, flusher, "ai.stream.started", aiStreamStartedResponse{
+		StreamID:        streamID,
+		ConversationID:  conversationID,
+		ClientMessageID: clientMessageID,
+	}); err != nil {
+		return
+	}
+	_ = writeSSE(w, flusher, "ai.stream.done", done)
 }
 
 func (s *Server) handleAIBindFile(w http.ResponseWriter, r *http.Request) {
