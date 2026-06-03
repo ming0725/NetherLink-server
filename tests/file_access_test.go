@@ -2,6 +2,7 @@ package tests
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -90,6 +91,33 @@ func TestExpiredTemporaryAIUploadedFileCleanup(t *testing.T) {
 	assertAIFileUsageDeleted(t, pool, aiActiveTemporaryUploadID, false)
 	assertAIFileChunkCount(t, pool, aiExpiredTemporaryUploadID, 0)
 	assertAIFileChunkCount(t, pool, aiActiveTemporaryUploadID, 1)
+}
+
+func TestDeleteAIConversationReleasesFilesAndChunks(t *testing.T) {
+	pool := newPostgresIntegrationPool(t)
+	repos := repository.New(pool)
+	ctx := context.Background()
+
+	seedExpiredTemporaryAIFileFixtures(t, pool)
+
+	if err := repos.AI.DeleteConversation(ctx, aiTempOwnerID, aiTemporaryConversationID); err != nil {
+		t.Fatalf("DeleteConversation() error = %v", err)
+	}
+
+	assertAIConversationDeleted(t, pool, aiTemporaryConversationID, true)
+	assertAIUploadedFileDeleted(t, pool, aiExpiredTemporaryUploadID, true)
+	assertAIUploadedFileDeleted(t, pool, aiActiveTemporaryUploadID, true)
+	assertAIUploadedFileDeleted(t, pool, aiConversationRetentionUploadID, true)
+	assertAIFileUsageDeleted(t, pool, aiExpiredTemporaryUploadID, true)
+	assertAIFileUsageDeleted(t, pool, aiActiveTemporaryUploadID, true)
+	assertAIFileUsageDeleted(t, pool, aiConversationRetentionUploadID, true)
+	assertAIFileChunkCount(t, pool, aiExpiredTemporaryUploadID, 0)
+	assertAIFileChunkCount(t, pool, aiActiveTemporaryUploadID, 0)
+	assertAIFileChunkCount(t, pool, aiConversationRetentionUploadID, 0)
+
+	if err := repos.AI.DeleteConversation(ctx, aiTempOwnerID, aiTemporaryConversationID); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("second DeleteConversation() error = %v, want ErrNotFound", err)
+	}
 }
 
 func newPostgresIntegrationPool(t *testing.T) *pgxpool.Pool {
@@ -199,6 +227,23 @@ func assertAIUploadedFileDeleted(t *testing.T, pool *pgxpool.Pool, aiFileID stri
 	}
 	if got != want {
 		t.Fatalf("AI uploaded file %s deleted = %v, want %v", aiFileID, got, want)
+	}
+}
+
+func assertAIConversationDeleted(t *testing.T, pool *pgxpool.Pool, conversationID string, want bool) {
+	t.Helper()
+
+	var got bool
+	if err := pool.QueryRow(context.Background(), `
+		SELECT deleted_at IS NOT NULL
+		FROM ai_conversations
+		WHERE id = $1::uuid`,
+		conversationID,
+	).Scan(&got); err != nil {
+		t.Fatalf("read AI conversation deleted state: %v", err)
+	}
+	if got != want {
+		t.Fatalf("AI conversation %s deleted = %v, want %v", conversationID, got, want)
 	}
 }
 

@@ -228,6 +228,33 @@ func (s *Server) handleAIListMessages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, aiMessagesResponse{Messages: makeAIMessageResponses(messages)})
 }
 
+func (s *Server) handleAIDeleteConversation(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAIService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+	conversationID := r.PathValue("conversationId")
+	if reqErr := validateUUID(conversationID, "conversationId"); reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+	s.handleIdempotentWrite(w, r, principal.UserID, "ai.conversation.delete:"+conversationID, idempotencyKeyFromRequest(r, r.URL.Query().Get("clientOperationId")), func(err error) {
+		writeAIServiceError(w, r, err)
+	}, func() (idempotentHTTPResult, error) {
+		if err := s.aiService.DeleteConversation(r.Context(), principal.UserID, conversationID); err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   okResponse{OK: true},
+		}, nil
+	})
+}
+
 func (s *Server) handleAISendMessage(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAIService(w, r) {
 		return

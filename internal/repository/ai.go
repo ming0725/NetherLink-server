@@ -233,6 +233,62 @@ func (r *AIRepository) UpdateConversationTitle(ctx context.Context, userID strin
 	return conversation, translateWriteError(err)
 }
 
+func (r *AIRepository) DeleteConversation(ctx context.Context, userID string, conversationID string) error {
+	var deletedCount int
+	err := r.db.QueryRow(ctx, `
+		WITH deleted_conversation AS (
+			UPDATE ai_conversations
+			SET deleted_at = now(),
+			    updated_at = now()
+			WHERE id = $1::uuid
+			  AND user_id = $2::uuid
+			  AND deleted_at IS NULL
+			RETURNING id
+		),
+		deleted_messages AS (
+			UPDATE ai_messages m
+			SET deleted_at = now(),
+			    updated_at = now()
+			FROM deleted_conversation dc
+			WHERE m.conversation_id = dc.id
+			  AND m.deleted_at IS NULL
+		),
+		deleted_files AS (
+			UPDATE ai_uploaded_files auf
+			SET deleted_at = now(),
+			    updated_at = now()
+			FROM deleted_conversation dc
+			WHERE auf.conversation_id = dc.id
+			  AND auf.deleted_at IS NULL
+			RETURNING auf.id
+		),
+		deleted_chunks AS (
+			DELETE FROM ai_file_chunks chunk
+			USING deleted_files df
+			WHERE chunk.ai_file_id = df.id
+		),
+		deleted_usages AS (
+			UPDATE file_usages fu
+			SET deleted_at = now(),
+			    updated_at = now()
+			FROM deleted_files df
+			WHERE fu.usage_type IN ('ai_upload', 'ai_extracted_text')
+			  AND fu.business_id = df.id
+			  AND fu.deleted_at IS NULL
+		)
+		SELECT count(*) FROM deleted_conversation`,
+		normalizeText(conversationID),
+		normalizeText(userID),
+	).Scan(&deletedCount)
+	if err != nil {
+		return err
+	}
+	if deletedCount == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (r *AIRepository) CreateMessage(ctx context.Context, params CreateAIMessageParams) (AIMessage, error) {
 	message, err := scanAIMessage(r.db.QueryRow(ctx, `
 		INSERT INTO ai_messages (

@@ -263,6 +263,7 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("DELETE /api/v1/conversations/{conversationId}/messages", s.withAuthRequired(http.HandlerFunc(s.handleHideConversationHistory)))
 	mux.Handle("GET /api/v1/ai/conversations", s.withAuthRequired(http.HandlerFunc(s.handleAIListConversations)))
 	mux.Handle("POST /api/v1/ai/conversations", s.withAuthRequired(http.HandlerFunc(s.handleAICreateConversation)))
+	mux.Handle("DELETE /api/v1/ai/conversations/{conversationId}", s.withAuthRequired(http.HandlerFunc(s.handleAIDeleteConversation)))
 	mux.Handle("GET /api/v1/ai/conversations/{conversationId}/messages", s.withAuthRequired(http.HandlerFunc(s.handleAIListMessages)))
 	mux.Handle("POST /api/v1/ai/conversations/{conversationId}/messages", s.withAuthRequired(http.HandlerFunc(s.handleAISendMessage)))
 	mux.Handle("POST /api/v1/ai/conversations/{conversationId}/files", s.withAuthRequired(http.HandlerFunc(s.handleAIBindFile)))

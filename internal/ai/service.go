@@ -166,6 +166,16 @@ func (s *Service) ListMessages(ctx context.Context, userID string, conversationI
 	return s.repos.AI.ListMessages(ctx, userID, conversationID)
 }
 
+func (s *Service) DeleteConversation(ctx context.Context, userID string, conversationID string) error {
+	if s.repos.AI == nil {
+		return ErrUnavailable
+	}
+	if strings.TrimSpace(userID) == "" || strings.TrimSpace(conversationID) == "" {
+		return ErrValidation
+	}
+	return mapRepositoryError(s.repos.AI.DeleteConversation(ctx, userID, conversationID))
+}
+
 func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (SendMessageResult, error) {
 	prepared, err := s.prepareMessageCompletion(ctx, input)
 	if err != nil {
