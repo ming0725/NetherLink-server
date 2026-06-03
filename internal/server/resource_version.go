@@ -1,11 +1,14 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 )
+
+var errResourceVersionConflict = errors.New("resource version conflict")
 
 func resourceETag(resourceType string, resourceID string, version int) string {
 	return fmt.Sprintf(`"%s-%s-v%d"`, resourceType, resourceID, version)
@@ -27,12 +30,18 @@ func ifNoneMatch(r *http.Request, etag string) bool {
 }
 
 func checkResourceVersion(w http.ResponseWriter, r *http.Request, resourceETag string, currentVersion int, expectedVersion *int) bool {
-	if expectedVersion != nil && *expectedVersion != currentVersion {
+	if !resourceVersionMatches(r, resourceETag, currentVersion, expectedVersion) {
 		writeError(w, r, http.StatusConflict, "VERSION_CONFLICT", "Resource version conflict")
 		return false
 	}
+	return true
+}
+
+func resourceVersionMatches(r *http.Request, resourceETag string, currentVersion int, expectedVersion *int) bool {
+	if expectedVersion != nil && *expectedVersion != currentVersion {
+		return false
+	}
 	if header := strings.TrimSpace(r.Header.Get("If-Match")); header != "" && !etagListMatches(header, resourceETag) {
-		writeError(w, r, http.StatusConflict, "VERSION_CONFLICT", "Resource version conflict")
 		return false
 	}
 	return true

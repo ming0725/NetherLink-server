@@ -334,24 +334,32 @@ func (s *Server) handleDeletePost(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, r, reqErr)
 		return
 	}
-	post, err := s.repos.Posts.GetPost(r.Context(), principal.UserID, postID)
-	if err != nil {
-		writeRepositoryError(w, r, err)
-		return
-	}
-	if !checkResourceVersion(w, r, resourceETag("post", post.Post.ID, post.Post.Version), post.Post.Version, expectedVersion) {
-		return
-	}
-	if err := s.postService.DeletePost(r.Context(), postID, principal.UserID); err != nil {
-		writePostServiceError(w, r, err)
-		return
-	}
-	s.publishRealtimeEvent(r.Context(), []string{principal.UserID, post.Post.AuthorID}, "post.deleted", map[string]any{
-		"postId":       postID,
-		"authorUuid":   post.Post.AuthorID,
-		"operatorUuid": principal.UserID,
+
+	s.handleIdempotentWrite(w, r, principal.UserID, "post.delete:"+postID, idempotencyKeyFromRequest(r, r.URL.Query().Get("clientOperationId")), func(err error) {
+		writeVersionedPostOperationError(w, r, err)
+	}, func() (idempotentHTTPResult, error) {
+		post, err := s.repos.Posts.GetPost(r.Context(), principal.UserID, postID)
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		if !resourceVersionMatches(r, resourceETag("post", post.Post.ID, post.Post.Version), post.Post.Version, expectedVersion) {
+			return idempotentHTTPResult{}, errResourceVersionConflict
+		}
+		if err := s.postService.DeletePost(r.Context(), postID, principal.UserID); err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   okResponse{OK: true},
+			After: func() {
+				s.publishRealtimeEvent(r.Context(), []string{principal.UserID, post.Post.AuthorID}, "post.deleted", map[string]any{
+					"postId":       postID,
+					"authorUuid":   post.Post.AuthorID,
+					"operatorUuid": principal.UserID,
+				})
+			},
+		}, nil
 	})
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) handleSetPostLike(w http.ResponseWriter, r *http.Request) {
@@ -632,24 +640,33 @@ func (s *Server) handleDeleteComment(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, r, reqErr)
 		return
 	}
-	commentPostID := ""
-	if s.repos.Posts != nil {
-		if postID, err := s.repos.Posts.GetCommentPostID(r.Context(), commentID, principal.UserID); err == nil {
-			commentPostID = postID
-		} else {
-			s.logger.WarnContext(r.Context(), "failed to load comment post for realtime delete", "error", err, "comment_id", commentID)
-		}
-	}
-	if err := s.postService.DeleteComment(r.Context(), commentID, principal.UserID); err != nil {
+
+	s.handleIdempotentWrite(w, r, principal.UserID, "post.comment.delete:"+commentID, idempotencyKeyFromRequest(r, r.URL.Query().Get("clientOperationId")), func(err error) {
 		writePostServiceError(w, r, err)
-		return
-	}
-	if commentPostID != "" {
-		s.publishPostSnapshotRealtimeEvent(r.Context(), principal.UserID, commentPostID, "post.comment.deleted", "comment.deleted", map[string]any{
-			"commentId": commentID,
-		})
-	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	}, func() (idempotentHTTPResult, error) {
+		commentPostID := ""
+		if s.repos.Posts != nil {
+			if postID, err := s.repos.Posts.GetCommentPostID(r.Context(), commentID, principal.UserID); err == nil {
+				commentPostID = postID
+			} else {
+				s.logger.WarnContext(r.Context(), "failed to load comment post for realtime delete", "error", err, "comment_id", commentID)
+			}
+		}
+		if err := s.postService.DeleteComment(r.Context(), commentID, principal.UserID); err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   okResponse{OK: true},
+			After: func() {
+				if commentPostID != "" {
+					s.publishPostSnapshotRealtimeEvent(r.Context(), principal.UserID, commentPostID, "post.comment.deleted", "comment.deleted", map[string]any{
+						"commentId": commentID,
+					})
+				}
+			},
+		}, nil
+	})
 }
 
 func (s *Server) handleDeleteReply(w http.ResponseWriter, r *http.Request) {
@@ -666,24 +683,33 @@ func (s *Server) handleDeleteReply(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, r, reqErr)
 		return
 	}
-	replyPostID := ""
-	if s.repos.Posts != nil {
-		if postID, err := s.repos.Posts.GetReplyPostID(r.Context(), replyID, principal.UserID); err == nil {
-			replyPostID = postID
-		} else {
-			s.logger.WarnContext(r.Context(), "failed to load reply post for realtime delete", "error", err, "reply_id", replyID)
-		}
-	}
-	if err := s.postService.DeleteReply(r.Context(), replyID, principal.UserID); err != nil {
+
+	s.handleIdempotentWrite(w, r, principal.UserID, "post.reply.delete:"+replyID, idempotencyKeyFromRequest(r, r.URL.Query().Get("clientOperationId")), func(err error) {
 		writePostServiceError(w, r, err)
-		return
-	}
-	if replyPostID != "" {
-		s.publishPostSnapshotRealtimeEvent(r.Context(), principal.UserID, replyPostID, "post.reply.deleted", "reply.deleted", map[string]any{
-			"replyId": replyID,
-		})
-	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	}, func() (idempotentHTTPResult, error) {
+		replyPostID := ""
+		if s.repos.Posts != nil {
+			if postID, err := s.repos.Posts.GetReplyPostID(r.Context(), replyID, principal.UserID); err == nil {
+				replyPostID = postID
+			} else {
+				s.logger.WarnContext(r.Context(), "failed to load reply post for realtime delete", "error", err, "reply_id", replyID)
+			}
+		}
+		if err := s.postService.DeleteReply(r.Context(), replyID, principal.UserID); err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   okResponse{OK: true},
+			After: func() {
+				if replyPostID != "" {
+					s.publishPostSnapshotRealtimeEvent(r.Context(), principal.UserID, replyPostID, "post.reply.deleted", "reply.deleted", map[string]any{
+						"replyId": replyID,
+					})
+				}
+			},
+		}, nil
+	})
 }
 
 func makePostResponses(posts []repository.PostEntry, includeFullMedia bool) []postResponse {
@@ -861,4 +887,12 @@ func writePostServiceError(w http.ResponseWriter, r *http.Request, err error) {
 	default:
 		writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error")
 	}
+}
+
+func writeVersionedPostOperationError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, errResourceVersionConflict) {
+		writeError(w, r, http.StatusConflict, "VERSION_CONFLICT", "Resource version conflict")
+		return
+	}
+	writePostServiceError(w, r, err)
 }
