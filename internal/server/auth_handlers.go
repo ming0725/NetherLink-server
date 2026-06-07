@@ -12,6 +12,7 @@ import (
 	"time"
 
 	authsvc "nlserver/internal/auth"
+	"nlserver/internal/realtime"
 	"nlserver/internal/repository"
 )
 
@@ -80,23 +81,30 @@ type refreshResponse struct {
 }
 
 type userResponse struct {
-	UserUUID          string     `json:"userUuid"`
-	UserID            string     `json:"userId"`
-	Email             string     `json:"email,omitempty"`
-	NickName          string     `json:"nickName"`
-	Gender            string     `json:"gender"`
-	GenderCustom      *string    `json:"genderCustom"`
-	AvatarURL         *string    `json:"avatarUrl"`
-	AvatarVersion     int        `json:"avatarVersion"`
-	AvatarEtag        *string    `json:"avatarEtag"`
-	AvatarContentHash *string    `json:"avatarContentHash"`
-	Status            string     `json:"status"`
-	Signature         *string    `json:"signature"`
-	Region            *string    `json:"region"`
-	LastSeenAt        *time.Time `json:"lastSeenAt"`
-	Version           int        `json:"version"`
-	ETag              string     `json:"etag"`
-	UpdatedAt         time.Time  `json:"updatedAt"`
+	UserUUID          string            `json:"userUuid"`
+	UserID            string            `json:"userId"`
+	Email             string            `json:"email,omitempty"`
+	NickName          string            `json:"nickName"`
+	Gender            string            `json:"gender"`
+	GenderCustom      *string           `json:"genderCustom"`
+	AvatarURL         *string           `json:"avatarUrl"`
+	AvatarVersion     int               `json:"avatarVersion"`
+	AvatarEtag        *string           `json:"avatarEtag"`
+	AvatarContentHash *string           `json:"avatarContentHash"`
+	Status            string            `json:"status"`
+	Signature         *string           `json:"signature"`
+	Region            *string           `json:"region"`
+	LastSeenAt        *time.Time        `json:"lastSeenAt"`
+	Presence          *presenceResponse `json:"presence,omitempty"`
+	Version           int               `json:"version"`
+	ETag              string            `json:"etag"`
+	UpdatedAt         time.Time         `json:"updatedAt"`
+}
+
+type presenceResponse struct {
+	Status     string     `json:"status"`
+	LastSeenAt *time.Time `json:"lastSeenAt"`
+	UpdatedAt  *time.Time `json:"updatedAt,omitempty"`
 }
 
 type preferencesResponse struct {
@@ -158,7 +166,7 @@ func (s *Server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, authResponse{
-		User:         makeUserResponse(result.User),
+		User:         s.makeUserResponseForViewer(result.User.ID, result.User),
 		AccessToken:  result.AccessToken,
 		RefreshToken: result.RefreshToken,
 		ExpiresIn:    result.ExpiresIn,
@@ -192,9 +200,11 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.notifyAuthSessionsRevoked(r.Context(), result.User.ID, result.RevokedSessions, "replaced_by_new_login")
+
 	preferences := makePreferencesResponse(result.Preferences)
 	writeJSON(w, http.StatusOK, authResponse{
-		User:         makeUserResponse(result.User),
+		User:         s.makeUserResponseForViewer(result.User.ID, result.User),
 		Preferences:  &preferences,
 		AccessToken:  result.AccessToken,
 		RefreshToken: result.RefreshToken,
@@ -261,7 +271,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := makeUserResponse(user)
+	response := s.makeUserResponseForViewer(principal.UserID, user)
 	writeJSONWithETag(w, r, http.StatusOK, response.ETag, response)
 }
 
@@ -300,8 +310,8 @@ func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := makeUserResponse(user)
-	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, makeProfileUpdatedPayload("profile.updated", response))
+	response := s.makeUserResponseForViewer(principal.UserID, user)
+	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, makeProfileUpdatedPayload("profile.updated", makePublicUserResponse(user)))
 	writeJSONWithETag(w, r, http.StatusOK, response.ETag, response)
 }
 
@@ -355,8 +365,8 @@ func (s *Server) handlePatchMeUserID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := makeUserResponse(user)
-	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, makeProfileUpdatedPayload("public_id.updated", response))
+	response := s.makeUserResponseForViewer(principal.UserID, user)
+	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, makeProfileUpdatedPayload("public_id.updated", makePublicUserResponse(user)))
 	writeJSONWithETag(w, r, http.StatusOK, response.ETag, response)
 }
 
@@ -385,12 +395,14 @@ func (s *Server) handleAuthRevokeSession(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if err := s.authService.RevokeSession(r.Context(), principal.UserID, r.PathValue("sessionId")); err != nil {
+	session, err := s.authService.RevokeSession(r.Context(), principal.UserID, r.PathValue("sessionId"))
+	if err != nil {
 		writeAccountError(w, r, err)
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	s.notifyAuthSessionsRevoked(r.Context(), principal.UserID, []repository.UserSession{session}, "session_revoked")
 }
 
 func (s *Server) handleGetMePreferences(w http.ResponseWriter, r *http.Request) {
@@ -493,7 +505,7 @@ func makeUserResponse(user repository.User) userResponse {
 		NickName:          user.Nick,
 		Gender:            user.Gender,
 		GenderCustom:      user.GenderCustom,
-		AvatarURL:         nil,
+		AvatarURL:         avatarContentURL(user.AvatarFileID),
 		AvatarVersion:     user.Version,
 		AvatarEtag:        nil,
 		AvatarContentHash: nil,
@@ -505,6 +517,14 @@ func makeUserResponse(user repository.User) userResponse {
 		ETag:              resourceETag("user", user.ID, user.Version),
 		UpdatedAt:         user.UpdatedAt,
 	}
+}
+
+func avatarContentURL(fileID *string) *string {
+	if fileID == nil || strings.TrimSpace(*fileID) == "" {
+		return nil
+	}
+	value := "/api/v1/avatar-files/" + strings.TrimSpace(*fileID) + "?variant=thumb"
+	return &value
 }
 
 func makePreferencesResponse(preferences repository.UserPreference) preferencesResponse {
@@ -533,6 +553,41 @@ func makeSessionResponses(sessions []repository.UserSession, currentSessionID st
 		})
 	}
 	return responses
+}
+
+func (s *Server) notifyAuthSessionsRevoked(ctx context.Context, userID string, sessions []repository.UserSession, reason string) {
+	if s.realtimeHub == nil || len(sessions) == 0 {
+		return
+	}
+
+	disconnected := 0
+	revokedAt := time.Now().UTC()
+	for _, session := range sessions {
+		payload := websocketAuthSessionRevokedPayload{
+			SessionID: session.ID,
+			DeviceID:  session.DeviceID,
+			Reason:    reason,
+			RevokedAt: revokedAt,
+		}
+		disconnected += s.realtimeHub.DisconnectSession(userID, session.ID, "auth.session.revoked", payload)
+		s.fanoutAuthSessionRevoked(ctx, userID, payload)
+	}
+	if disconnected > 0 && !s.realtimeHub.HasUserConnections(userID) {
+		s.handleWebSocketPresenceDisconnect(ctx, userID)
+	}
+}
+
+func (s *Server) fanoutAuthSessionRevoked(ctx context.Context, userID string, payload websocketAuthSessionRevokedPayload) {
+	if s.realtimeFanout == nil {
+		return
+	}
+	if err := s.realtimeFanout.Publish(ctx, []string{userID}, realtime.Event{
+		Type:      "auth.session.revoked",
+		EmittedAt: time.Now().UTC(),
+		Payload:   realtime.MarshalPayload(payload),
+	}); err != nil {
+		s.logger.WarnContext(ctx, "failed to publish auth session revoke fanout", "error", err, "user_id", userID)
+	}
 }
 
 func writeRequestError(w http.ResponseWriter, r *http.Request, err *requestError) {

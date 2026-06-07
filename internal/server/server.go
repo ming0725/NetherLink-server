@@ -72,7 +72,7 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client, logger 
 	}
 	if db != nil {
 		deps.Repos = repository.New(db)
-		deps.AuthService = authsvc.NewService(cfg.Auth, deps.Repos)
+		deps.AuthService = authsvc.NewServiceWithTx(cfg.Auth, deps.Repos, db)
 	}
 
 	return NewWithDependencies(deps)
@@ -86,7 +86,7 @@ func NewWithDependencies(deps Dependencies) *Server {
 		deps.Repos = repository.New(deps.DB)
 	}
 	if deps.AuthService == nil && deps.Repos.Users != nil && deps.Repos.Sessions != nil {
-		deps.AuthService = authsvc.NewService(deps.Config.Auth, deps.Repos)
+		deps.AuthService = authsvc.NewServiceWithTx(deps.Config.Auth, deps.Repos, deps.DB)
 	}
 	if deps.AIService == nil && deps.Repos.AI != nil {
 		if aiClient, err := aisvc.NewChatClient(deps.Config.AI); err == nil {
@@ -202,10 +202,12 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/v1/me/avatar", s.withAuthRequired(http.HandlerFunc(s.handleUploadMeAvatar)))
 	mux.Handle("GET /api/v1/me/preferences", s.withAuthRequired(http.HandlerFunc(s.handleGetMePreferences)))
 	mux.Handle("PATCH /api/v1/me/preferences", s.withAuthRequired(http.HandlerFunc(s.handlePatchMePreferences)))
+	mux.HandleFunc("GET /api/v1/avatar-files/{fileId}", s.handleGetPublicAvatarFile)
 	mux.Handle("GET /api/v1/users", s.withAuthRequired(http.HandlerFunc(s.handleUsersSearch)))
 	mux.Handle("GET /api/v1/users/by-id/{userId}", s.withAuthRequired(http.HandlerFunc(s.handleUserByPublicID)))
 	mux.Handle("GET /api/v1/users/{userUuid}", s.withAuthRequired(http.HandlerFunc(s.handleUserByUUID)))
 	mux.Handle("POST /api/v1/users/batch", s.withAuthRequired(http.HandlerFunc(s.handleUsersBatch)))
+	mux.Handle("POST /api/v1/presence/batch", s.withAuthRequired(http.HandlerFunc(s.handlePresenceBatch)))
 	mux.Handle("POST /api/v1/users/{authorUuid}/follow", s.withAuthRequired(http.HandlerFunc(s.handleSetAuthorFollow)))
 	mux.Handle("GET /api/v1/friends", s.withAuthRequired(http.HandlerFunc(s.handleFriends)))
 	mux.Handle("PATCH /api/v1/friends/{friendUserUuid}", s.withAuthRequired(http.HandlerFunc(s.handlePatchFriend)))
@@ -222,6 +224,7 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("PATCH /api/v1/groups/{groupId}", s.withAuthRequired(http.HandlerFunc(s.handlePatchGroup)))
 	mux.Handle("DELETE /api/v1/groups/{groupId}", s.withAuthRequired(http.HandlerFunc(s.handleDeleteGroup)))
 	mux.Handle("GET /api/v1/groups/{groupId}/members", s.withAuthRequired(http.HandlerFunc(s.handleGroupMembers)))
+	mux.Handle("POST /api/v1/groups/{groupId}/members/batch", s.withAuthRequired(http.HandlerFunc(s.handleGroupMembersBatch)))
 	mux.Handle("POST /api/v1/groups/{groupId}/members", s.withAuthRequired(http.HandlerFunc(s.handleAddGroupMembers)))
 	mux.Handle("DELETE /api/v1/groups/{groupId}/members/{userUuid}", s.withAuthRequired(http.HandlerFunc(s.handleRemoveGroupMember)))
 	mux.Handle("PATCH /api/v1/groups/{groupId}/members/{userUuid}", s.withAuthRequired(http.HandlerFunc(s.handlePatchGroupMember)))
@@ -263,6 +266,7 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("DELETE /api/v1/conversations/{conversationId}/messages", s.withAuthRequired(http.HandlerFunc(s.handleHideConversationHistory)))
 	mux.Handle("GET /api/v1/ai/conversations", s.withAuthRequired(http.HandlerFunc(s.handleAIListConversations)))
 	mux.Handle("POST /api/v1/ai/conversations", s.withAuthRequired(http.HandlerFunc(s.handleAICreateConversation)))
+	mux.Handle("PATCH /api/v1/ai/conversations/{conversationId}", s.withAuthRequired(http.HandlerFunc(s.handleAIUpdateConversation)))
 	mux.Handle("DELETE /api/v1/ai/conversations/{conversationId}", s.withAuthRequired(http.HandlerFunc(s.handleAIDeleteConversation)))
 	mux.Handle("GET /api/v1/ai/conversations/{conversationId}/messages", s.withAuthRequired(http.HandlerFunc(s.handleAIListMessages)))
 	mux.Handle("POST /api/v1/ai/conversations/{conversationId}/messages", s.withAuthRequired(http.HandlerFunc(s.handleAISendMessage)))

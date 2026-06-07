@@ -56,11 +56,13 @@ type markConversationUnreadRequest struct {
 }
 
 type conversationsResponse struct {
-	Conversations []conversationResponse `json:"conversations"`
+	Conversations []conversationResponse     `json:"conversations"`
+	Included      *includedResourcesResponse `json:"included,omitempty"`
 }
 
 type conversationDetailResponse struct {
-	Conversation conversationResponse `json:"conversation"`
+	Conversation conversationResponse       `json:"conversation"`
+	Included     *includedResourcesResponse `json:"included,omitempty"`
 }
 
 type conversationSettingsResponse struct {
@@ -134,14 +136,16 @@ type conversationSyncStateResponse struct {
 }
 
 type messageDetailResponse struct {
-	Message messageResponse `json:"message"`
+	Message  messageResponse            `json:"message"`
+	Included *includedResourcesResponse `json:"included,omitempty"`
 }
 
 type messagesResponse struct {
-	Messages      []messageResponse  `json:"messages"`
-	HasMoreBefore bool               `json:"hasMoreBefore"`
-	HasMoreAfter  bool               `json:"hasMoreAfter"`
-	SyncCursor    *messageSyncCursor `json:"syncCursor,omitempty"`
+	Messages      []messageResponse          `json:"messages"`
+	HasMoreBefore bool                       `json:"hasMoreBefore"`
+	HasMoreAfter  bool                       `json:"hasMoreAfter"`
+	SyncCursor    *messageSyncCursor         `json:"syncCursor,omitempty"`
+	Included      *includedResourcesResponse `json:"included,omitempty"`
 }
 
 type messageSyncCursor struct {
@@ -187,7 +191,8 @@ type messageAttachmentResponse struct {
 }
 
 type realtimeMessagePayload struct {
-	Message messageResponse `json:"message"`
+	Message messageResponse              `json:"message"`
+	Refs    *referencedResourcesResponse `json:"refs,omitempty"`
 }
 
 type realtimeConversationSyncPayload struct {
@@ -207,6 +212,7 @@ type realtimeConversationUpdatedPayload struct {
 	Version        int                           `json:"version"`
 	ETag           string                        `json:"etag"`
 	UpdatedAt      time.Time                     `json:"updatedAt"`
+	Refs           *referencedResourcesResponse  `json:"refs,omitempty"`
 }
 
 func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request) {
@@ -241,7 +247,12 @@ func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request)
 		writeChatError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, conversationsResponse{Conversations: responses})
+	included, err := s.makeIncludedForConversationEntries(r.Context(), principal.UserID, entries)
+	if err != nil {
+		writeChatError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, conversationsResponse{Conversations: responses, Included: included})
 }
 
 func (s *Server) handleOpenDirectConversation(w http.ResponseWriter, r *http.Request) {
@@ -278,7 +289,12 @@ func (s *Server) handleOpenDirectConversation(w http.ResponseWriter, r *http.Req
 		writeChatError(w, r, err)
 		return
 	}
-	writeJSONWithETag(w, r, http.StatusOK, response.ETag, conversationDetailResponse{Conversation: response})
+	included, err := s.makeIncludedForConversationEntries(r.Context(), principal.UserID, []repository.ConversationEntry{entry})
+	if err != nil {
+		writeChatError(w, r, err)
+		return
+	}
+	writeJSONWithETag(w, r, http.StatusOK, response.ETag, conversationDetailResponse{Conversation: response, Included: included})
 }
 
 func (s *Server) handleOpenGroupConversation(w http.ResponseWriter, r *http.Request) {
@@ -315,7 +331,12 @@ func (s *Server) handleOpenGroupConversation(w http.ResponseWriter, r *http.Requ
 		writeChatError(w, r, err)
 		return
 	}
-	writeJSONWithETag(w, r, http.StatusOK, response.ETag, conversationDetailResponse{Conversation: response})
+	included, err := s.makeIncludedForConversationEntries(r.Context(), principal.UserID, []repository.ConversationEntry{entry})
+	if err != nil {
+		writeChatError(w, r, err)
+		return
+	}
+	writeJSONWithETag(w, r, http.StatusOK, response.ETag, conversationDetailResponse{Conversation: response, Included: included})
 }
 
 func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
@@ -347,7 +368,12 @@ func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
 		writeChatError(w, r, err)
 		return
 	}
-	writeJSONWithETag(w, r, http.StatusOK, response.ETag, conversationDetailResponse{Conversation: response})
+	included, err := s.makeIncludedForConversationEntries(r.Context(), principal.UserID, []repository.ConversationEntry{entry})
+	if err != nil {
+		writeChatError(w, r, err)
+		return
+	}
+	writeJSONWithETag(w, r, http.StatusOK, response.ETag, conversationDetailResponse{Conversation: response, Included: included})
 }
 
 func (s *Server) handleUpdateConversationSettings(w http.ResponseWriter, r *http.Request) {
@@ -530,9 +556,14 @@ func (s *Server) handleRecallMessage(w http.ResponseWriter, r *http.Request) {
 		writeChatError(w, r, err)
 		return
 	}
+	included, err := s.makeIncludedForMessages(r.Context(), principal.UserID, conversationID, []repository.Message{message})
+	if err != nil {
+		writeChatError(w, r, err)
+		return
+	}
 	s.publishConversationMessage(r.Context(), conversationID, "chat.message.recalled", response)
 	s.publishAllConversationUpdated(r.Context(), conversationID, "message.recalled")
-	writeJSON(w, http.StatusOK, messageDetailResponse{Message: response})
+	writeJSON(w, http.StatusOK, messageDetailResponse{Message: response, Included: included})
 }
 
 func (s *Server) handleHideConversationHistory(w http.ResponseWriter, r *http.Request) {
@@ -634,10 +665,15 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		writeChatError(w, r, err)
 		return
 	}
+	included, err := s.makeIncludedForMessages(r.Context(), principal.UserID, conversationID, []repository.Message{message})
+	if err != nil {
+		writeChatError(w, r, err)
+		return
+	}
 	s.publishConversationMessage(r.Context(), conversationID, "chat.message.created", response)
 	s.publishAllConversationSyncStates(r.Context(), conversationID, "message.created")
 	s.publishAllConversationUpdated(r.Context(), conversationID, "message.created")
-	writeJSON(w, http.StatusCreated, messageDetailResponse{Message: response})
+	writeJSON(w, http.StatusCreated, messageDetailResponse{Message: response, Included: included})
 }
 
 func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
@@ -693,12 +729,18 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		responses = append(responses, response)
 	}
+	included, err := s.makeIncludedForMessages(r.Context(), principal.UserID, conversationID, messages)
+	if err != nil {
+		writeChatError(w, r, err)
+		return
+	}
 
 	writeJSON(w, http.StatusOK, messagesResponse{
 		Messages:      responses,
 		HasMoreBefore: beforeSeq != nil && len(responses) == limit,
 		HasMoreAfter:  afterSeq != nil && len(responses) == limit,
 		SyncCursor:    makeMessageSyncCursor(messages),
+		Included:      included,
 	})
 }
 
@@ -780,6 +822,7 @@ func makeConversationSummaryResponse(entry repository.ConversationEntry) convers
 	if entry.PeerUser != nil {
 		peer := makeConversationUserSummaryResponse(*entry.PeerUser)
 		response.Title = peer.NickName
+		response.AvatarURL = avatarContentURL(entry.PeerUser.AvatarFileID)
 		response.AvatarVersion = peer.Version
 		response.PeerUser = &peer
 	}
@@ -819,7 +862,7 @@ func makeConversationGroupSummaryResponse(group repository.ConversationGroupSumm
 		GroupID:           group.ID,
 		Name:              group.Name,
 		OwnerUUID:         group.OwnerID,
-		AvatarURL:         nil,
+		AvatarURL:         avatarContentURL(group.AvatarFileID),
 		AvatarVersion:     group.Version,
 		AvatarEtag:        nil,
 		AvatarContentHash: nil,
@@ -935,7 +978,10 @@ func (s *Server) publishConversationMessage(ctx context.Context, conversationID 
 		s.logger.WarnContext(ctx, "failed to list realtime message recipients", "error", err, "conversation_id", conversationID)
 		return
 	}
-	s.publishRealtimeEvent(ctx, userIDs, eventType, realtimeMessagePayload{Message: message})
+	s.publishRealtimeEvent(ctx, userIDs, eventType, realtimeMessagePayload{
+		Message: message,
+		Refs:    s.makeRealtimeMessageRefs(ctx, conversationID, message),
+	})
 }
 
 func (s *Server) publishConversationSyncState(ctx context.Context, participant repository.ConversationParticipant, reason string) {
@@ -961,6 +1007,10 @@ func (s *Server) publishConversationUpdatedForParticipant(ctx context.Context, u
 		s.logger.WarnContext(ctx, "failed to build realtime conversation snapshot", "error", err, "conversation_id", conversationID, "user_id", userID)
 		return
 	}
+	var refs *referencedResourcesResponse
+	if response.LastMessage != nil {
+		refs = s.makeRealtimeMessageRefs(ctx, conversationID, *response.LastMessage)
+	}
 	s.publishRealtimeEvent(ctx, []string{userID}, "chat.conversation.updated", realtimeConversationUpdatedPayload{
 		ConversationID: response.ConversationID,
 		Reason:         reason,
@@ -971,6 +1021,7 @@ func (s *Server) publishConversationUpdatedForParticipant(ctx context.Context, u
 		Version:        response.Version,
 		ETag:           response.ETag,
 		UpdatedAt:      response.UpdatedAt,
+		Refs:           refs,
 	})
 }
 
@@ -1015,6 +1066,8 @@ func chatErrorCodeAndMessage(err error) (string, string) {
 	switch {
 	case errors.Is(err, chatsvc.ErrValidation):
 		return "VALIDATION_ERROR", "Invalid chat request"
+	case errors.Is(err, chatsvc.ErrNotFriend):
+		return "NOT_FRIEND", "You are not friends with this user"
 	case errors.Is(err, chatsvc.ErrForbidden):
 		return "FORBIDDEN", "Forbidden"
 	case errors.Is(err, chatsvc.ErrUnavailable):
@@ -1030,14 +1083,16 @@ func writeChatError(w http.ResponseWriter, r *http.Request, err error) {
 	code, message := chatErrorCodeAndMessage(err)
 	switch code {
 	case "VALIDATION_ERROR":
-		writeError(w, r, http.StatusBadRequest, code, message)
+		writeErrorCause(w, r, http.StatusBadRequest, code, message, err)
 	case "FORBIDDEN":
-		writeError(w, r, http.StatusForbidden, code, message)
+		writeErrorCause(w, r, http.StatusForbidden, code, message, err)
+	case "NOT_FRIEND":
+		writeErrorCause(w, r, http.StatusForbidden, code, message, err)
 	case "SERVICE_NOT_READY":
-		writeError(w, r, http.StatusServiceUnavailable, code, message)
+		writeErrorCause(w, r, http.StatusServiceUnavailable, code, message, err)
 	case "CONFLICT":
-		writeError(w, r, http.StatusConflict, code, message)
+		writeErrorCause(w, r, http.StatusConflict, code, message, err)
 	default:
-		writeError(w, r, http.StatusInternalServerError, code, message)
+		writeErrorCause(w, r, http.StatusInternalServerError, code, message, err)
 	}
 }

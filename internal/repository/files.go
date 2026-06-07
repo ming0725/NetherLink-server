@@ -288,6 +288,91 @@ func (r *FileRepository) Get(ctx context.Context, fileID string) (File, error) {
 	return file, translateReadError(err)
 }
 
+func (r *FileRepository) ListDefaultAvatarFileIDs(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := r.db.Query(ctx, `
+		SELECT id
+		FROM files
+		WHERE object_key LIKE 'defaults/avatar/%'
+		  AND visibility = 'public'
+		  AND storage_status = 'ready'
+		  AND deleted_at IS NULL
+		ORDER BY object_key ASC
+		LIMIT $1`,
+		limit,
+	)
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	defer rows.Close()
+
+	fileIDs := []string{}
+	for rows.Next() {
+		var fileID pgtype.UUID
+		if err := rows.Scan(&fileID); err != nil {
+			return nil, translateReadError(err)
+		}
+		fileIDs = append(fileIDs, uuidString(fileID))
+	}
+	return fileIDs, translateReadError(rows.Err())
+}
+
+func (r *FileRepository) ListDefaultGroupAvatarFileIDs(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := r.db.Query(ctx, `
+		SELECT id
+		FROM files
+		WHERE object_key LIKE 'defaults/group-avatar/%'
+		  AND visibility = 'public'
+		  AND storage_status = 'ready'
+		  AND deleted_at IS NULL
+		ORDER BY object_key ASC
+		LIMIT $1`,
+		limit,
+	)
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	defer rows.Close()
+
+	fileIDs := []string{}
+	for rows.Next() {
+		var fileID pgtype.UUID
+		if err := rows.Scan(&fileID); err != nil {
+			return nil, translateReadError(err)
+		}
+		fileIDs = append(fileIDs, uuidString(fileID))
+	}
+	return fileIDs, translateReadError(rows.Err())
+}
+
+func (r *FileRepository) IsAvatarFile(ctx context.Context, fileID string) (bool, error) {
+	var isAvatar bool
+	err := r.db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM files f
+			WHERE f.id = $1::uuid
+			  AND f.deleted_at IS NULL
+			  AND f.visibility = 'public'
+		) OR EXISTS (
+			SELECT 1
+			FROM file_usages fu
+			JOIN files f ON f.id = fu.file_id
+			WHERE fu.file_id = $1::uuid
+			  AND f.deleted_at IS NULL
+			  AND fu.deleted_at IS NULL
+			  AND fu.usage_type IN ('avatar', 'group_avatar')
+		)`,
+		normalizeText(fileID),
+	).Scan(&isAvatar)
+	return isAvatar, translateReadError(err)
+}
+
 func (r *FileRepository) CanUserAccessFile(ctx context.Context, userID string, fileID string) (bool, error) {
 	var allowed bool
 	err := r.db.QueryRow(ctx, `

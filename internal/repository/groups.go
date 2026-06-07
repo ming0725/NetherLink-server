@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -801,8 +803,127 @@ func (r *GroupRepository) ListMembers(ctx context.Context, userID string, groupI
 	return members, total, nil
 }
 
+func (r *GroupRepository) BatchGetMembers(ctx context.Context, viewerUserID string, groupID string, userIDs []string) ([]GroupMember, error) {
+	normalized := make([]string, 0, len(userIDs))
+	for _, userID := range userIDs {
+		userID = normalizeText(userID)
+		if userID != "" {
+			normalized = append(normalized, userID)
+		}
+	}
+	if len(normalized) == 0 {
+		return []GroupMember{}, nil
+	}
+
+	placeholders := make([]string, 0, len(normalized))
+	args := make([]any, 0, len(normalized)+2)
+	args = append(args, normalizeText(viewerUserID), normalizeText(groupID))
+	for i, userID := range normalized {
+		placeholders = append(placeholders, fmt.Sprintf("($%d::uuid, %d)", i+3, i+1))
+		args = append(args, userID)
+	}
+
+	rows, err := r.db.Query(ctx, `
+		WITH input_ids(id, ord) AS (
+			VALUES `+strings.Join(placeholders, ",")+`
+		)
+		SELECT
+			gm.group_id,
+			u.id,
+			u.public_id,
+			u.email,
+			u.password_hash,
+			u.nick,
+			u.gender,
+			u.gender_custom,
+			u.avatar_file_id,
+			u.status,
+			u.signature,
+			u.region,
+			u.last_seen_at,
+			u.token_version,
+			u.version,
+			u.created_at,
+			u.updated_at,
+			u.deleted_at,
+			gm.role,
+			gm.nickname,
+			gm.is_dnd,
+			gm.joined_at,
+			gm.version,
+			gm.created_at,
+			gm.updated_at,
+			1 AS total_count
+		FROM input_ids
+		JOIN group_members gm
+		  ON gm.user_id = input_ids.id
+		 AND gm.group_id = $2::uuid
+		JOIN users u ON u.id = gm.user_id
+		JOIN groups g ON g.id = gm.group_id
+		WHERE g.deleted_at IS NULL
+		  AND u.deleted_at IS NULL
+		  AND u.status = 'active'
+		  AND EXISTS (
+		    SELECT 1
+		    FROM group_members viewer
+		    WHERE viewer.group_id = gm.group_id
+		      AND viewer.user_id = $1::uuid
+		  )
+		ORDER BY input_ids.ord`,
+		args...,
+	)
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	defer rows.Close()
+
+	members, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (GroupMember, error) {
+		member, _, err := scanGroupMemberWithTotal(row)
+		return member, err
+	})
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	return members, nil
+}
+
 func (r *GroupRepository) ListActiveMemberUserIDs(ctx context.Context, groupID string) ([]string, error) {
 	return r.listMemberUserIDsByRole(ctx, groupID, nil)
+}
+
+func (r *GroupRepository) ListCoMemberUserIDs(ctx context.Context, userID string) ([]string, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT DISTINCT gm2.user_id
+		FROM group_members gm1
+		JOIN groups g
+		  ON g.id = gm1.group_id
+		 AND g.deleted_at IS NULL
+		JOIN group_members gm2 ON gm2.group_id = gm1.group_id
+		JOIN users u
+		  ON u.id = gm2.user_id
+		 AND u.deleted_at IS NULL
+		 AND u.status = 'active'
+		WHERE gm1.user_id = $1::uuid
+		ORDER BY gm2.user_id`,
+		normalizeText(userID),
+	)
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	defer rows.Close()
+
+	userIDs := []string{}
+	for rows.Next() {
+		var memberUserID pgtype.UUID
+		if err := rows.Scan(&memberUserID); err != nil {
+			return nil, err
+		}
+		userIDs = append(userIDs, uuidString(memberUserID))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return userIDs, nil
 }
 
 func (r *GroupRepository) ListPrivilegedMemberUserIDs(ctx context.Context, groupID string) ([]string, error) {

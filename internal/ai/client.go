@@ -191,6 +191,13 @@ func (c *OpenAICompatibleClient) Stream(ctx context.Context, req CompletionReque
 	var content strings.Builder
 	var finishReason string
 	totalTokens := 0
+	streamResponse := func() CompletionResponse {
+		return CompletionResponse{
+			Content:      content.String(),
+			TokenCount:   totalTokens,
+			FinishReason: finishReason,
+		}
+	}
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, ":") {
@@ -205,7 +212,7 @@ func (c *OpenAICompatibleClient) Stream(ctx context.Context, req CompletionReque
 		}
 		delta, usageTokens, err := parseStreamData(data)
 		if err != nil {
-			return CompletionResponse{}, err
+			return streamResponse(), err
 		}
 		if usageTokens > 0 {
 			totalTokens = usageTokens
@@ -219,18 +226,14 @@ func (c *OpenAICompatibleClient) Stream(ctx context.Context, req CompletionReque
 		content.WriteString(delta.Content)
 		if onDelta != nil {
 			if err := onDelta(delta); err != nil {
-				return CompletionResponse{}, err
+				return streamResponse(), err
 			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return CompletionResponse{}, err
+		return streamResponse(), err
 	}
-	return CompletionResponse{
-		Content:      content.String(),
-		TokenCount:   totalTokens,
-		FinishReason: finishReason,
-	}, nil
+	return streamResponse(), nil
 }
 
 func parseStreamData(data string) (CompletionStreamDelta, int, error) {

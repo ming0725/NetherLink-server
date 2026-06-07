@@ -19,6 +19,11 @@ type aiCreateConversationRequest struct {
 	ClientOperationID string  `json:"clientOperationId"`
 }
 
+type aiUpdateConversationRequest struct {
+	Title             string `json:"title"`
+	ClientOperationID string `json:"clientOperationId"`
+}
+
 type aiSendMessageRequest struct {
 	Message         string   `json:"message"`
 	ClientMessageID string   `json:"clientMessageId"`
@@ -58,6 +63,7 @@ type aiSendMessageResponse struct {
 	AssistantMessageID string                   `json:"assistantMessageId"`
 	StreamID           string                   `json:"streamId"`
 	UsedFiles          []aiUploadedFileResponse `json:"usedFiles"`
+	Title              *string                  `json:"title,omitempty"`
 }
 
 type aiFilesResponse struct {
@@ -102,10 +108,16 @@ type aiStreamDoneResponse struct {
 	AssistantMessage aiMessageResponse        `json:"assistantMessage"`
 	UsedFiles        []aiUploadedFileResponse `json:"usedFiles"`
 	FinishReason     string                   `json:"finishReason,omitempty"`
+	Title            *string                  `json:"title,omitempty"`
 }
 
 type aiStreamCancelledResponse struct {
-	StreamID string `json:"streamId"`
+	StreamID         string                   `json:"streamId"`
+	UserMessage      *aiMessageResponse       `json:"userMessage,omitempty"`
+	AssistantMessage *aiMessageResponse       `json:"assistantMessage,omitempty"`
+	UsedFiles        []aiUploadedFileResponse `json:"usedFiles,omitempty"`
+	FinishReason     string                   `json:"finishReason,omitempty"`
+	Title            *string                  `json:"title,omitempty"`
 }
 
 type aiStreamErrorResponse struct {
@@ -202,6 +214,43 @@ func (s *Server) handleAICreateConversation(w http.ResponseWriter, r *http.Reque
 		}
 		return idempotentHTTPResult{
 			Status: http.StatusCreated,
+			Body:   aiConversationDetailResponse{Conversation: makeAIConversationResponse(conversation)},
+		}, nil
+	})
+}
+
+func (s *Server) handleAIUpdateConversation(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAIService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+	conversationID := r.PathValue("conversationId")
+	if reqErr := validateUUID(conversationID, "conversationId"); reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+	var req aiUpdateConversationRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	s.handleIdempotentWrite(w, r, principal.UserID, "ai.conversation.update:"+conversationID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
+		writeAIServiceError(w, r, err)
+	}, func() (idempotentHTTPResult, error) {
+		conversation, err := s.aiService.UpdateConversationTitle(r.Context(), aisvc.UpdateConversationTitleInput{
+			UserID:         principal.UserID,
+			ConversationID: conversationID,
+			Title:          req.Title,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
 			Body:   aiConversationDetailResponse{Conversation: makeAIConversationResponse(conversation)},
 		}, nil
 	})
@@ -305,6 +354,7 @@ func (s *Server) handleAISendMessage(w http.ResponseWriter, r *http.Request) {
 				AssistantMessageID: result.AssistantMessageID,
 				StreamID:           result.StreamID,
 				UsedFiles:          makeAIUploadedFileResponses(result.UsedFiles),
+				Title:              result.Title,
 			},
 		}, nil
 	})
@@ -382,11 +432,17 @@ func (s *Server) handleAISendMessageStream(w http.ResponseWriter, r *http.Reques
 		},
 	})
 	if err != nil {
-		s.deleteAIStreamReceipt(principal.UserID, receiptClaim)
 		if errors.Is(err, context.Canceled) {
-			_ = writeSSE(w, flusher, "ai.stream.cancelled", aiStreamCancelledResponse{StreamID: streamID})
+			cancelled := makeAIStreamCancelledResponse(streamID, result)
+			completeCtx, completeCancel := context.WithTimeout(context.Background(), aiStreamReceiptCleanupTimeout)
+			if err := s.completeAIStreamCancelledReceipt(completeCtx, principal.UserID, receiptClaim, cancelled); err != nil {
+				s.logger.WarnContext(completeCtx, "failed to complete cancelled AI stream receipt", "error", err, "operation_type", receiptClaim.OperationType)
+			}
+			completeCancel()
+			_ = writeSSE(w, flusher, "ai.stream.cancelled", cancelled)
 			return
 		}
+		s.deleteAIStreamReceipt(principal.UserID, receiptClaim)
 		code, message := aiErrorCodeAndMessage(err)
 		_ = writeSSE(w, flusher, "client.error", aiStreamErrorResponse{
 			RequestType: "ai.message.send",
@@ -402,6 +458,7 @@ func (s *Server) handleAISendMessageStream(w http.ResponseWriter, r *http.Reques
 		AssistantMessage: makeAIMessageResponse(result.AssistantMessage),
 		UsedFiles:        makeAIUploadedFileResponses(result.UsedFiles),
 		FinishReason:     result.FinishReason,
+		Title:            result.Title,
 	}
 	completeCtx, completeCancel := context.WithTimeout(context.Background(), aiStreamReceiptCleanupTimeout)
 	if err := s.completeAIStreamReceipt(completeCtx, principal.UserID, receiptClaim, done); err != nil {
@@ -411,9 +468,30 @@ func (s *Server) handleAISendMessageStream(w http.ResponseWriter, r *http.Reques
 	_ = writeSSE(w, flusher, "ai.stream.done", done)
 }
 
+func makeAIStreamCancelledResponse(streamID string, result aisvc.StreamMessageResult) aiStreamCancelledResponse {
+	response := aiStreamCancelledResponse{
+		StreamID:     streamID,
+		UsedFiles:    makeAIUploadedFileResponses(result.UsedFiles),
+		FinishReason: result.FinishReason,
+		Title:        result.Title,
+	}
+	if response.FinishReason == "" {
+		response.FinishReason = "cancelled"
+	}
+	if result.UserMessage.ID != "" {
+		userMessage := makeAIMessageResponse(result.UserMessage)
+		response.UserMessage = &userMessage
+	}
+	if result.AssistantMessage.ID != "" {
+		assistantMessage := makeAIMessageResponse(result.AssistantMessage)
+		response.AssistantMessage = &assistantMessage
+	}
+	return response
+}
+
 func (s *Server) replayAISSEStreamReceipt(w http.ResponseWriter, flusher http.Flusher, r *http.Request, conversationID string, clientMessageID string, receipt repository.OperationReceipt) {
 	streamID := newAIStreamID()
-	done, code, message := aiStreamDoneFromReceipt(receipt, streamID)
+	finalEvent, done, cancelled, code, message := aiStreamFinalFromReceipt(receipt, streamID)
 
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -436,7 +514,12 @@ func (s *Server) replayAISSEStreamReceipt(w http.ResponseWriter, flusher http.Fl
 	}); err != nil {
 		return
 	}
-	_ = writeSSE(w, flusher, "ai.stream.done", done)
+	switch finalEvent {
+	case "ai.stream.cancelled":
+		_ = writeSSE(w, flusher, "ai.stream.cancelled", cancelled)
+	default:
+		_ = writeSSE(w, flusher, "ai.stream.done", done)
+	}
 }
 
 func (s *Server) handleAIBindFile(w http.ResponseWriter, r *http.Request) {

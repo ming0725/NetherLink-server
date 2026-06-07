@@ -28,6 +28,23 @@ const messageSelectColumns = `
 	m.edited_at,
 	m.recalled_at`
 
+const messageReturningColumns = `
+	id,
+	conversation_id,
+	sender_id,
+	message_seq,
+	type,
+	content_text,
+	content_json,
+	referenced_message_id,
+	client_message_id,
+	client_sent_at,
+	server_received_at,
+	created_at,
+	updated_at,
+	edited_at,
+	recalled_at`
+
 const conversationSelectColumns = `
 	c.id,
 	c.type,
@@ -38,6 +55,17 @@ const conversationSelectColumns = `
 	c.version,
 	c.created_at,
 	c.updated_at`
+
+const conversationReturningColumns = `
+	id,
+	type,
+	peer_user_id,
+	group_id,
+	last_message_id,
+	last_message_at,
+	version,
+	created_at,
+	updated_at`
 
 const participantSelectColumns = `
 	cp.conversation_id,
@@ -295,12 +323,23 @@ func (r *ChatRepository) CreateConversation(ctx context.Context, params CreateCo
 			group_id
 		)
 		VALUES ($1, NULLIF($2, '')::uuid, NULLIF($3, '')::uuid)
-		RETURNING `+conversationSelectColumns,
+		RETURNING `+conversationReturningColumns,
 		normalizeText(params.Type),
 		normalizeOptionalUUIDPtr(params.PeerUserID),
 		normalizeOptionalUUIDPtr(params.GroupID),
 	))
 	return conversation, translateWriteError(err)
+}
+
+func (r *ChatRepository) GetConversationByID(ctx context.Context, conversationID string) (Conversation, error) {
+	conversation, err := scanConversation(r.db.QueryRow(ctx, `
+		SELECT `+conversationSelectColumns+`
+		FROM conversations c
+		WHERE c.id = $1::uuid
+		  AND c.deleted_at IS NULL`,
+		normalizeText(conversationID),
+	))
+	return conversation, translateReadError(err)
 }
 
 func (r *ChatRepository) AddConversationParticipants(ctx context.Context, conversationID string, userIDs []string) error {
@@ -541,7 +580,7 @@ func (r *ChatRepository) CreateMessage(ctx context.Context, params CreateMessage
 			client_sent_at
 		)
 		VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, NULLIF($7, '')::uuid, $8, $9)
-		RETURNING `+messageSelectColumns,
+		RETURNING `+messageReturningColumns,
 		normalizeText(params.ConversationID),
 		normalizeText(params.SenderID),
 		params.MessageSeq,

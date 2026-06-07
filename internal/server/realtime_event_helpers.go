@@ -2,23 +2,27 @@ package server
 
 import (
 	"context"
+	"time"
 )
 
 func (s *Server) publishSelfRealtimeEvent(ctx context.Context, userID string, eventType string, payload any) {
 	s.publishRealtimeEvent(ctx, []string{userID}, eventType, payload)
 }
 
-func (s *Server) publishPresenceRealtimeEvent(ctx context.Context, userID string, payload any) {
-	userIDs := []string{userID}
+func (s *Server) publishPresenceRealtimeEvent(ctx context.Context, userID string, status string, lastSeenAt time.Time) {
+	s.publishRealtimeEvent(ctx, []string{userID}, "presence.updated", makePresenceUpdatedPayload(userID, status, lastSeenAt))
 	if s.repos.Friends != nil {
 		friendUserIDs, err := s.repos.Friends.ListActiveFriendUserIDs(ctx, userID)
 		if err != nil {
 			s.logger.WarnContext(ctx, "failed to list presence realtime recipients", "error", err, "user_id", userID)
 		} else {
-			userIDs = append(userIDs, friendUserIDs...)
+			visibleStatus := externallyVisiblePresenceStatus(status)
+			friendUserIDs = uniqueRealtimeUserIDs(friendUserIDs)
+			if len(friendUserIDs) > 0 {
+				s.publishRealtimeEvent(ctx, friendUserIDs, "presence.updated", makePresenceUpdatedPayload(userID, visibleStatus, lastSeenAt))
+			}
 		}
 	}
-	s.publishRealtimeEvent(ctx, uniqueRealtimeUserIDs(userIDs), "presence.updated", payload)
 }
 
 func (s *Server) publishProfileRealtimeEvent(ctx context.Context, userID string, payload any) {
@@ -31,6 +35,14 @@ func (s *Server) publishProfileRealtimeEvent(ctx context.Context, userID string,
 			userIDs = append(userIDs, friendUserIDs...)
 		}
 	}
+	if s.repos.Groups != nil {
+		groupUserIDs, err := s.repos.Groups.ListCoMemberUserIDs(ctx, userID)
+		if err != nil {
+			s.logger.WarnContext(ctx, "failed to list profile group realtime recipients", "error", err, "user_id", userID)
+		} else {
+			userIDs = append(userIDs, groupUserIDs...)
+		}
+	}
 	s.publishRealtimeEvent(ctx, uniqueRealtimeUserIDs(userIDs), "profile.updated", payload)
 }
 
@@ -40,6 +52,8 @@ func makeProfileUpdatedPayload(reason string, user userResponse) map[string]any 
 		"userUuid":          user.UserUUID,
 		"userId":            user.UserID,
 		"profile":           user,
+		"version":           user.Version,
+		"etag":              user.ETag,
 		"avatarUrl":         user.AvatarURL,
 		"avatarVersion":     user.AvatarVersion,
 		"avatarEtag":        user.AvatarEtag,
@@ -47,22 +61,20 @@ func makeProfileUpdatedPayload(reason string, user userResponse) map[string]any 
 	}
 }
 
-func makeAvatarUpdatedPayload(reason string, user profileEventIdentity, avatar avatarUploadResponse) map[string]any {
+func makeAvatarUpdatedPayload(reason string, user userResponse, avatar avatarUploadResponse) map[string]any {
 	return map[string]any{
 		"reason":            reason,
 		"userUuid":          user.UserUUID,
 		"userId":            user.UserID,
+		"profile":           user,
+		"version":           user.Version,
+		"etag":              user.ETag,
 		"avatar":            avatar,
 		"avatarUrl":         avatar.AvatarURL,
 		"avatarVersion":     avatar.AvatarVersion,
 		"avatarEtag":        avatar.AvatarEtag,
 		"avatarContentHash": avatar.AvatarContentHash,
 	}
-}
-
-type profileEventIdentity struct {
-	UserUUID string
-	UserID   string
 }
 
 func (s *Server) publishGroupRealtimeEvent(ctx context.Context, groupID string, eventType string, payload any) {

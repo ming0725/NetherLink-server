@@ -2,6 +2,7 @@ package friend
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 
@@ -9,10 +10,12 @@ import (
 )
 
 var (
-	ErrValidation  = errors.New("friend: validation failed")
-	ErrConflict    = errors.New("friend: conflict")
-	ErrForbidden   = errors.New("friend: forbidden")
-	ErrUnavailable = errors.New("friend: unavailable")
+	ErrValidation            = errors.New("friend: validation failed")
+	ErrConflict              = errors.New("friend: conflict")
+	ErrForbidden             = errors.New("friend: forbidden")
+	ErrUnavailable           = errors.New("friend: unavailable")
+	ErrRequestAlreadyHandled = errors.New("friend: request already handled")
+	ErrRequestNotRecipient   = errors.New("friend: request not recipient")
 )
 
 const (
@@ -20,6 +23,7 @@ const (
 	maxRemarkLength          = 64
 	maxRequestMessageLength  = 256
 	maxRequestSourceLength   = 32
+	friendAcceptedMessage    = "我们已经是好友了，现在可以开始聊天了。"
 )
 
 type Service struct {
@@ -64,6 +68,33 @@ type AcceptRequestInput struct {
 	RequestID string
 	Remark    *string
 	GroupID   *string
+}
+
+type AcceptRequestResult struct {
+	Friend         repository.Friend
+	ConversationID string
+	Message        *repository.Message
+}
+
+type RequestActionError struct {
+	Err       error
+	Action    string
+	ActorRole string
+	Request   repository.FriendRequest
+}
+
+func (e *RequestActionError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Err.Error() + ": action=" + e.Action + " status=" + e.Request.Status + " role=" + e.ActorRole
+}
+
+func (e *RequestActionError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
 }
 
 func NewService(repos repository.Repositories, tx repository.TxBeginner) *Service {
@@ -203,30 +234,42 @@ func (s *Service) ListRequests(ctx context.Context, input ListRequestsInput) ([]
 	return requests, total, unread, nil
 }
 
-func (s *Service) AcceptRequest(ctx context.Context, input AcceptRequestInput) (repository.Friend, error) {
+func (s *Service) AcceptRequest(ctx context.Context, input AcceptRequestInput) (AcceptRequestResult, error) {
 	if strings.TrimSpace(input.UserID) == "" || strings.TrimSpace(input.RequestID) == "" {
-		return repository.Friend{}, ErrValidation
+		return AcceptRequestResult{}, ErrValidation
 	}
 
 	remark := strings.TrimSpace(stringValue(input.Remark))
 	if len([]rune(remark)) > maxRemarkLength {
-		return repository.Friend{}, ErrValidation
+		return AcceptRequestResult{}, ErrValidation
 	}
 	groupID := strings.TrimSpace(stringValue(input.GroupID))
 	if groupID != "" {
 		ok, err := s.repos.Friends.GroupExists(ctx, input.UserID, groupID)
 		if err != nil {
-			return repository.Friend{}, err
+			return AcceptRequestResult{}, err
 		}
 		if !ok {
-			return repository.Friend{}, ErrValidation
+			return AcceptRequestResult{}, ErrValidation
 		}
 	}
 
-	var accepted repository.Friend
+	var result AcceptRequestResult
 	if err := s.withTx(ctx, func(repos repository.Repositories) error {
 		request, err := repos.Friends.AcceptFriendRequest(ctx, input.RequestID, input.UserID)
 		if err != nil {
+			if errors.Is(err, repository.ErrNotFound) {
+				stateErr := friendRequestActionError(ctx, repos, input.UserID, input.RequestID, "accept")
+				var actionErr *RequestActionError
+				if errors.As(stateErr, &actionErr) && errors.Is(actionErr, ErrRequestAlreadyHandled) && actionErr.Request.Status == "accepted" {
+					friend, relationErr := repos.Friends.GetRelation(ctx, input.UserID, actionErr.Request.FromUser.ID)
+					if relationErr == nil {
+						result.Friend = friend
+						return nil
+					}
+				}
+				return stateErr
+			}
 			return mapRepositoryError(err)
 		}
 
@@ -249,13 +292,62 @@ func (s *Service) AcceptRequest(ctx context.Context, input AcceptRequestInput) (
 			return mapRepositoryError(err)
 		}
 
-		accepted = currentFriend
+		result.Friend = currentFriend
+		conversationID, message, err := createFriendAcceptedMessage(ctx, repos, input.UserID, request.FromUser.ID, request.ID)
+		if err != nil {
+			return mapRepositoryError(err)
+		}
+		result.ConversationID = conversationID
+		result.Message = &message
 		return nil
 	}); err != nil {
-		return repository.Friend{}, err
+		return AcceptRequestResult{}, err
 	}
 
-	return accepted, nil
+	return result, nil
+}
+
+func createFriendAcceptedMessage(ctx context.Context, repos repository.Repositories, senderID string, recipientID string, requestID string) (string, repository.Message, error) {
+	conversationID, found, err := repos.Chat.FindDirectConversation(ctx, senderID, recipientID)
+	if err != nil {
+		return "", repository.Message{}, err
+	}
+	if !found {
+		peerUserID := recipientID
+		conversation, err := repos.Chat.CreateConversation(ctx, repository.CreateConversationParams{
+			Type:       "direct",
+			PeerUserID: &peerUserID,
+		})
+		if err != nil {
+			return "", repository.Message{}, err
+		}
+		conversationID = conversation.ID
+	}
+	if err := repos.Chat.AddConversationParticipants(ctx, conversationID, []string{senderID, recipientID}); err != nil {
+		return "", repository.Message{}, err
+	}
+
+	seq, err := repos.Chat.NextMessageSeq(ctx, conversationID)
+	if err != nil {
+		return "", repository.Message{}, err
+	}
+	contentText := friendAcceptedMessage
+	message, err := repos.Chat.CreateMessage(ctx, repository.CreateMessageParams{
+		ConversationID:  conversationID,
+		SenderID:        senderID,
+		MessageSeq:      seq,
+		Type:            "text",
+		ContentText:     &contentText,
+		ContentJSON:     json.RawMessage(`{}`),
+		ClientMessageID: "friend-request-accepted:" + requestID,
+	})
+	if err != nil {
+		return "", repository.Message{}, err
+	}
+	if err := repos.Chat.TouchConversationAfterMessage(ctx, conversationID, message.ID, senderID); err != nil {
+		return "", repository.Message{}, err
+	}
+	return conversationID, message, nil
 }
 
 func (s *Service) RejectRequest(ctx context.Context, userID string, requestID string) (repository.FriendRequest, error) {
@@ -265,10 +357,54 @@ func (s *Service) RejectRequest(ctx context.Context, userID string, requestID st
 
 	request, err := s.repos.Friends.RejectFriendRequest(ctx, requestID, userID)
 	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			stateErr := friendRequestActionError(ctx, s.repos, userID, requestID, "reject")
+			var actionErr *RequestActionError
+			if errors.As(stateErr, &actionErr) && errors.Is(actionErr, ErrRequestAlreadyHandled) && actionErr.Request.Status == "rejected" {
+				return actionErr.Request, nil
+			}
+			return repository.FriendRequest{}, stateErr
+		}
 		return repository.FriendRequest{}, mapRepositoryError(err)
 	}
 
 	return request, nil
+}
+
+func friendRequestActionError(ctx context.Context, repos repository.Repositories, userID string, requestID string, action string) error {
+	request, err := repos.Friends.GetFriendRequest(ctx, requestID)
+	if err != nil {
+		return mapRepositoryError(err)
+	}
+
+	role := ""
+	switch userID {
+	case request.ToUser.ID:
+		role = "recipient"
+	case request.FromUser.ID:
+		role = "sender"
+	default:
+		return repository.ErrNotFound
+	}
+
+	if role != "recipient" {
+		return &RequestActionError{
+			Err:       ErrRequestNotRecipient,
+			Action:    action,
+			ActorRole: role,
+			Request:   request,
+		}
+	}
+	if request.Status != "pending" {
+		return &RequestActionError{
+			Err:       ErrRequestAlreadyHandled,
+			Action:    action,
+			ActorRole: role,
+			Request:   request,
+		}
+	}
+
+	return repository.ErrNotFound
 }
 
 func (s *Service) validateRequestOptionalFields(input CreateRequestInput) error {

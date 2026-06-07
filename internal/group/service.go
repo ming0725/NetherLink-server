@@ -2,8 +2,10 @@ package groups
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"math/big"
 	"strings"
 
 	"nlserver/internal/repository"
@@ -127,6 +129,12 @@ func (s *Service) CreateGroup(ctx context.Context, input CreateGroupInput) (repo
 		avatarFileID := normalizedOptional(input.AvatarFileID)
 		if avatarFileID != nil {
 			if err := validateOwnedGroupAvatarFile(ctx, repos, input.UserID, *avatarFileID); err != nil {
+				return err
+			}
+		} else {
+			var err error
+			avatarFileID, err = pickDefaultGroupAvatarFileID(ctx, repos)
+			if err != nil {
 				return err
 			}
 		}
@@ -567,6 +575,25 @@ func (s *Service) RejectJoinRequest(ctx context.Context, userID string, requestI
 
 func canManageGroup(role string) bool {
 	return role == groupRoleOwner || role == groupRoleAdmin
+}
+
+func pickDefaultGroupAvatarFileID(ctx context.Context, repos repository.Repositories) (*string, error) {
+	if repos.Files == nil {
+		return nil, nil
+	}
+	fileIDs, err := repos.Files.ListDefaultGroupAvatarFileIDs(ctx, 100)
+	if err != nil {
+		return nil, mapRepositoryError(err)
+	}
+	if len(fileIDs) == 0 {
+		return nil, nil
+	}
+	index, err := rand.Int(rand.Reader, big.NewInt(int64(len(fileIDs))))
+	if err != nil {
+		return nil, err
+	}
+	selected := fileIDs[index.Int64()]
+	return &selected, nil
 }
 
 func validateOwnedGroupAvatarFile(ctx context.Context, repos repository.Repositories, userID string, fileID string) error {

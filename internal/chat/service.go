@@ -13,6 +13,7 @@ import (
 var (
 	ErrValidation  = errors.New("chat: validation failed")
 	ErrForbidden   = errors.New("chat: forbidden")
+	ErrNotFriend   = errors.New("chat: not friend")
 	ErrUnavailable = errors.New("chat: unavailable")
 )
 
@@ -332,7 +333,7 @@ func (s *Service) HideConversationHistory(ctx context.Context, input HideConvers
 }
 
 func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (repository.Message, error) {
-	if s.repos.Chat == nil || s.repos.Files == nil || s.tx == nil {
+	if s.repos.Chat == nil || s.repos.Files == nil || s.repos.Friends == nil || s.tx == nil {
 		return repository.Message{}, ErrUnavailable
 	}
 	if err := validateSendMessageInput(input); err != nil {
@@ -352,13 +353,16 @@ func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (repo
 			}
 			return err
 		}
+		if err := ensureDirectMessageAllowed(ctx, repos, input.UserID, input.ConversationID); err != nil {
+			return err
+		}
 
 		for _, attachment := range input.Attachments {
 			file, err := repos.Files.Get(ctx, attachment.FileID)
 			if err != nil {
 				return err
 			}
-			if file.OwnerUserID == nil || *file.OwnerUserID != input.UserID || file.StorageStatus != "uploaded" {
+			if file.OwnerUserID == nil || *file.OwnerUserID != input.UserID || !isSendableAttachmentStatus(file.StorageStatus) {
 				return ErrForbidden
 			}
 			attachments = append(attachments, repository.CreateMessageAttachmentParams{
@@ -413,10 +417,51 @@ func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (repo
 		if errors.Is(err, repository.ErrConflict) {
 			return s.repos.Chat.GetMessageByClientMessageID(ctx, input.UserID, input.ConversationID, input.UserID, input.ClientMessageID)
 		}
+		if errors.Is(err, ErrNotFriend) {
+			existing, existingErr := s.repos.Chat.GetMessageByClientMessageID(ctx, input.UserID, input.ConversationID, input.UserID, input.ClientMessageID)
+			if existingErr == nil {
+				return existing, nil
+			}
+		}
 		return repository.Message{}, mapError(err)
 	}
 
 	return created, nil
+}
+
+func ensureDirectMessageAllowed(ctx context.Context, repos repository.Repositories, userID string, conversationID string) error {
+	entry, err := repos.Chat.GetConversationForUser(ctx, userID, conversationID)
+	if err != nil {
+		return err
+	}
+	if entry.Conversation.Type != "direct" {
+		return nil
+	}
+
+	peerUserID := directConversationPeerUserID(entry, userID)
+	if peerUserID == "" {
+		return ErrForbidden
+	}
+
+	forwardExists, err := repos.Friends.ActiveFriendshipExists(ctx, userID, peerUserID)
+	if err != nil {
+		return err
+	}
+	reverseExists, err := repos.Friends.ActiveFriendshipExists(ctx, peerUserID, userID)
+	if err != nil {
+		return err
+	}
+	if !forwardExists || !reverseExists {
+		return ErrNotFriend
+	}
+	return nil
+}
+
+func directConversationPeerUserID(entry repository.ConversationEntry, userID string) string {
+	if entry.PeerUser == nil || entry.PeerUser.ID == userID {
+		return ""
+	}
+	return entry.PeerUser.ID
 }
 
 func (s *Service) ListMessages(ctx context.Context, input ListMessagesInput) ([]repository.Message, error) {
@@ -488,6 +533,15 @@ func validateSendMessageInput(input SendMessageInput) error {
 	return nil
 }
 
+func isSendableAttachmentStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "uploaded", "processing", "ready":
+		return true
+	default:
+		return false
+	}
+}
+
 func normalizeMessageType(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
@@ -513,7 +567,7 @@ func normalizedOptional(value *string) *string {
 
 func mapError(err error) error {
 	switch {
-	case errors.Is(err, ErrValidation), errors.Is(err, ErrForbidden), errors.Is(err, ErrUnavailable):
+	case errors.Is(err, ErrValidation), errors.Is(err, ErrForbidden), errors.Is(err, ErrNotFriend), errors.Is(err, ErrUnavailable):
 		return err
 	case errors.Is(err, repository.ErrNotFound):
 		return ErrForbidden

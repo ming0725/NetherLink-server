@@ -43,6 +43,12 @@ type CreateConversationInput struct {
 	FirstMessage *string
 }
 
+type UpdateConversationTitleInput struct {
+	UserID         string
+	ConversationID string
+	Title          string
+}
+
 type SendMessageInput struct {
 	UserID          string
 	ConversationID  string
@@ -56,6 +62,7 @@ type SendMessageResult struct {
 	AssistantMessageID string
 	StreamID           string
 	UsedFiles          []repository.AIUploadedFile
+	Title              *string
 }
 
 type StreamMessageInput struct {
@@ -72,6 +79,7 @@ type StreamMessageResult struct {
 	AssistantMessage repository.AIMessage
 	UsedFiles        []repository.AIUploadedFile
 	FinishReason     string
+	Title            *string
 }
 
 type BindFileInput struct {
@@ -98,12 +106,16 @@ func (s *Service) CreateConversation(ctx context.Context, input CreateConversati
 		return repository.AIConversation{}, ErrUnavailable
 	}
 	title := normalizeOptionalTitle(input.Title)
-	if title != nil && len(*title) > maxAITitleLength {
+	if title != nil && titleTooLong(*title) {
 		return repository.AIConversation{}, ErrValidation
 	}
 	firstMessage := strings.TrimSpace(valueOrEmpty(input.FirstMessage))
 	if firstMessage != "" && len(firstMessage) > maxAIMessageLength {
 		return repository.AIConversation{}, ErrValidation
+	}
+	if title == nil && firstMessage != "" {
+		fallbackTitle := fallbackConversationTitle(firstMessage)
+		title = &fallbackTitle
 	}
 
 	var conversation repository.AIConversation
@@ -156,6 +168,21 @@ func (s *Service) CreateConversation(ctx context.Context, input CreateConversati
 	return created, nil
 }
 
+func (s *Service) UpdateConversationTitle(ctx context.Context, input UpdateConversationTitleInput) (repository.AIConversation, error) {
+	if s.repos.AI == nil {
+		return repository.AIConversation{}, ErrUnavailable
+	}
+	title := strings.TrimSpace(input.Title)
+	if strings.TrimSpace(input.UserID) == "" || strings.TrimSpace(input.ConversationID) == "" || title == "" || titleTooLong(title) {
+		return repository.AIConversation{}, ErrValidation
+	}
+	conversation, err := s.repos.AI.UpdateConversationTitle(ctx, input.UserID, input.ConversationID, title)
+	if err != nil {
+		return repository.AIConversation{}, mapRepositoryError(err)
+	}
+	return conversation, nil
+}
+
 func (s *Service) ListMessages(ctx context.Context, userID string, conversationID string) ([]repository.AIMessage, error) {
 	if s.repos.AI == nil {
 		return nil, ErrUnavailable
@@ -201,12 +228,14 @@ func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (Send
 	if err != nil {
 		return SendMessageResult{}, mapRepositoryError(err)
 	}
+	title := s.finishFirstRoundTitle(ctx, prepared, assistantMessage)
 
 	return SendMessageResult{
 		UserMessage:        prepared.userMessage,
 		AssistantMessageID: assistantMessage.ID,
 		StreamID:           "",
 		UsedFiles:          prepared.usedFiles,
+		Title:              title,
 	}, nil
 }
 
@@ -226,9 +255,19 @@ func (s *Service) StreamMessage(ctx context.Context, input StreamMessageInput) (
 		if input.OnDelta == nil || delta.Content == "" {
 			return nil
 		}
-		return input.OnDelta(StreamMessageDelta{Content: delta.Content})
+		if err := input.OnDelta(StreamMessageDelta{Content: delta.Content}); err != nil {
+			return streamDeliveryError{err: err}
+		}
+		return nil
 	})
 	if err != nil {
+		if isStreamCancellation(ctx, err) {
+			result, saveErr := s.saveCancelledStreamMessage(ctx, prepared, completion)
+			if saveErr != nil {
+				return StreamMessageResult{}, saveErr
+			}
+			return result, context.Canceled
+		}
 		return StreamMessageResult{}, err
 	}
 	content := strings.TrimSpace(completion.Content)
@@ -245,12 +284,84 @@ func (s *Service) StreamMessage(ctx context.Context, input StreamMessageInput) (
 	if err != nil {
 		return StreamMessageResult{}, mapRepositoryError(err)
 	}
+	title := s.finishFirstRoundTitle(ctx, prepared, assistantMessage)
 	return StreamMessageResult{
 		UserMessage:      prepared.userMessage,
 		AssistantMessage: assistantMessage,
 		UsedFiles:        prepared.usedFiles,
 		FinishReason:     completion.FinishReason,
+		Title:            title,
 	}, nil
+}
+
+func (s *Service) saveCancelledStreamMessage(ctx context.Context, prepared preparedMessageCompletion, completion CompletionResponse) (StreamMessageResult, error) {
+	result := StreamMessageResult{
+		UserMessage:  prepared.userMessage,
+		UsedFiles:    prepared.usedFiles,
+		FinishReason: "cancelled",
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	content := strings.TrimSpace(completion.Content)
+	if content == "" {
+		result.Title = s.finishFirstRoundTitleFromText(persistCtx, prepared, "")
+		return result, nil
+	}
+	tokenCount := completion.TokenCount
+	if tokenCount == 0 {
+		tokenCount = roughTokenCount(content)
+	}
+	assistantMessage, err := s.repos.AI.CreateMessage(persistCtx, repository.CreateAIMessageParams{
+		ConversationID: prepared.conversation.ID,
+		Role:           "assistant",
+		Text:           content,
+		TokenCount:     tokenCount,
+	})
+	if err != nil {
+		return StreamMessageResult{}, mapRepositoryError(err)
+	}
+	result.AssistantMessage = assistantMessage
+	result.Title = s.finishFirstRoundTitle(persistCtx, prepared, assistantMessage)
+	return result, nil
+}
+
+func (s *Service) finishFirstRoundTitleFromText(ctx context.Context, prepared preparedMessageCompletion, assistantText string) *string {
+	if !prepared.firstRound || !prepared.autoTitle || strings.TrimSpace(prepared.titleInput) == "" {
+		return nil
+	}
+	title, err := s.GenerateConversationTitle(ctx, prepared.titleInput, assistantText)
+	if err != nil || strings.TrimSpace(title) == "" {
+		title = fallbackConversationTitle(prepared.titleInput)
+	}
+	title = truncateTitle(title)
+	if strings.TrimSpace(title) == "" {
+		return nil
+	}
+	if _, err := s.repos.AI.UpdateConversationTitle(ctx, prepared.conversation.UserID, prepared.conversation.ID, title); err != nil {
+		return nil
+	}
+	return &title
+}
+
+func isStreamCancellation(ctx context.Context, err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) || isStreamDeliveryError(err)
+}
+
+type streamDeliveryError struct {
+	err error
+}
+
+func (e streamDeliveryError) Error() string {
+	return e.err.Error()
+}
+
+func (e streamDeliveryError) Unwrap() error {
+	return e.err
+}
+
+func isStreamDeliveryError(err error) bool {
+	var deliveryErr streamDeliveryError
+	return errors.As(err, &deliveryErr)
 }
 
 type preparedMessageCompletion struct {
@@ -259,6 +370,9 @@ type preparedMessageCompletion struct {
 	usedFiles    []repository.AIUploadedFile
 	model        string
 	messages     []ChatMessage
+	firstRound   bool
+	autoTitle    bool
+	titleInput   string
 }
 
 func (s *Service) prepareMessageCompletion(ctx context.Context, input SendMessageInput) (preparedMessageCompletion, error) {
@@ -273,6 +387,10 @@ func (s *Service) prepareMessageCompletion(ctx context.Context, input SendMessag
 		return preparedMessageCompletion{}, ErrValidation
 	}
 	conversation, err := s.repos.AI.GetConversation(ctx, input.UserID, input.ConversationID)
+	if err != nil {
+		return preparedMessageCompletion{}, mapRepositoryError(err)
+	}
+	existingMessages, err := s.repos.AI.ListMessages(ctx, input.UserID, conversation.ID)
 	if err != nil {
 		return preparedMessageCompletion{}, mapRepositoryError(err)
 	}
@@ -307,9 +425,19 @@ func (s *Service) prepareMessageCompletion(ctx context.Context, input SendMessag
 		return preparedMessageCompletion{}, mapRepositoryError(err)
 	}
 
-	history, err := s.repos.AI.ListMessages(ctx, input.UserID, conversation.ID)
-	if err != nil {
-		return preparedMessageCompletion{}, mapRepositoryError(err)
+	history := make([]repository.AIMessage, 0, len(existingMessages)+1)
+	history = append(history, existingMessages...)
+	history = append(history, userMessage)
+	firstRound := !hasRole(existingMessages, "assistant")
+	titleInput := initialUserMessagesForTitle(history)
+	autoTitle := isBlankStringPtr(conversation.Title) || (firstRound && titleInput != "" && strings.TrimSpace(*conversation.Title) == fallbackConversationTitle(titleInput))
+	if isBlankStringPtr(conversation.Title) && titleInput != "" {
+		fallbackTitle := fallbackConversationTitle(titleInput)
+		updated, err := s.repos.AI.UpdateConversationTitle(ctx, input.UserID, conversation.ID, fallbackTitle)
+		if err != nil {
+			return preparedMessageCompletion{}, mapRepositoryError(err)
+		}
+		conversation = updated
 	}
 	model := s.cfg.DefaultModel
 	if conversation.Model != nil && strings.TrimSpace(*conversation.Model) != "" {
@@ -321,6 +449,9 @@ func (s *Service) prepareMessageCompletion(ctx context.Context, input SendMessag
 		usedFiles:    usedFiles,
 		model:        model,
 		messages:     makeCompletionMessages(history, contextChunks),
+		firstRound:   firstRound,
+		autoTitle:    autoTitle,
+		titleInput:   titleInput,
 	}, nil
 }
 
@@ -439,6 +570,10 @@ func (s *Service) selectFileContext(ctx context.Context, userID string, conversa
 }
 
 func (s *Service) GenerateTitle(ctx context.Context, firstUserMessage string) (string, error) {
+	return s.GenerateConversationTitle(ctx, firstUserMessage, "")
+}
+
+func (s *Service) GenerateConversationTitle(ctx context.Context, firstUserMessage string, assistantMessage string) (string, error) {
 	if s.client == nil {
 		return "", ErrUnavailable
 	}
@@ -446,6 +581,7 @@ func (s *Service) GenerateTitle(ctx context.Context, firstUserMessage string) (s
 	if text == "" || len(text) > maxAIMessageLength {
 		return "", ErrValidation
 	}
+	assistantText := strings.TrimSpace(assistantMessage)
 	model := s.cfg.TitleModel
 	if strings.TrimSpace(model) == "" {
 		model = s.cfg.DefaultModel
@@ -455,8 +591,8 @@ func (s *Service) GenerateTitle(ctx context.Context, firstUserMessage string) (s
 	completion, err := s.client.Complete(providerCtx, CompletionRequest{
 		Model: model,
 		Messages: []ChatMessage{
-			{Role: "system", Content: "Create a concise conversation title. Return only the title."},
-			{Role: "user", Content: text},
+			{Role: "system", Content: titleGenerationSystemPrompt()},
+			{Role: "user", Content: formatTitleGenerationInput(text, assistantText)},
 		},
 		ThinkingType:    s.cfg.ThinkingType,
 		ReasoningEffort: s.cfg.ReasoningEffort,
@@ -465,10 +601,7 @@ func (s *Service) GenerateTitle(ctx context.Context, firstUserMessage string) (s
 		return "", err
 	}
 	title := strings.TrimSpace(completion.Content)
-	if len(title) > maxAITitleLength {
-		title = title[:maxAITitleLength]
-	}
-	return title, nil
+	return truncateTitle(title), nil
 }
 
 func mapRepositoryError(err error) error {
@@ -499,6 +632,77 @@ func makeCompletionMessages(messages []repository.AIMessage, chunks []repository
 		result = append(result, ChatMessage{Role: message.Role, Content: message.Text})
 	}
 	return result
+}
+
+func (s *Service) finishFirstRoundTitle(ctx context.Context, prepared preparedMessageCompletion, assistantMessage repository.AIMessage) *string {
+	return s.finishFirstRoundTitleFromText(ctx, prepared, assistantMessage.Text)
+}
+
+func hasRole(messages []repository.AIMessage, role string) bool {
+	for _, message := range messages {
+		if message.Role == role {
+			return true
+		}
+	}
+	return false
+}
+
+func initialUserMessagesForTitle(messages []repository.AIMessage) string {
+	parts := []string{}
+	for _, message := range messages {
+		if message.Role == "assistant" {
+			break
+		}
+		if message.Role != "user" {
+			continue
+		}
+		text := strings.TrimSpace(message.Text)
+		if text == "" {
+			continue
+		}
+		parts = append(parts, text)
+	}
+	return strings.Join(parts, "\n")
+}
+
+func fallbackConversationTitle(text string) string {
+	return truncateTitle(strings.TrimSpace(text))
+}
+
+func truncateTitle(title string) string {
+	title = strings.TrimSpace(strings.Trim(title, "\"'“”‘’`"))
+	runes := []rune(title)
+	if len(runes) > maxAITitleLength {
+		title = string(runes[:maxAITitleLength])
+	}
+	return strings.TrimSpace(title)
+}
+
+func titleTooLong(title string) bool {
+	return len([]rune(strings.TrimSpace(title))) > maxAITitleLength
+}
+
+func isBlankStringPtr(value *string) bool {
+	return value == nil || strings.TrimSpace(*value) == ""
+}
+
+func titleGenerationSystemPrompt() string {
+	return strings.Join([]string{
+		"你是对话标题生成器。请根据首轮用户消息和助手回复，为这段 AI 对话生成一个具体、易扫描的标题。",
+		"要求：",
+		"1. 标题要概括用户真正想完成的任务、问题对象或讨论主题。",
+		"2. 优先使用用户使用的语言；中文标题建议 4 到 18 个汉字，英文标题不超过 8 个单词。",
+		"3. 避免“新对话”“问题咨询”“技术讨论”这类空泛标题。",
+		"4. 不要添加引号、句号、冒号前缀、编号、解释或多余换行。",
+		"5. 只输出标题本身。",
+	}, "\n")
+}
+
+func formatTitleGenerationInput(userText string, assistantText string) string {
+	if strings.TrimSpace(assistantText) == "" {
+		return fmt.Sprintf("用户首条消息：\n%s", strings.TrimSpace(userText))
+	}
+	return fmt.Sprintf("用户首条消息：\n%s\n\n助手首轮回复：\n%s", strings.TrimSpace(userText), strings.TrimSpace(assistantText))
 }
 
 // SelectRelevantChunks chooses bounded uploaded-file context for provider prompts.

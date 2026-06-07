@@ -22,7 +22,16 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, code string,
 	writeErrorDetails(w, r, status, code, message, nil)
 }
 
+func writeErrorCause(w http.ResponseWriter, r *http.Request, status int, code string, message string, cause error) {
+	writeErrorDetailsCause(w, r, status, code, message, nil, cause)
+}
+
 func writeErrorDetails(w http.ResponseWriter, r *http.Request, status int, code string, message string, details any) {
+	writeErrorDetailsCause(w, r, status, code, message, details, nil)
+}
+
+func writeErrorDetailsCause(w http.ResponseWriter, r *http.Request, status int, code string, message string, details any, cause error) {
+	setAccessLogError(r.Context(), code, message, cause)
 	writeJSON(w, status, errorResponse{
 		Code:      code,
 		Message:   message,

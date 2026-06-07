@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	friendsvc "nlserver/internal/friend"
@@ -14,7 +15,27 @@ import (
 const maxBatchUsers = 100
 
 type batchUsersRequest struct {
+	UserUUIDs []string               `json:"userUuids"`
+	Items     []batchUserRequestItem `json:"items"`
+}
+
+type batchPresenceRequest struct {
 	UserUUIDs []string `json:"userUuids"`
+}
+
+type batchUserRequestItem struct {
+	UserUUID     string `json:"userUuid"`
+	KnownVersion *int   `json:"knownVersion"`
+}
+
+type batchGroupMembersRequest struct {
+	UserUUIDs []string                      `json:"userUuids"`
+	Items     []batchGroupMemberRequestItem `json:"items"`
+}
+
+type batchGroupMemberRequestItem struct {
+	UserUUID     string `json:"userUuid"`
+	KnownVersion *int   `json:"knownVersion"`
 }
 
 type createFriendGroupRequest struct {
@@ -26,12 +47,14 @@ type createFriendGroupRequest struct {
 type patchFriendRequest struct {
 	Remark            *string `json:"remark"`
 	GroupID           *string `json:"groupId"`
+	FriendGroupID     *string `json:"friendGroupId"`
 	IsDND             *bool   `json:"isDnd"`
 	ClientOperationID string  `json:"clientOperationId"`
 }
 
 type createFriendRequestRequest struct {
 	ToUserUUID        string  `json:"toUserUuid"`
+	ToUserID          string  `json:"toUserId"`
 	Message           *string `json:"message"`
 	SourceType        *string `json:"sourceType"`
 	SourceGroupID     *string `json:"sourceGroupId"`
@@ -42,7 +65,12 @@ type createFriendRequestRequest struct {
 type acceptFriendRequestRequest struct {
 	Remark            *string `json:"remark"`
 	GroupID           *string `json:"groupId"`
+	FriendGroupID     *string `json:"friendGroupId"`
 	ClientOperationID string  `json:"clientOperationId"`
+}
+
+type rejectFriendRequestRequest struct {
+	ClientOperationID string `json:"clientOperationId"`
 }
 
 type createGroupRequest struct {
@@ -103,15 +131,30 @@ type userDetailResponse struct {
 }
 
 type friendRelationResponse struct {
-	IsFriend      bool    `json:"isFriend"`
-	Remark        *string `json:"remark"`
-	FriendGroupID *string `json:"friendGroupId"`
-	IsDND         bool    `json:"isDnd"`
-	Version       int     `json:"version,omitempty"`
+	IsFriend        bool    `json:"isFriend"`
+	Remark          *string `json:"remark"`
+	FriendGroupID   *string `json:"friendGroupId"`
+	FriendGroupName *string `json:"friendGroupName,omitempty"`
+	IsDND           bool    `json:"isDnd"`
+	Version         int     `json:"version,omitempty"`
 }
 
 type batchUsersResponse struct {
-	Users []userResponse `json:"users"`
+	Users       []userResponse `json:"users"`
+	NotModified []string       `json:"notModified,omitempty"`
+	NotFound    []string       `json:"notFound,omitempty"`
+}
+
+type presenceEntryResponse struct {
+	UserUUID   string     `json:"userUuid"`
+	Status     string     `json:"status"`
+	LastSeenAt *time.Time `json:"lastSeenAt"`
+	UpdatedAt  *time.Time `json:"updatedAt,omitempty"`
+}
+
+type batchPresenceResponse struct {
+	Presences []presenceEntryResponse `json:"presences"`
+	NotFound  []string                `json:"notFound,omitempty"`
 }
 
 type friendGroupsResponse struct {
@@ -123,11 +166,12 @@ type friendGroupDetailResponse struct {
 }
 
 type friendGroupResponse struct {
-	GroupID   string    `json:"groupId"`
-	Name      string    `json:"name"`
-	SortOrder int       `json:"sortOrder"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	GroupID       string    `json:"groupId"`
+	FriendGroupID string    `json:"friendGroupId"`
+	Name          string    `json:"name"`
+	SortOrder     int       `json:"sortOrder"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
 }
 
 type friendsResponse struct {
@@ -140,13 +184,14 @@ type friendshipResponse struct {
 }
 
 type friendResponse struct {
-	User          userResponse `json:"user"`
-	Remark        *string      `json:"remark"`
-	FriendGroupID *string      `json:"friendGroupId"`
-	IsDND         bool         `json:"isDnd"`
-	Version       int          `json:"version"`
-	CreatedAt     time.Time    `json:"createdAt"`
-	UpdatedAt     time.Time    `json:"updatedAt"`
+	User            userResponse `json:"user"`
+	Remark          *string      `json:"remark"`
+	FriendGroupID   *string      `json:"friendGroupId"`
+	FriendGroupName *string      `json:"friendGroupName,omitempty"`
+	IsDND           bool         `json:"isDnd"`
+	Version         int          `json:"version"`
+	CreatedAt       time.Time    `json:"createdAt"`
+	UpdatedAt       time.Time    `json:"updatedAt"`
 }
 
 type friendRequestsResponse struct {
@@ -157,6 +202,19 @@ type friendRequestsResponse struct {
 
 type friendRequestDetailResponse struct {
 	Request friendRequestResponse `json:"request"`
+}
+
+type friendRequestActionErrorDetails struct {
+	RequestedAction string                `json:"requestedAction"`
+	ActorRole       string                `json:"actorRole"`
+	CurrentStatus   string                `json:"currentStatus"`
+	Request         friendRequestResponse `json:"request"`
+}
+
+type friendRequestRealtimePayload struct {
+	Request      friendRequestResponse        `json:"request"`
+	Notification friendRequestResponse        `json:"notification"`
+	Refs         *referencedResourcesResponse `json:"refs,omitempty"`
 }
 
 type friendRequestResponse struct {
@@ -214,6 +272,12 @@ type groupMembersResponse struct {
 	Total   int                   `json:"total"`
 }
 
+type batchGroupMembersResponse struct {
+	Members     []groupMemberResponse `json:"members"`
+	NotModified []string              `json:"notModified,omitempty"`
+	NotFound    []string              `json:"notFound,omitempty"`
+}
+
 type groupMemberDetailResponse struct {
 	Member groupMemberResponse `json:"member"`
 }
@@ -259,7 +323,63 @@ type groupJoinRequestResponse struct {
 	UpdatedAt    time.Time     `json:"updatedAt"`
 }
 
+type optionalStringInput struct {
+	Set   bool
+	Value *string
+}
+
+func parseOptionalFriendGroupID(groupID *string, friendGroupID *string) (optionalStringInput, *requestError) {
+	if groupID == nil && friendGroupID == nil {
+		return optionalStringInput{}, nil
+	}
+
+	if groupID != nil && friendGroupID != nil && strings.TrimSpace(*groupID) != strings.TrimSpace(*friendGroupID) {
+		return optionalStringInput{}, &requestError{
+			Status:  http.StatusBadRequest,
+			Code:    "VALIDATION_ERROR",
+			Message: "use either friendGroupId or groupId, not both",
+		}
+	}
+
+	source := groupID
+	field := "groupId"
+	if friendGroupID != nil {
+		source = friendGroupID
+		field = "friendGroupId"
+	}
+
+	normalized := strings.TrimSpace(*source)
+	if normalized != "" && !uuidPattern.MatchString(normalized) {
+		return optionalStringInput{}, &requestError{
+			Status:  http.StatusBadRequest,
+			Code:    "VALIDATION_ERROR",
+			Message: field + " must be a friend group UUID",
+		}
+	}
+
+	return optionalStringInput{Set: true, Value: &normalized}, nil
+}
+
+func parseAcceptFriendGroupID(groupID *string, friendGroupID *string) (optionalStringInput, *requestError) {
+	if friendGroupID != nil {
+		return parseOptionalFriendGroupID(nil, friendGroupID)
+	}
+	if groupID == nil {
+		return optionalStringInput{}, nil
+	}
+	if normalized := strings.TrimSpace(*groupID); normalized != "" && !uuidPattern.MatchString(normalized) {
+		return optionalStringInput{}, nil
+	}
+	return parseOptionalFriendGroupID(groupID, nil)
+}
+
 func (s *Server) handleUsersSearch(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
 	limit, offset, err := parsePagination(r)
 	if err != nil {
 		writeRequestError(w, r, err)
@@ -273,7 +393,7 @@ func (s *Server) handleUsersSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, usersListResponse{
-		Users: makePublicUserResponses(users),
+		Users: s.makePublicUserResponsesForViewer(principal.UserID, users),
 		Total: total,
 	})
 }
@@ -297,7 +417,7 @@ func (s *Server) handleUserByUUID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response, err := makeUserDetailResponse(r.Context(), s.repos, principal.UserID, user)
+	response, err := s.makeUserDetailResponse(r.Context(), principal.UserID, user)
 	if err != nil {
 		writeRepositoryError(w, r, err)
 		return
@@ -319,7 +439,7 @@ func (s *Server) handleUserByPublicID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response, err := makeUserDetailResponse(r.Context(), s.repos, principal.UserID, user)
+	response, err := s.makeUserDetailResponse(r.Context(), principal.UserID, user)
 	if err != nil {
 		writeRepositoryError(w, r, err)
 		return
@@ -329,33 +449,110 @@ func (s *Server) handleUserByPublicID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUsersBatch(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
 	var req batchUsersRequest
 	if err := decodeJSONBody(r, &req); err != nil {
 		writeRequestError(w, r, err)
 		return
 	}
-	if len(req.UserUUIDs) > maxBatchUsers {
-		writeRequestError(w, r, &requestError{
-			Status:  http.StatusBadRequest,
-			Code:    "VALIDATION_ERROR",
-			Message: "userUuids must contain at most 100 entries",
-		})
+
+	lookups, reqErr := collectBatchUserLookups(req)
+	if reqErr != nil {
+		writeRequestError(w, r, reqErr)
 		return
 	}
-	for _, userUUID := range req.UserUUIDs {
-		if err := validateUUID(userUUID, "userUuids"); err != nil {
-			writeRequestError(w, r, err)
-			return
-		}
+	userIDs := make([]string, 0, len(lookups))
+	for _, lookup := range lookups {
+		userIDs = append(userIDs, lookup.UserUUID)
 	}
 
-	users, err := s.repos.Users.BatchGetByIDs(r.Context(), req.UserUUIDs)
+	users, err := s.repos.Users.BatchGetByIDs(r.Context(), userIDs)
 	if err != nil {
 		writeRepositoryError(w, r, err)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, batchUsersResponse{Users: makePublicUserResponses(users)})
+	usersByID := make(map[string]repository.User, len(users))
+	for _, user := range users {
+		usersByID[user.ID] = user
+	}
+	response := batchUsersResponse{Users: []userResponse{}}
+	for _, lookup := range lookups {
+		user, ok := usersByID[lookup.UserUUID]
+		if !ok {
+			response.NotFound = append(response.NotFound, lookup.UserUUID)
+			continue
+		}
+		if lookup.HasKnownVersion && user.Version <= lookup.KnownVersion {
+			response.NotModified = append(response.NotModified, lookup.UserUUID)
+			continue
+		}
+		response.Users = append(response.Users, s.makePublicUserResponseForViewer(principal.UserID, user))
+	}
+
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) handlePresenceBatch(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	var req batchPresenceRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	userIDs := uniqueStrings(req.UserUUIDs)
+	if len(userIDs) > maxBatchUsers {
+		writeRequestError(w, r, &requestError{
+			Status:  http.StatusBadRequest,
+			Code:    "VALIDATION_ERROR",
+			Message: "userUuids exceeds maximum batch size",
+		})
+		return
+	}
+	for _, userID := range userIDs {
+		if reqErr := validateUUID(userID, "userUuids"); reqErr != nil {
+			writeRequestError(w, r, reqErr)
+			return
+		}
+	}
+
+	users, err := s.repos.Users.BatchGetByIDs(r.Context(), userIDs)
+	if err != nil {
+		writeRepositoryError(w, r, err)
+		return
+	}
+	usersByID := make(map[string]repository.User, len(users))
+	for _, user := range users {
+		usersByID[user.ID] = user
+	}
+
+	response := batchPresenceResponse{Presences: []presenceEntryResponse{}}
+	for _, userID := range userIDs {
+		user, ok := usersByID[userID]
+		if !ok {
+			response.NotFound = append(response.NotFound, userID)
+			continue
+		}
+		presence := s.presenceForViewer(principal.UserID, user.ID, user.LastSeenAt)
+		response.Presences = append(response.Presences, presenceEntryResponse{
+			UserUUID:   user.ID,
+			Status:     presence.Status,
+			LastSeenAt: presence.LastSeenAt,
+			UpdatedAt:  presence.UpdatedAt,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleFriendGroups(w http.ResponseWriter, r *http.Request) {
@@ -442,7 +639,7 @@ func (s *Server) handleFriends(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, friendsResponse{Friends: makeFriendResponses(friends), Total: total})
+	writeJSON(w, http.StatusOK, friendsResponse{Friends: s.makeFriendResponsesForViewer(principal.UserID, friends), Total: total})
 }
 
 func (s *Server) handlePatchFriend(w http.ResponseWriter, r *http.Request) {
@@ -466,11 +663,10 @@ func (s *Server) handlePatchFriend(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, r, err)
 		return
 	}
-	if req.GroupID != nil {
-		if reqErr := validateOptionalUUID(*req.GroupID, "groupId"); reqErr != nil {
-			writeRequestError(w, r, reqErr)
-			return
-		}
+	friendGroupID, reqErr := parseOptionalFriendGroupID(req.GroupID, req.FriendGroupID)
+	if reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
 	}
 
 	s.handleIdempotentWrite(w, r, principal.UserID, "friend.update:"+friendUserID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
@@ -481,14 +677,14 @@ func (s *Server) handlePatchFriend(w http.ResponseWriter, r *http.Request) {
 			FriendUserID: friendUserID,
 			RemarkSet:    req.Remark != nil,
 			Remark:       req.Remark,
-			GroupIDSet:   req.GroupID != nil,
-			GroupID:      req.GroupID,
+			GroupIDSet:   friendGroupID.Set,
+			GroupID:      friendGroupID.Value,
 			IsDND:        req.IsDND,
 		})
 		if err != nil {
 			return idempotentHTTPResult{}, err
 		}
-		response := friendshipResponse{Friendship: makeFriendResponse(friend)}
+		response := friendshipResponse{Friendship: s.makeFriendResponseForViewer(principal.UserID, friend)}
 		return idempotentHTTPResult{
 			Status: http.StatusOK,
 			Body:   response,
@@ -550,7 +746,8 @@ func (s *Server) handleCreateFriendRequest(w http.ResponseWriter, r *http.Reques
 		writeRequestError(w, r, err)
 		return
 	}
-	if reqErr := validateUUID(req.ToUserUUID, "toUserUuid"); reqErr != nil {
+	toUserUUID, reqErr := s.resolveFriendRequestTargetUserUUID(r.Context(), req)
+	if reqErr != nil {
 		writeRequestError(w, r, reqErr)
 		return
 	}
@@ -567,12 +764,12 @@ func (s *Server) handleCreateFriendRequest(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	s.handleIdempotentWrite(w, r, principal.UserID, "friend.request.create:"+req.ToUserUUID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
+	s.handleIdempotentWrite(w, r, principal.UserID, "friend.request.create:"+toUserUUID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writeFriendServiceError(w, r, err)
 	}, func() (idempotentHTTPResult, error) {
 		request, err := s.friendService.CreateRequest(r.Context(), friendsvc.CreateRequestInput{
 			FromUserID:     principal.UserID,
-			ToUserID:       req.ToUserUUID,
+			ToUserID:       toUserUUID,
 			Message:        req.Message,
 			SourceType:     req.SourceType,
 			SourceGroupID:  req.SourceGroupID,
@@ -586,13 +783,60 @@ func (s *Server) handleCreateFriendRequest(w http.ResponseWriter, r *http.Reques
 			Status: http.StatusCreated,
 			Body:   response,
 			After: func() {
-				s.publishRealtimeEvent(r.Context(), []string{request.FromUser.ID, request.ToUser.ID}, "friend.request.created", map[string]any{
-					"request":      response.Request,
-					"notification": response.Request,
+				refs, err := s.makeUserRefsForIDs(r.Context(), []string{request.FromUser.ID, request.ToUser.ID})
+				if err != nil {
+					s.logger.WarnContext(r.Context(), "failed to load friend request user refs", "error", err, "request_id", request.ID)
+				}
+				s.publishRealtimeEvent(r.Context(), []string{request.FromUser.ID, request.ToUser.ID}, "friend.request.created", friendRequestRealtimePayload{
+					Request:      response.Request,
+					Notification: response.Request,
+					Refs:         refs,
 				})
 			},
 		}, nil
 	})
+}
+
+func (s *Server) resolveFriendRequestTargetUserUUID(ctx context.Context, req createFriendRequestRequest) (string, *requestError) {
+	toUserUUID := strings.TrimSpace(req.ToUserUUID)
+	toUserID := strings.TrimSpace(req.ToUserID)
+	if toUserUUID == "" && toUserID == "" {
+		return "", &requestError{
+			Status:  http.StatusBadRequest,
+			Code:    "VALIDATION_ERROR",
+			Message: "toUserUuid or toUserId is required",
+		}
+	}
+	if toUserUUID != "" && toUserID != "" {
+		return "", &requestError{
+			Status:  http.StatusBadRequest,
+			Code:    "VALIDATION_ERROR",
+			Message: "use either toUserUuid or toUserId, not both",
+		}
+	}
+	if toUserUUID != "" {
+		if reqErr := validateUUID(toUserUUID, "toUserUuid"); reqErr != nil {
+			return "", reqErr
+		}
+		return toUserUUID, nil
+	}
+
+	user, err := s.repos.Users.GetByPublicID(ctx, toUserID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return "", &requestError{
+				Status:  http.StatusNotFound,
+				Code:    "NOT_FOUND",
+				Message: "target user not found",
+			}
+		}
+		return "", &requestError{
+			Status:  http.StatusInternalServerError,
+			Code:    "INTERNAL_ERROR",
+			Message: "failed to resolve target user",
+		}
+	}
+	return user.ID, nil
 }
 
 func (s *Server) handleFriendRequests(w http.ResponseWriter, r *http.Request) {
@@ -650,31 +894,41 @@ func (s *Server) handleAcceptFriendRequest(w http.ResponseWriter, r *http.Reques
 		writeRequestError(w, r, err)
 		return
 	}
-	if req.GroupID != nil {
-		if reqErr := validateOptionalUUID(*req.GroupID, "groupId"); reqErr != nil {
-			writeRequestError(w, r, reqErr)
-			return
-		}
+	friendGroupID, reqErr := parseAcceptFriendGroupID(req.GroupID, req.FriendGroupID)
+	if reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
 	}
 
 	s.handleIdempotentWrite(w, r, principal.UserID, "friend.request.accept:"+requestID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writeFriendServiceError(w, r, err)
 	}, func() (idempotentHTTPResult, error) {
-		friend, err := s.friendService.AcceptRequest(r.Context(), friendsvc.AcceptRequestInput{
+		result, err := s.friendService.AcceptRequest(r.Context(), friendsvc.AcceptRequestInput{
 			UserID:    principal.UserID,
 			RequestID: requestID,
 			Remark:    req.Remark,
-			GroupID:   req.GroupID,
+			GroupID:   friendGroupID.Value,
 		})
 		if err != nil {
 			return idempotentHTTPResult{}, err
 		}
-		response := friendshipResponse{Friendship: makeFriendResponse(friend)}
+		response := friendshipResponse{Friendship: s.makeFriendResponseForViewer(principal.UserID, result.Friend)}
 		return idempotentHTTPResult{
 			Status: http.StatusOK,
 			Body:   response,
 			After: func() {
-				s.publishRealtimeEvent(r.Context(), []string{principal.UserID, friend.User.ID}, "friend.request.accepted", response)
+				s.publishRealtimeEvent(r.Context(), []string{principal.UserID, result.Friend.User.ID}, "friend.request.accepted", response)
+				if result.Message == nil || result.ConversationID == "" {
+					return
+				}
+				messageResponse, err := s.makeMessageResponse(r, *result.Message)
+				if err != nil {
+					s.logger.WarnContext(r.Context(), "failed to build friend accepted message response", "error", err, "request_id", requestID)
+					return
+				}
+				s.publishConversationMessage(r.Context(), result.ConversationID, "chat.message.created", messageResponse)
+				s.publishAllConversationSyncStates(r.Context(), result.ConversationID, "friend.request.accepted")
+				s.publishAllConversationUpdated(r.Context(), result.ConversationID, "friend.request.accepted")
 			},
 		}, nil
 	})
@@ -696,7 +950,17 @@ func (s *Server) handleRejectFriendRequest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	s.handleIdempotentWrite(w, r, principal.UserID, "friend.request.reject:"+requestID, idempotencyKeyFromRequest(r, r.URL.Query().Get("clientOperationId")), func(err error) {
+	var req rejectFriendRequestRequest
+	if err := decodeOptionalJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	clientOperationID := req.ClientOperationID
+	if clientOperationID == "" {
+		clientOperationID = r.URL.Query().Get("clientOperationId")
+	}
+
+	s.handleIdempotentWrite(w, r, principal.UserID, "friend.request.reject:"+requestID, idempotencyKeyFromRequest(r, clientOperationID), func(err error) {
 		writeFriendServiceError(w, r, err)
 	}, func() (idempotentHTTPResult, error) {
 		request, err := s.friendService.RejectRequest(r.Context(), principal.UserID, requestID)
@@ -976,7 +1240,65 @@ func (s *Server) handleGroupMembers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, groupMembersResponse{Members: makeGroupMemberResponses(members), Total: total})
+	writeJSON(w, http.StatusOK, groupMembersResponse{Members: s.makeGroupMemberResponsesForViewer(principal.UserID, members), Total: total})
+}
+
+func (s *Server) handleGroupMembersBatch(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	groupID := r.PathValue("groupId")
+	if reqErr := validateUUID(groupID, "groupId"); reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+	var req batchGroupMembersRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+	lookups, reqErr := collectBatchGroupMemberLookups(req)
+	if reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+	if _, err := s.repos.Groups.GetForUser(r.Context(), principal.UserID, groupID); err != nil {
+		writeRepositoryError(w, r, err)
+		return
+	}
+
+	userIDs := make([]string, 0, len(lookups))
+	for _, lookup := range lookups {
+		userIDs = append(userIDs, lookup.UserUUID)
+	}
+	members, err := s.repos.Groups.BatchGetMembers(r.Context(), principal.UserID, groupID, userIDs)
+	if err != nil {
+		writeRepositoryError(w, r, err)
+		return
+	}
+
+	membersByUserID := make(map[string]repository.GroupMember, len(members))
+	for _, member := range members {
+		membersByUserID[member.User.ID] = member
+	}
+	response := batchGroupMembersResponse{Members: []groupMemberResponse{}}
+	for _, lookup := range lookups {
+		member, ok := membersByUserID[lookup.UserUUID]
+		if !ok {
+			response.NotFound = append(response.NotFound, lookup.UserUUID)
+			continue
+		}
+		if lookup.HasKnownVersion && member.Version <= lookup.KnownVersion {
+			response.NotModified = append(response.NotModified, lookup.UserUUID)
+			continue
+		}
+		response.Members = append(response.Members, s.makeGroupMemberResponseForViewer(principal.UserID, member))
+	}
+
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleAddGroupMembers(w http.ResponseWriter, r *http.Request) {
@@ -1016,12 +1338,13 @@ func (s *Server) handleAddGroupMembers(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return idempotentHTTPResult{}, err
 		}
-		response := groupMembersResponse{Members: makeGroupMemberResponses(members), Total: len(members)}
+		response := groupMembersResponse{Members: s.makeGroupMemberResponsesForViewer(principal.UserID, members), Total: len(members)}
 		return idempotentHTTPResult{
 			Status: http.StatusCreated,
 			Body:   response,
 			After: func() {
-				s.publishGroupRealtimeEvent(r.Context(), groupID, "group.members.added", response)
+				eventResponse := groupMembersResponse{Members: makeGroupMemberResponses(members), Total: len(members)}
+				s.publishGroupRealtimeEvent(r.Context(), groupID, "group.members.added", eventResponse)
 			},
 		}, nil
 	})
@@ -1120,12 +1443,13 @@ func (s *Server) handlePatchGroupMember(w http.ResponseWriter, r *http.Request) 
 		if err != nil {
 			return idempotentHTTPResult{}, err
 		}
-		response := groupMemberDetailResponse{Member: makeGroupMemberResponse(member)}
+		response := groupMemberDetailResponse{Member: s.makeGroupMemberResponseForViewer(principal.UserID, member)}
 		return idempotentHTTPResult{
 			Status: http.StatusOK,
 			Body:   response,
 			After: func() {
-				s.publishGroupRealtimeEvent(r.Context(), groupID, "group.member.updated", response)
+				eventResponse := groupMemberDetailResponse{Member: makeGroupMemberResponse(member)}
+				s.publishGroupRealtimeEvent(r.Context(), groupID, "group.member.updated", eventResponse)
 			},
 		}, nil
 	})
@@ -1399,20 +1723,21 @@ func (s *Server) handleRejectGroupJoinRequest(w http.ResponseWriter, r *http.Req
 	})
 }
 
-func makeUserDetailResponse(ctx context.Context, repos repository.Repositories, viewerUserID string, user repository.User) (userDetailResponse, error) {
-	response := userDetailResponse{User: makePublicUserResponse(user)}
+func (s *Server) makeUserDetailResponse(ctx context.Context, viewerUserID string, user repository.User) (userDetailResponse, error) {
+	response := userDetailResponse{User: s.makePublicUserResponseForViewer(viewerUserID, user)}
 	if user.ID == viewerUserID {
 		return response, nil
 	}
 
-	relation, err := repos.Friends.GetRelation(ctx, viewerUserID, user.ID)
+	relation, err := s.repos.Friends.GetRelation(ctx, viewerUserID, user.ID)
 	if err == nil {
 		response.Relation = &friendRelationResponse{
-			IsFriend:      true,
-			Remark:        relation.Remark,
-			FriendGroupID: relation.FriendGroupID,
-			IsDND:         relation.IsDND,
-			Version:       relation.Version,
+			IsFriend:        true,
+			Remark:          relation.Remark,
+			FriendGroupID:   relation.FriendGroupID,
+			FriendGroupName: relation.FriendGroupName,
+			IsDND:           relation.IsDND,
+			Version:         relation.Version,
 		}
 		return response, nil
 	}
@@ -1422,6 +1747,60 @@ func makeUserDetailResponse(ctx context.Context, repos repository.Repositories, 
 
 	response.Relation = &friendRelationResponse{IsFriend: false}
 	return response, nil
+}
+
+func (s *Server) makeUserResponseForViewer(viewerUserID string, user repository.User) userResponse {
+	response := makeUserResponse(user)
+	s.attachPresenceForViewer(viewerUserID, &response)
+	return response
+}
+
+func (s *Server) makePublicUserResponseForViewer(viewerUserID string, user repository.User) userResponse {
+	response := makePublicUserResponse(user)
+	s.attachPresenceForViewer(viewerUserID, &response)
+	return response
+}
+
+func (s *Server) makePublicUserResponsesForViewer(viewerUserID string, users []repository.User) []userResponse {
+	responses := make([]userResponse, 0, len(users))
+	for _, user := range users {
+		responses = append(responses, s.makePublicUserResponseForViewer(viewerUserID, user))
+	}
+	return responses
+}
+
+func (s *Server) attachPresenceForViewer(viewerUserID string, response *userResponse) {
+	if response == nil {
+		return
+	}
+	response.Presence = s.presenceForViewer(viewerUserID, response.UserUUID, response.LastSeenAt)
+}
+
+func (s *Server) presenceForViewer(viewerUserID string, userID string, userLastSeenAt *time.Time) *presenceResponse {
+	status := "offline"
+	lastSeenAt := userLastSeenAt
+	var updatedAt *time.Time
+	if s.realtimeHub != nil {
+		if state, ok := s.realtimeHub.Presence(userID); ok {
+			status = state.Status
+			seen := state.LastSeenAt
+			lastSeenAt = &seen
+			updated := state.UpdatedAt
+			updatedAt = &updated
+		}
+	}
+	if viewerUserID != userID {
+		status = externallyVisiblePresenceStatus(status)
+		if status == "offline" {
+			lastSeenAt = userLastSeenAt
+			updatedAt = nil
+		}
+	}
+	return &presenceResponse{
+		Status:     status,
+		LastSeenAt: lastSeenAt,
+		UpdatedAt:  updatedAt,
+	}
 }
 
 func makePublicUserResponse(user repository.User) userResponse {
@@ -1448,11 +1827,12 @@ func makeFriendGroupResponses(groups []repository.FriendGroup) []friendGroupResp
 
 func makeFriendGroupResponse(group repository.FriendGroup) friendGroupResponse {
 	return friendGroupResponse{
-		GroupID:   group.ID,
-		Name:      group.Name,
-		SortOrder: group.SortOrder,
-		CreatedAt: group.CreatedAt,
-		UpdatedAt: group.UpdatedAt,
+		GroupID:       group.ID,
+		FriendGroupID: group.ID,
+		Name:          group.Name,
+		SortOrder:     group.SortOrder,
+		CreatedAt:     group.CreatedAt,
+		UpdatedAt:     group.UpdatedAt,
 	}
 }
 
@@ -1464,16 +1844,31 @@ func makeFriendResponses(friends []repository.Friend) []friendResponse {
 	return responses
 }
 
+func (s *Server) makeFriendResponsesForViewer(viewerUserID string, friends []repository.Friend) []friendResponse {
+	responses := make([]friendResponse, 0, len(friends))
+	for _, friend := range friends {
+		responses = append(responses, s.makeFriendResponseForViewer(viewerUserID, friend))
+	}
+	return responses
+}
+
 func makeFriendResponse(friend repository.Friend) friendResponse {
 	return friendResponse{
-		User:          makePublicUserResponse(friend.User),
-		Remark:        friend.Remark,
-		FriendGroupID: friend.FriendGroupID,
-		IsDND:         friend.IsDND,
-		Version:       friend.Version,
-		CreatedAt:     friend.CreatedAt,
-		UpdatedAt:     friend.UpdatedAt,
+		User:            makePublicUserResponse(friend.User),
+		Remark:          friend.Remark,
+		FriendGroupID:   friend.FriendGroupID,
+		FriendGroupName: friend.FriendGroupName,
+		IsDND:           friend.IsDND,
+		Version:         friend.Version,
+		CreatedAt:       friend.CreatedAt,
+		UpdatedAt:       friend.UpdatedAt,
 	}
+}
+
+func (s *Server) makeFriendResponseForViewer(viewerUserID string, friend repository.Friend) friendResponse {
+	response := makeFriendResponse(friend)
+	s.attachPresenceForViewer(viewerUserID, &response.User)
+	return response
 }
 
 func makeFriendRequestResponses(requests []repository.FriendRequest) []friendRequestResponse {
@@ -1513,7 +1908,7 @@ func makeGroupResponse(entry repository.GroupListEntry) groupResponse {
 		GroupID:           entry.Group.ID,
 		Name:              entry.Group.Name,
 		OwnerUUID:         entry.Group.OwnerID,
-		AvatarURL:         nil,
+		AvatarURL:         avatarContentURL(entry.Group.AvatarFileID),
 		AvatarVersion:     entry.Group.Version,
 		AvatarEtag:        nil,
 		AvatarContentHash: nil,
@@ -1541,6 +1936,14 @@ func makeGroupMemberResponses(members []repository.GroupMember) []groupMemberRes
 	return responses
 }
 
+func (s *Server) makeGroupMemberResponsesForViewer(viewerUserID string, members []repository.GroupMember) []groupMemberResponse {
+	responses := make([]groupMemberResponse, 0, len(members))
+	for _, member := range members {
+		responses = append(responses, s.makeGroupMemberResponseForViewer(viewerUserID, member))
+	}
+	return responses
+}
+
 func makeGroupMemberResponse(member repository.GroupMember) groupMemberResponse {
 	return groupMemberResponse{
 		User:     makePublicUserResponse(member.User),
@@ -1550,6 +1953,12 @@ func makeGroupMemberResponse(member repository.GroupMember) groupMemberResponse 
 		JoinedAt: member.JoinedAt,
 		Version:  member.Version,
 	}
+}
+
+func (s *Server) makeGroupMemberResponseForViewer(viewerUserID string, member repository.GroupMember) groupMemberResponse {
+	response := makeGroupMemberResponse(member)
+	s.attachPresenceForViewer(viewerUserID, &response.User)
+	return response
 }
 
 func makeGroupSettingsResponse(settings repository.GroupUserSettings) groupSettingsResponse {
@@ -1610,42 +2019,61 @@ func (s *Server) requireGroupService(w http.ResponseWriter, r *http.Request) boo
 }
 
 func writeFriendServiceError(w http.ResponseWriter, r *http.Request, err error) {
+	var requestActionErr *friendsvc.RequestActionError
+	if errors.As(err, &requestActionErr) {
+		details := friendRequestActionErrorDetails{
+			RequestedAction: requestActionErr.Action,
+			ActorRole:       requestActionErr.ActorRole,
+			CurrentStatus:   requestActionErr.Request.Status,
+			Request:         makeFriendRequestResponse(requestActionErr.Request),
+		}
+		switch {
+		case errors.Is(err, friendsvc.ErrRequestAlreadyHandled):
+			writeErrorDetailsCause(w, r, http.StatusConflict, "FRIEND_REQUEST_ALREADY_HANDLED", "Friend request is already handled", details, err)
+		case errors.Is(err, friendsvc.ErrRequestNotRecipient):
+			writeErrorDetailsCause(w, r, http.StatusForbidden, "FRIEND_REQUEST_NOT_RECIPIENT", "Only the recipient can accept or reject this friend request", details, err)
+		default:
+			writeErrorDetailsCause(w, r, http.StatusConflict, "FRIEND_REQUEST_STATE_CHANGED", "Friend request state changed", details, err)
+		}
+		return
+	}
+
 	switch {
 	case errors.Is(err, friendsvc.ErrValidation):
-		writeError(w, r, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid friend request")
+		writeErrorCause(w, r, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid friend request", err)
 	case errors.Is(err, friendsvc.ErrConflict):
-		writeError(w, r, http.StatusConflict, "CONFLICT", "Friend resource conflict")
+		writeErrorCause(w, r, http.StatusConflict, "CONFLICT", "Friend resource conflict", err)
 	case errors.Is(err, friendsvc.ErrForbidden):
-		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Forbidden")
+		writeErrorCause(w, r, http.StatusForbidden, "FORBIDDEN", "Forbidden", err)
 	case errors.Is(err, friendsvc.ErrUnavailable):
-		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "Friend service is not ready")
+		writeErrorCause(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "Friend service is not ready", err)
 	case errors.Is(err, repository.ErrNotFound):
-		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "Resource not found")
+		writeErrorCause(w, r, http.StatusNotFound, "NOT_FOUND", "Resource not found", err)
 	default:
-		writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error")
+		writeErrorCause(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error", err)
 	}
 }
 
 func writeGroupServiceError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, groupsvc.ErrValidation):
-		writeError(w, r, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid group request")
+		writeErrorCause(w, r, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid group request", err)
 	case errors.Is(err, groupsvc.ErrConflict):
-		writeError(w, r, http.StatusConflict, "CONFLICT", "Group resource conflict")
+		writeErrorCause(w, r, http.StatusConflict, "CONFLICT", "Group resource conflict", err)
 	case errors.Is(err, groupsvc.ErrForbidden):
-		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Forbidden")
+		writeErrorCause(w, r, http.StatusForbidden, "FORBIDDEN", "Forbidden", err)
 	case errors.Is(err, groupsvc.ErrUnavailable):
-		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "Group service is not ready")
+		writeErrorCause(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "Group service is not ready", err)
 	case errors.Is(err, repository.ErrNotFound):
-		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "Resource not found")
+		writeErrorCause(w, r, http.StatusNotFound, "NOT_FOUND", "Resource not found", err)
 	default:
-		writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error")
+		writeErrorCause(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error", err)
 	}
 }
 
 func writeVersionedGroupOperationError(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, errResourceVersionConflict) {
-		writeError(w, r, http.StatusConflict, "VERSION_CONFLICT", "Resource version conflict")
+		writeErrorCause(w, r, http.StatusConflict, "VERSION_CONFLICT", "Resource version conflict", err)
 		return
 	}
 	writeGroupServiceError(w, r, err)

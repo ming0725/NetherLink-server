@@ -167,6 +167,10 @@ func (r *UserRepository) GetByID(ctx context.Context, userID string) (User, erro
 	return r.getOne(ctx, `SELECT `+userSelectColumns+` FROM users WHERE id = $1::uuid AND deleted_at IS NULL`, normalizeText(userID))
 }
 
+func (r *UserRepository) LockByID(ctx context.Context, userID string) (User, error) {
+	return r.getOne(ctx, `SELECT `+userSelectColumns+` FROM users WHERE id = $1::uuid AND deleted_at IS NULL FOR UPDATE`, normalizeText(userID))
+}
+
 func (r *UserRepository) GetByEmail(ctx context.Context, email string) (User, error) {
 	return r.getOne(ctx, `SELECT `+userSelectColumns+` FROM users WHERE email = $1 AND deleted_at IS NULL`, normalizeEmail(email))
 }

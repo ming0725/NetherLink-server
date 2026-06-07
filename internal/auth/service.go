@@ -6,6 +6,7 @@ import (
 	"encoding/base32"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/mail"
 	"regexp"
 	"strings"
@@ -36,9 +37,10 @@ const (
 )
 
 type Service struct {
-	cfg   config.AuthConfig
-	repos repository.Repositories
-	now   func() time.Time
+	cfg        config.AuthConfig
+	repos      repository.Repositories
+	txBeginner repository.TxBeginner
+	now        func() time.Time
 }
 
 type RegisterInput struct {
@@ -80,11 +82,12 @@ type ChangePublicIDInput struct {
 }
 
 type AuthResult struct {
-	User         repository.User
-	Preferences  repository.UserPreference
-	AccessToken  string
-	RefreshToken string
-	ExpiresIn    int
+	User            repository.User
+	Preferences     repository.UserPreference
+	AccessToken     string
+	RefreshToken    string
+	ExpiresIn       int
+	RevokedSessions []repository.UserSession
 }
 
 type RefreshResult struct {
@@ -106,6 +109,10 @@ type PublicIDAvailability struct {
 }
 
 func NewService(cfg config.AuthConfig, repos repository.Repositories) *Service {
+	return NewServiceWithTx(cfg, repos, nil)
+}
+
+func NewServiceWithTx(cfg config.AuthConfig, repos repository.Repositories, txBeginner repository.TxBeginner) *Service {
 	if cfg.AccessTokenTTL <= 0 {
 		cfg.AccessTokenTTL = 15 * time.Minute
 	}
@@ -114,9 +121,10 @@ func NewService(cfg config.AuthConfig, repos repository.Repositories) *Service {
 	}
 
 	return &Service{
-		cfg:   cfg,
-		repos: repos,
-		now:   time.Now,
+		cfg:        cfg,
+		repos:      repos,
+		txBeginner: txBeginner,
+		now:        time.Now,
 	}
 }
 
@@ -154,12 +162,18 @@ func (s *Service) Register(ctx context.Context, input RegisterInput) (AuthResult
 		return AuthResult{}, err
 	}
 
+	avatarFileID, err := s.pickDefaultAvatarFileID(ctx)
+	if err != nil {
+		return AuthResult{}, err
+	}
+
 	user, err := s.repos.Users.Create(ctx, repository.CreateUserParams{
 		PublicID:     publicID,
 		Email:        email,
 		PasswordHash: passwordHash,
 		Nick:         displayName,
 		Gender:       gender,
+		AvatarFileID: avatarFileID,
 		Status:       "active",
 	})
 	if err != nil {
@@ -324,16 +338,16 @@ func (s *Service) ListActiveSessions(ctx context.Context, userID string) ([]repo
 	return s.repos.Sessions.ListByUserID(ctx, userID, true)
 }
 
-func (s *Service) RevokeSession(ctx context.Context, userID string, sessionID string) error {
+func (s *Service) RevokeSession(ctx context.Context, userID string, sessionID string) (repository.UserSession, error) {
 	if strings.TrimSpace(userID) == "" || strings.TrimSpace(sessionID) == "" {
-		return ErrValidation
+		return repository.UserSession{}, ErrValidation
 	}
 
-	err := s.repos.Sessions.RevokeForUser(ctx, sessionID, userID)
+	session, err := s.repos.Sessions.RevokeForUserReturning(ctx, sessionID, userID)
 	if err != nil {
-		return mapRepositoryError(err)
+		return repository.UserSession{}, mapRepositoryError(err)
 	}
-	return nil
+	return session, nil
 }
 
 func (s *Service) Login(ctx context.Context, input LoginInput) (AuthResult, error) {
@@ -355,16 +369,53 @@ func (s *Service) Login(ctx context.Context, input LoginInput) (AuthResult, erro
 		return AuthResult{}, ErrInvalidCredentials
 	}
 
-	preferences, err := s.repos.Preferences.EnsureDefault(ctx, user.ID)
-	if err != nil {
-		return AuthResult{}, err
+	deviceID := strings.TrimSpace(input.DeviceID)
+	deviceName := stringPtrOrNil(input.DeviceName)
+	var result AuthResult
+	if s.txBeginner != nil {
+		err = repository.WithTx(ctx, s.txBeginner, func(repos repository.Repositories) error {
+			lockedUser, err := repos.Users.LockByID(ctx, user.ID)
+			if err != nil {
+				return mapRepositoryError(err)
+			}
+			if lockedUser.Status != "active" {
+				return ErrInvalidCredentials
+			}
+			preferences, err := repos.Preferences.EnsureDefault(ctx, lockedUser.ID)
+			if err != nil {
+				return err
+			}
+			revokedSessions, err := repos.Sessions.RevokeActiveByUserID(ctx, lockedUser.ID)
+			if err != nil {
+				return err
+			}
+			result, err = s.createTokenSessionWithRepos(ctx, repos, lockedUser, deviceID, deviceName)
+			if err != nil {
+				return err
+			}
+			result.Preferences = preferences
+			result.RevokedSessions = revokedSessions
+			return nil
+		})
+		if err != nil {
+			return AuthResult{}, err
+		}
+	} else {
+		preferences, err := s.repos.Preferences.EnsureDefault(ctx, user.ID)
+		if err != nil {
+			return AuthResult{}, err
+		}
+		revokedSessions, err := s.repos.Sessions.RevokeActiveByUserID(ctx, user.ID)
+		if err != nil {
+			return AuthResult{}, err
+		}
+		result, err = s.createTokenSessionWithRepos(ctx, s.repos, user, deviceID, deviceName)
+		if err != nil {
+			return AuthResult{}, err
+		}
+		result.Preferences = preferences
+		result.RevokedSessions = revokedSessions
 	}
-
-	result, err := s.createTokenSession(ctx, user, strings.TrimSpace(input.DeviceID), stringPtrOrNil(input.DeviceName))
-	if err != nil {
-		return AuthResult{}, err
-	}
-	result.Preferences = preferences
 
 	_ = s.repos.Users.TouchLastSeen(ctx, user.ID, s.now().UTC())
 	return result, nil
@@ -467,13 +518,17 @@ func (s *Service) ValidateAccessToken(ctx context.Context, token string) (Princi
 }
 
 func (s *Service) createTokenSession(ctx context.Context, user repository.User, deviceID string, deviceName *string) (AuthResult, error) {
+	return s.createTokenSessionWithRepos(ctx, s.repos, user, deviceID, deviceName)
+}
+
+func (s *Service) createTokenSessionWithRepos(ctx context.Context, repos repository.Repositories, user repository.User, deviceID string, deviceName *string) (AuthResult, error) {
 	refreshToken, err := newRefreshToken()
 	if err != nil {
 		return AuthResult{}, err
 	}
 
 	now := s.now().UTC()
-	session, err := s.repos.Sessions.Create(ctx, repository.CreateUserSessionParams{
+	session, err := repos.Sessions.Create(ctx, repository.CreateUserSessionParams{
 		UserID:           user.ID,
 		RefreshTokenHash: hashRefreshToken(refreshToken),
 		DeviceID:         deviceID,
@@ -529,6 +584,25 @@ func (s *Service) generateAvailablePublicID(ctx context.Context) (string, error)
 	}
 
 	return "", ErrConflict
+}
+
+func (s *Service) pickDefaultAvatarFileID(ctx context.Context) (*string, error) {
+	if s.repos.Files == nil {
+		return nil, nil
+	}
+	fileIDs, err := s.repos.Files.ListDefaultAvatarFileIDs(ctx, 100)
+	if err != nil {
+		return nil, err
+	}
+	if len(fileIDs) == 0 {
+		return nil, nil
+	}
+	index, err := rand.Int(rand.Reader, big.NewInt(int64(len(fileIDs))))
+	if err != nil {
+		return nil, err
+	}
+	selected := fileIDs[index.Int64()]
+	return &selected, nil
 }
 
 func randomPublicID() (string, error) {

@@ -165,8 +165,48 @@ func (r *UserSessionRepository) RevokeForUser(ctx context.Context, sessionID str
 	return r.revokeWhere(ctx, `id = $1::uuid AND user_id = $2::uuid`, normalizeText(sessionID), normalizeText(userID))
 }
 
+func (r *UserSessionRepository) RevokeForUserReturning(ctx context.Context, sessionID string, userID string) (UserSession, error) {
+	row := r.db.QueryRow(ctx, `
+		UPDATE user_sessions
+		SET revoked_at = now()
+		WHERE id = $1::uuid
+		  AND user_id = $2::uuid
+		  AND revoked_at IS NULL
+		RETURNING `+userSessionSelectColumns,
+		normalizeText(sessionID),
+		normalizeText(userID),
+	)
+
+	session, err := scanUserSession(row)
+	return session, translateWriteError(err)
+}
+
 func (r *UserSessionRepository) RevokeByRefreshTokenHash(ctx context.Context, refreshTokenHash string) error {
 	return r.revokeWhere(ctx, `refresh_token_hash = $1`, refreshTokenHash)
+}
+
+func (r *UserSessionRepository) RevokeActiveByUserID(ctx context.Context, userID string) ([]UserSession, error) {
+	rows, err := r.db.Query(ctx, `
+		UPDATE user_sessions
+		SET revoked_at = now()
+		WHERE user_id = $1::uuid
+		  AND revoked_at IS NULL
+		  AND expires_at > now()
+		RETURNING `+userSessionSelectColumns,
+		normalizeText(userID),
+	)
+	if err != nil {
+		return nil, translateWriteError(err)
+	}
+	defer rows.Close()
+
+	sessions, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (UserSession, error) {
+		return scanUserSession(row)
+	})
+	if err != nil {
+		return nil, translateWriteError(err)
+	}
+	return sessions, nil
 }
 
 func (r *UserSessionRepository) RevokeByUserID(ctx context.Context, userID string) (int64, error) {

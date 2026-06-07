@@ -2,12 +2,15 @@ package server
 
 import (
 	"errors"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	filesvc "nlserver/internal/files"
 	"nlserver/internal/repository"
+	"nlserver/internal/storage"
 )
 
 type createUploadSessionRequest struct {
@@ -458,11 +461,111 @@ func (s *Server) handleUploadMeAvatar(w http.ResponseWriter, r *http.Request) {
 		writeRepositoryError(w, r, err)
 		return
 	}
-	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, makeAvatarUpdatedPayload("avatar.updated", profileEventIdentity{
-		UserUUID: user.ID,
-		UserID:   user.PublicID,
-	}, response))
+	s.publishProfileRealtimeEvent(r.Context(), principal.UserID, makeAvatarUpdatedPayload("avatar.updated", makePublicUserResponse(user), response))
 	writeJSONWithETag(w, r, http.StatusCreated, resourceETag("user", principal.UserID, result.AvatarVersion), response)
+}
+
+func (s *Server) handleGetPublicAvatarFile(w http.ResponseWriter, r *http.Request) {
+	if s.repos.Files == nil || s.storage == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_NOT_READY", "File service is not configured")
+		return
+	}
+
+	fileID := r.PathValue("fileId")
+	if err := validateUUID(fileID, "fileId"); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+
+	file, err := s.repos.Files.Get(r.Context(), fileID)
+	if err != nil {
+		writeRepositoryError(w, r, err)
+		return
+	}
+	isAvatar, err := s.repos.Files.IsAvatarFile(r.Context(), file.ID)
+	if err != nil {
+		writeRepositoryError(w, r, err)
+		return
+	}
+	if !isAvatar {
+		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Forbidden")
+		return
+	}
+
+	target := avatarFileTarget{
+		bucket:       file.Bucket,
+		objectKey:    file.ObjectKey,
+		mimeType:     file.MimeType,
+		sizeBytes:    file.SizeBytes,
+		etag:         file.ETag,
+		lastModified: file.UpdatedAt,
+		cacheID:      file.ID,
+	}
+	if variant := normalizeAvatarVariant(r.URL.Query().Get("variant")); variant != "" && variant != "original" {
+		variants, err := s.repos.Files.ListVariants(r.Context(), file.ID)
+		if err != nil {
+			writeRepositoryError(w, r, err)
+			return
+		}
+		found := false
+		for _, candidate := range variants {
+			if candidate.VariantType != variant {
+				continue
+			}
+			target = avatarFileTarget{
+				bucket:       candidate.Bucket,
+				objectKey:    candidate.ObjectKey,
+				mimeType:     candidate.MimeType,
+				sizeBytes:    candidate.SizeBytes,
+				etag:         candidate.ETag,
+				lastModified: candidate.UpdatedAt,
+				cacheID:      candidate.ID,
+			}
+			found = true
+			break
+		}
+		if !found && variant != "thumbnail_512" {
+			writeError(w, r, http.StatusNotFound, "NOT_FOUND", "Resource not found")
+			return
+		}
+	}
+
+	etag := avatarFileETag(target, file.Version)
+	setAvatarFileHeaders(w, target, etag)
+	if ifNoneMatch(r, etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	object, err := s.storage.GetObject(r.Context(), storage.GetObjectInput{
+		Bucket:    target.bucket,
+		ObjectKey: target.objectKey,
+	})
+	if err != nil {
+		clearAvatarFileHeaders(w)
+		writeFileError(w, r, err)
+		return
+	}
+	defer object.Body.Close()
+
+	if target.mimeType == "" {
+		target.mimeType = object.Info.ContentType
+	}
+	if target.sizeBytes <= 0 {
+		target.sizeBytes = object.Info.SizeBytes
+	}
+	if target.etag == nil && strings.TrimSpace(object.Info.ETag) != "" {
+		target.etag = &object.Info.ETag
+		etag = avatarFileETag(target, file.Version)
+	}
+	if target.lastModified.IsZero() {
+		target.lastModified = object.Info.LastModified
+	}
+	setAvatarFileHeaders(w, target, etag)
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.Copy(w, object.Body); err != nil && s.logger != nil {
+		s.logger.Warn("failed to stream avatar file", "file_id", file.ID, "error", err)
+	}
 }
 
 func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
@@ -586,6 +689,73 @@ func makeFileResponse(result filesvc.FileResult) fileResponse {
 		UpdatedAt:        result.UpdatedAt,
 		Variants:         variants,
 	}
+}
+
+type avatarFileTarget struct {
+	bucket       string
+	objectKey    string
+	mimeType     string
+	sizeBytes    int64
+	etag         *string
+	lastModified time.Time
+	cacheID      string
+}
+
+func normalizeAvatarVariant(value string) string {
+	switch strings.TrimSpace(value) {
+	case "", "original":
+		return strings.TrimSpace(value)
+	case "thumb":
+		return "thumbnail_512"
+	default:
+		return strings.TrimSpace(value)
+	}
+}
+
+func avatarFileETag(target avatarFileTarget, version int) string {
+	if target.etag != nil && strings.TrimSpace(*target.etag) != "" {
+		return quoteHTTPETag(*target.etag)
+	}
+	return resourceETag("avatar-file", target.cacheID, version)
+}
+
+func quoteHTTPETag(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, `"`) && strings.HasSuffix(trimmed, `"`) {
+		return trimmed
+	}
+	return `"` + strings.Trim(trimmed, `"`) + `"`
+}
+
+func setAvatarFileHeaders(w http.ResponseWriter, target avatarFileTarget, etag string) {
+	header := w.Header()
+	contentType := strings.TrimSpace(target.mimeType)
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	header.Set("Content-Type", contentType)
+	header.Set("Cache-Control", "public, max-age=31536000, immutable")
+	if target.sizeBytes > 0 {
+		header.Set("Content-Length", strconv.FormatInt(target.sizeBytes, 10))
+	}
+	if etag != "" {
+		header.Set("ETag", etag)
+	}
+	if !target.lastModified.IsZero() {
+		header.Set("Last-Modified", target.lastModified.UTC().Format(http.TimeFormat))
+	}
+}
+
+func clearAvatarFileHeaders(w http.ResponseWriter) {
+	header := w.Header()
+	header.Del("Content-Type")
+	header.Del("Content-Length")
+	header.Del("Cache-Control")
+	header.Del("ETag")
+	header.Del("Last-Modified")
 }
 
 func writeFileError(w http.ResponseWriter, r *http.Request, err error) {

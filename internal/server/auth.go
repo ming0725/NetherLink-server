@@ -42,12 +42,14 @@ func (s *Server) withAuthRequired(next http.Handler) http.Handler {
 			return
 		}
 
-		ctx := context.WithValue(r.Context(), authPrincipalContextKey{}, AuthPrincipal{
+		authPrincipal := AuthPrincipal{
 			AccessToken: token,
 			UserID:      principal.UserID,
 			SessionID:   principal.SessionID,
 			DeviceID:    principal.DeviceID,
-		})
+		}
+		ctx := context.WithValue(r.Context(), authPrincipalContextKey{}, authPrincipal)
+		setAccessLogPrincipal(ctx, authPrincipal)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

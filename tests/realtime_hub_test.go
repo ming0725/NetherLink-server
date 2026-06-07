@@ -154,6 +154,34 @@ func TestRealtimeHubPresenceState(t *testing.T) {
 	}
 }
 
+func TestRealtimeHubDisconnectSessionSendsRevokedEvent(t *testing.T) {
+	hub := realtime.NewHub()
+	oldConn, _, _ := hub.Connect("user_a", "session_old", "device_old", 0)
+	newConn, _, _ := hub.Connect("user_a", "session_new", "device_new", 0)
+	defer hub.Disconnect(oldConn)
+	defer hub.Disconnect(newConn)
+
+	disconnected := hub.DisconnectSession("user_a", "session_old", "auth.session.revoked", map[string]string{
+		"reason": "replaced_by_new_login",
+	})
+
+	if disconnected != 1 {
+		t.Fatalf("disconnected = %d, want 1", disconnected)
+	}
+	event := receiveHubEvent(t, oldConn)
+	if event.Type != "auth.session.revoked" || event.EventSeq != 0 {
+		t.Fatalf("event = %+v, want auth.session.revoked control event", event)
+	}
+	if !hub.HasUserConnections("user_a") {
+		t.Fatal("user_a has no connections, want new session to remain connected")
+	}
+	select {
+	case unexpected := <-newConn.Events():
+		t.Fatalf("new session received revoked event: %+v", unexpected)
+	default:
+	}
+}
+
 func TestRedisFanoutSnapshotReportsConfiguredChannel(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 	defer client.Close()

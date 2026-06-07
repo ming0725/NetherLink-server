@@ -22,12 +22,23 @@ func (e *requestError) Error() string {
 }
 
 func decodeJSONBody(r *http.Request, dst any) *requestError {
+	return decodeJSONBodyWithRequired(r, dst, true)
+}
+
+func decodeOptionalJSONBody(r *http.Request, dst any) *requestError {
+	return decodeJSONBodyWithRequired(r, dst, false)
+}
+
+func decodeJSONBodyWithRequired(r *http.Request, dst any, required bool) *requestError {
 	r.Body = http.MaxBytesReader(nil, r.Body, maxJSONBodyBytes)
 
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 
 	if err := decoder.Decode(dst); err != nil {
+		if !required && errors.Is(err, io.EOF) {
+			return nil
+		}
 		return jsonDecodeError(err)
 	}
 

@@ -32,6 +32,13 @@ type websocketReadyPayload struct {
 	ConnectedAt  time.Time `json:"connectedAt"`
 }
 
+type websocketAuthSessionRevokedPayload struct {
+	SessionID string    `json:"sessionId"`
+	DeviceID  string    `json:"deviceId"`
+	Reason    string    `json:"reason"`
+	RevokedAt time.Time `json:"revokedAt"`
+}
+
 type websocketSyncRequiredPayload struct {
 	Reason       string `json:"reason"`
 	LastEventSeq uint64 `json:"lastEventSeq"`
@@ -86,8 +93,9 @@ type websocketPresenceUpdatedPayload struct {
 }
 
 type websocketMessageSentPayload struct {
-	ClientMessageID string          `json:"clientMessageId"`
-	Message         messageResponse `json:"message"`
+	ClientMessageID string                       `json:"clientMessageId"`
+	Message         messageResponse              `json:"message"`
+	Refs            *referencedResourcesResponse `json:"refs,omitempty"`
 }
 
 type websocketAIMessagePayload struct {
@@ -118,10 +126,16 @@ type websocketAIStreamDonePayload struct {
 	AssistantMessage aiMessageResponse        `json:"assistantMessage"`
 	UsedFiles        []aiUploadedFileResponse `json:"usedFiles"`
 	FinishReason     string                   `json:"finishReason,omitempty"`
+	Title            *string                  `json:"title,omitempty"`
 }
 
 type websocketAIStreamCancelledPayload struct {
-	StreamID string `json:"streamId"`
+	StreamID         string                   `json:"streamId"`
+	UserMessage      *aiMessageResponse       `json:"userMessage,omitempty"`
+	AssistantMessage *aiMessageResponse       `json:"assistantMessage,omitempty"`
+	UsedFiles        []aiUploadedFileResponse `json:"usedFiles,omitempty"`
+	FinishReason     string                   `json:"finishReason,omitempty"`
+	Title            *string                  `json:"title,omitempty"`
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -150,15 +164,30 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	authPrincipal := AuthPrincipal{
+		AccessToken: token,
+		UserID:      principal.UserID,
+		SessionID:   principal.SessionID,
+		DeviceID:    principal.DeviceID,
+	}
+	setAccessLogPrincipal(r.Context(), authPrincipal)
+
 	lastEventSeq := parseLastEventSeq(r)
-	websocket.Handler(func(conn *websocket.Conn) {
-		s.serveWebSocket(r.Context(), conn, AuthPrincipal{
-			AccessToken: token,
-			UserID:      principal.UserID,
-			SessionID:   principal.SessionID,
-			DeviceID:    principal.DeviceID,
-		}, lastEventSeq)
-	}).ServeHTTP(w, r)
+	websocket.Server{
+		Handshake: acceptWebSocketOrigin,
+		Handler: func(conn *websocket.Conn) {
+			s.serveWebSocket(r.Context(), conn, authPrincipal, lastEventSeq)
+		},
+	}.ServeHTTP(w, r)
+}
+
+func acceptWebSocketOrigin(config *websocket.Config, req *http.Request) error {
+	origin, err := websocket.Origin(config, req)
+	if err != nil {
+		return err
+	}
+	config.Origin = origin
+	return nil
 }
 
 func (s *Server) serveWebSocket(ctx context.Context, conn *websocket.Conn, principal AuthPrincipal, lastEventSeq uint64) {
@@ -172,8 +201,11 @@ func (s *Server) serveWebSocket(ctx context.Context, conn *websocket.Conn, princ
 		if s.aiStreams != nil {
 			s.aiStreams.CancelConnection(connection.ID())
 		}
-		s.realtimeHub.Disconnect(connection)
+		if s.realtimeHub.Disconnect(connection) {
+			s.handleWebSocketPresenceDisconnect(ctx, principal.UserID)
+		}
 	}()
+	s.handleWebSocketPresenceConnect(ctx, principal.UserID)
 
 	if durableReplay, durableSyncRequired, ok := s.loadDurableReplay(ctx, principal.UserID, lastEventSeq); ok {
 		replay = durableReplay
@@ -207,7 +239,12 @@ func (s *Server) serveWebSocket(ctx context.Context, conn *websocket.Conn, princ
 				if err := websocket.JSON.Send(conn, event); err != nil {
 					return
 				}
+				if event.Type == "auth.session.revoked" && websocketAuthSessionRevokedMatches(event, connection.SessionID()) {
+					_ = conn.Close()
+					return
+				}
 			case <-connection.Done():
+				_ = conn.Close()
 				return
 			}
 		}
@@ -371,6 +408,7 @@ func (s *Server) handleWebSocketSendMessage(ctx context.Context, conn *realtime.
 	s.realtimeHub.Send(conn, "chat.message.sent", websocketMessageSentPayload{
 		ClientMessageID: req.ClientMessageID,
 		Message:         response,
+		Refs:            s.makeRealtimeMessageRefs(ctx, req.ConversationID, response),
 	})
 }
 
@@ -466,17 +504,69 @@ func (s *Server) handleWebSocketPresenceUpdate(ctx context.Context, conn *realti
 	}
 
 	now := time.Now().UTC()
-	if s.repos.Users != nil {
+	if s.repos.Users != nil && status != "invisible" {
 		if err := s.repos.Users.TouchLastSeen(ctx, principal.UserID, now); err != nil {
 			s.logger.WarnContext(ctx, "failed to touch user last seen for presence update", "error", err, "user_id", principal.UserID)
 		}
 	}
 	state := s.realtimeHub.SetPresence(principal.UserID, status, now)
-	s.publishPresenceRealtimeEvent(ctx, principal.UserID, websocketPresenceUpdatedPayload{
-		UserUUID:   principal.UserID,
-		Status:     state.Status,
-		LastSeenAt: state.LastSeenAt,
-	})
+	s.publishPresenceRealtimeEvent(ctx, principal.UserID, state.Status, state.LastSeenAt)
+}
+
+func (s *Server) handleWebSocketPresenceConnect(ctx context.Context, userID string) {
+	if s.realtimeHub == nil {
+		return
+	}
+	current, ok := s.realtimeHub.Presence(userID)
+	if ok && current.Status != "offline" {
+		return
+	}
+
+	now := time.Now().UTC()
+	if s.repos.Users != nil {
+		if err := s.repos.Users.TouchLastSeen(ctx, userID, now); err != nil {
+			s.logger.WarnContext(ctx, "failed to touch user last seen for websocket connect", "error", err, "user_id", userID)
+		}
+	}
+	state := s.realtimeHub.SetPresence(userID, "online", now)
+	s.publishPresenceRealtimeEvent(ctx, userID, state.Status, state.LastSeenAt)
+}
+
+func (s *Server) handleWebSocketPresenceDisconnect(ctx context.Context, userID string) {
+	if s.realtimeHub == nil {
+		return
+	}
+	current, ok := s.realtimeHub.Presence(userID)
+	if !ok || current.Status == "offline" || current.Status == "invisible" {
+		return
+	}
+
+	now := time.Now().UTC()
+	if s.repos.Users != nil {
+		if err := s.repos.Users.TouchLastSeen(ctx, userID, now); err != nil {
+			s.logger.WarnContext(ctx, "failed to touch user last seen for websocket disconnect", "error", err, "user_id", userID)
+		}
+	}
+	state := s.realtimeHub.SetPresence(userID, "offline", now)
+	s.publishPresenceRealtimeEvent(ctx, userID, state.Status, state.LastSeenAt)
+}
+
+func makePresenceUpdatedPayload(userID string, status string, lastSeenAt time.Time) websocketPresenceUpdatedPayload {
+	return websocketPresenceUpdatedPayload{
+		UserUUID:   userID,
+		Status:     status,
+		LastSeenAt: lastSeenAt,
+	}
+}
+
+func externallyVisiblePresenceStatus(status string) string {
+	if status == "invisible" {
+		return "offline"
+	}
+	if status == "" {
+		return "offline"
+	}
+	return status
 }
 
 func (s *Server) sendWebSocketError(conn *realtime.Connection, requestType string, code string, message string) {
@@ -485,6 +575,14 @@ func (s *Server) sendWebSocketError(conn *realtime.Connection, requestType strin
 		Code:        code,
 		Message:     message,
 	})
+}
+
+func websocketAuthSessionRevokedMatches(event realtime.Event, sessionID string) bool {
+	var payload websocketAuthSessionRevokedPayload
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return true
+	}
+	return payload.SessionID == "" || payload.SessionID == sessionID
 }
 
 func (s *Server) handleWebSocketAIMessageSend(ctx context.Context, conn *realtime.Connection, principal AuthPrincipal, payload json.RawMessage) {
@@ -547,7 +645,7 @@ func (s *Server) handleWebSocketAIMessageSend(ctx context.Context, conn *realtim
 
 func (s *Server) replayWebSocketAIStreamReceipt(conn *realtime.Connection, req websocketAIMessagePayload, receipt repository.OperationReceipt) {
 	streamID := newAIStreamID()
-	done, code, message := aiStreamDoneFromReceipt(receipt, streamID)
+	finalEvent, done, cancelled, code, message := aiStreamFinalFromReceipt(receipt, streamID)
 	if code != "" {
 		s.sendWebSocketError(conn, "ai.message.send", code, message)
 		return
@@ -557,13 +655,33 @@ func (s *Server) replayWebSocketAIStreamReceipt(conn *realtime.Connection, req w
 		ConversationID:  req.ConversationID,
 		ClientMessageID: req.ClientMessageID,
 	})
-	s.realtimeHub.Send(conn, "ai.stream.done", websocketAIStreamDonePayload{
+	if finalEvent == "ai.stream.cancelled" {
+		s.realtimeHub.Send(conn, "ai.stream.cancelled", makeWebSocketAIStreamCancelledPayload(cancelled))
+		return
+	}
+	s.realtimeHub.Send(conn, "ai.stream.done", makeWebSocketAIStreamDonePayload(done))
+}
+
+func makeWebSocketAIStreamDonePayload(done aiStreamDoneResponse) websocketAIStreamDonePayload {
+	return websocketAIStreamDonePayload{
 		StreamID:         done.StreamID,
 		UserMessage:      done.UserMessage,
 		AssistantMessage: done.AssistantMessage,
 		UsedFiles:        done.UsedFiles,
 		FinishReason:     done.FinishReason,
-	})
+		Title:            done.Title,
+	}
+}
+
+func makeWebSocketAIStreamCancelledPayload(cancelled aiStreamCancelledResponse) websocketAIStreamCancelledPayload {
+	return websocketAIStreamCancelledPayload{
+		StreamID:         cancelled.StreamID,
+		UserMessage:      cancelled.UserMessage,
+		AssistantMessage: cancelled.AssistantMessage,
+		UsedFiles:        cancelled.UsedFiles,
+		FinishReason:     cancelled.FinishReason,
+		Title:            cancelled.Title,
+	}
 }
 
 func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connection, principal AuthPrincipal, streamID string, req websocketAIMessagePayload, receiptClaim aiStreamReceiptClaim) {
@@ -594,11 +712,17 @@ func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connec
 		},
 	})
 	if err != nil {
-		s.deleteAIStreamReceipt(principal.UserID, receiptClaim)
 		if errors.Is(err, context.Canceled) {
-			s.realtimeHub.Send(conn, "ai.stream.cancelled", websocketAIStreamCancelledPayload{StreamID: streamID})
+			cancelled := makeAIStreamCancelledResponse(streamID, result)
+			completeCtx, completeCancel := context.WithTimeout(context.Background(), aiStreamReceiptCleanupTimeout)
+			if err := s.completeAIStreamCancelledReceipt(completeCtx, principal.UserID, receiptClaim, cancelled); err != nil {
+				s.logger.WarnContext(completeCtx, "failed to complete cancelled AI websocket stream receipt", "error", err, "operation_type", receiptClaim.OperationType)
+			}
+			completeCancel()
+			s.realtimeHub.Send(conn, "ai.stream.cancelled", makeWebSocketAIStreamCancelledPayload(cancelled))
 			return
 		}
+		s.deleteAIStreamReceipt(principal.UserID, receiptClaim)
 		code, message := aiErrorCodeAndMessage(err)
 		s.sendWebSocketError(conn, "ai.message.send", code, message)
 		return
@@ -609,19 +733,14 @@ func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connec
 		AssistantMessage: makeAIMessageResponse(result.AssistantMessage),
 		UsedFiles:        makeAIUploadedFileResponses(result.UsedFiles),
 		FinishReason:     result.FinishReason,
+		Title:            result.Title,
 	}
 	completeCtx, completeCancel := context.WithTimeout(context.Background(), aiStreamReceiptCleanupTimeout)
 	if err := s.completeAIStreamReceipt(completeCtx, principal.UserID, receiptClaim, done); err != nil {
 		s.logger.WarnContext(completeCtx, "failed to complete AI websocket stream receipt", "error", err, "operation_type", receiptClaim.OperationType)
 	}
 	completeCancel()
-	s.realtimeHub.Send(conn, "ai.stream.done", websocketAIStreamDonePayload{
-		StreamID:         done.StreamID,
-		UserMessage:      done.UserMessage,
-		AssistantMessage: done.AssistantMessage,
-		UsedFiles:        done.UsedFiles,
-		FinishReason:     done.FinishReason,
-	})
+	s.realtimeHub.Send(conn, "ai.stream.done", makeWebSocketAIStreamDonePayload(done))
 }
 
 func (s *Server) handleWebSocketAIStreamCancel(conn *realtime.Connection, principal AuthPrincipal, payload json.RawMessage) {
@@ -692,8 +811,12 @@ func parseEventSeq(value string) uint64 {
 
 func normalizePresenceStatus(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "online", "away", "busy", "dnd", "invisible", "offline":
+	case "online", "mining", "airplane", "invisible", "offline":
 		return strings.ToLower(strings.TrimSpace(value))
+	case "busy", "dnd":
+		return "mining"
+	case "away":
+		return "airplane"
 	default:
 		return ""
 	}

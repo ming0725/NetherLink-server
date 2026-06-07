@@ -33,6 +33,7 @@ type Connection struct {
 	createdAt time.Time
 	send      chan Event
 	done      chan struct{}
+	doneOnce  sync.Once
 }
 
 type Hub struct {
@@ -122,11 +123,12 @@ func (h *Hub) ReplayForUser(userID string, lastEventSeq uint64) ([]Event, bool) 
 	return replay, syncRequired
 }
 
-func (h *Hub) Disconnect(conn *Connection) {
+func (h *Hub) Disconnect(conn *Connection) bool {
 	if h == nil || conn == nil {
-		return
+		return false
 	}
 
+	lastUserConnection := false
 	h.mu.Lock()
 	if _, ok := h.connections[conn.id]; ok {
 		delete(h.connections, conn.id)
@@ -134,11 +136,53 @@ func (h *Hub) Disconnect(conn *Connection) {
 			delete(userConns, conn.id)
 			if len(userConns) == 0 {
 				delete(h.userConnections, conn.userID)
+				lastUserConnection = true
 			}
 		}
-		close(conn.done)
 	}
 	h.mu.Unlock()
+	conn.close()
+	return lastUserConnection
+}
+
+func (h *Hub) DisconnectSession(userID string, sessionID string, eventType string, payload any) int {
+	if h == nil || userID == "" || sessionID == "" {
+		return 0
+	}
+
+	event := h.newControlEvent(eventType, payload)
+	var targets []*Connection
+
+	h.mu.Lock()
+	if userConns := h.userConnections[userID]; userConns != nil {
+		for connID, conn := range userConns {
+			if conn.sessionID != sessionID {
+				continue
+			}
+			targets = append(targets, conn)
+			delete(userConns, connID)
+			delete(h.connections, connID)
+		}
+		if len(userConns) == 0 {
+			delete(h.userConnections, userID)
+		}
+	}
+	h.mu.Unlock()
+
+	for _, conn := range targets {
+		conn.deliverRequired(event)
+	}
+	return len(targets)
+}
+
+func (h *Hub) HasUserConnections(userID string) bool {
+	if h == nil || userID == "" {
+		return false
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.userConnections[userID]) > 0
 }
 
 func (h *Hub) SetPresence(userID string, status string, lastSeenAt time.Time) PresenceState {
@@ -344,6 +388,30 @@ func (c *Connection) deliver(event Event) {
 	case <-c.done:
 	default:
 	}
+}
+
+func (c *Connection) deliverRequired(event Event) bool {
+	if c == nil {
+		return false
+	}
+	select {
+	case c.send <- event:
+		return true
+	case <-c.done:
+		return false
+	case <-time.After(100 * time.Millisecond):
+		c.close()
+		return false
+	}
+}
+
+func (c *Connection) close() {
+	if c == nil {
+		return
+	}
+	c.doneOnce.Do(func() {
+		close(c.done)
+	})
 }
 
 func (h *Hub) newEvent(eventType string, payload any) Event {

@@ -43,6 +43,12 @@ func withJSONFallbacks(next http.Handler) http.Handler {
 
 		switch buffer.status {
 		case http.StatusNotFound:
+			if isJSONResponse(buffer.header) {
+				copyHeader(w.Header(), buffer.header)
+				w.WriteHeader(buffer.status)
+				_, _ = buffer.body.WriteTo(w)
+				return
+			}
 			writeError(w, r, http.StatusNotFound, "NOT_FOUND", "Route not found")
 			return
 		case http.StatusMethodNotAllowed:
@@ -57,6 +63,16 @@ func withJSONFallbacks(next http.Handler) http.Handler {
 		w.WriteHeader(buffer.status)
 		_, _ = buffer.body.WriteTo(w)
 	})
+}
+
+func isJSONResponse(header http.Header) bool {
+	for _, part := range strings.Split(header.Get("Content-Type"), ",") {
+		mediaType := strings.TrimSpace(strings.SplitN(part, ";", 2)[0])
+		if strings.EqualFold(mediaType, "application/json") {
+			return true
+		}
+	}
+	return false
 }
 
 func isEventStreamRequest(r *http.Request) bool {

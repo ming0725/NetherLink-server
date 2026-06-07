@@ -68,7 +68,7 @@ func NewRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*R
 		DB:            db,
 		Redis:         redisClient,
 		Repos:         repos,
-		AuthService:   authsvc.NewService(cfg.Auth, repos),
+		AuthService:   authsvc.NewServiceWithTx(cfg.Auth, repos, db),
 		ChatService:   chatsvc.NewService(repos, db),
 		FileService:   filesvc.NewService(cfg.Storage, repos, db, nil),
 		FriendService: friendsvc.NewService(repos, db),

@@ -23,15 +23,16 @@ type FriendGroup struct {
 }
 
 type Friend struct {
-	ID            string
-	User          User
-	Remark        *string
-	FriendGroupID *string
-	IsDND         bool
-	Status        string
-	Version       int
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID              string
+	User            User
+	Remark          *string
+	FriendGroupID   *string
+	FriendGroupName *string
+	IsDND           bool
+	Status          string
+	Version         int
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 type FriendRequest struct {
@@ -161,6 +162,7 @@ func (r *FriendRepository) ListFriends(ctx context.Context, userID string, keywo
 			f.id,
 			f.remark,
 			f.friend_group_id,
+			fg.name,
 			f.is_dnd,
 			f.status,
 			f.version,
@@ -186,6 +188,7 @@ func (r *FriendRepository) ListFriends(ctx context.Context, userID string, keywo
 			(count(*) OVER())::int AS total_count
 		FROM friendships f
 		JOIN users u ON u.id = f.friend_user_id
+		LEFT JOIN friend_groups fg ON fg.id = f.friend_group_id AND fg.deleted_at IS NULL
 		WHERE f.user_id = $1::uuid
 		  AND f.status = 'active'
 		  AND f.deleted_at IS NULL
@@ -261,6 +264,7 @@ func (r *FriendRepository) GetRelation(ctx context.Context, userID string, frien
 			f.id,
 			f.remark,
 			f.friend_group_id,
+			fg.name,
 			f.is_dnd,
 			f.status,
 			f.version,
@@ -285,6 +289,7 @@ func (r *FriendRepository) GetRelation(ctx context.Context, userID string, frien
 			u.deleted_at
 		FROM friendships f
 		JOIN users u ON u.id = f.friend_user_id
+		LEFT JOIN friend_groups fg ON fg.id = f.friend_group_id AND fg.deleted_at IS NULL
 		WHERE f.user_id = $1::uuid
 		  AND f.friend_user_id = $2::uuid
 		  AND f.status = 'active'
@@ -315,6 +320,7 @@ func (r *FriendRepository) UpdateFriend(ctx context.Context, params UpdateFriend
 			f.id,
 			f.remark,
 			f.friend_group_id,
+			fg.name,
 			f.is_dnd,
 			f.status,
 			f.version,
@@ -338,7 +344,8 @@ func (r *FriendRepository) UpdateFriend(ctx context.Context, params UpdateFriend
 			u.updated_at,
 			u.deleted_at
 		FROM updated f
-		JOIN users u ON u.id = f.friend_user_id`,
+		JOIN users u ON u.id = f.friend_user_id
+		LEFT JOIN friend_groups fg ON fg.id = f.friend_group_id AND fg.deleted_at IS NULL`,
 		normalizeText(params.UserID),
 		normalizeText(params.FriendUserID),
 		params.RemarkSet,
@@ -517,6 +524,7 @@ func (r *FriendRepository) UpsertFriendship(ctx context.Context, params UpsertFr
 			f.id,
 			f.remark,
 			f.friend_group_id,
+			fg.name,
 			f.is_dnd,
 			f.status,
 			f.version,
@@ -540,7 +548,8 @@ func (r *FriendRepository) UpsertFriendship(ctx context.Context, params UpsertFr
 			u.updated_at,
 			u.deleted_at
 		FROM upserted f
-		JOIN users u ON u.id = f.friend_user_id`,
+		JOIN users u ON u.id = f.friend_user_id
+		LEFT JOIN friend_groups fg ON fg.id = f.friend_group_id AND fg.deleted_at IS NULL`,
 		normalizeText(params.UserID),
 		normalizeText(params.FriendUserID),
 		normalizeTextPtr(params.Remark),
@@ -860,24 +869,26 @@ func scanFriendRequestRow(row scanner, withCounts bool) (FriendRequest, int, int
 
 func scanFriend(row scanner, withTotal bool) (Friend, int, error) {
 	var (
-		friend       Friend
-		friendID     pgtype.UUID
-		remark       sql.NullString
-		friendGroup  pgtype.UUID
-		userID       pgtype.UUID
-		genderCustom sql.NullString
-		avatarFileID pgtype.UUID
-		signature    sql.NullString
-		region       sql.NullString
-		lastSeenAt   sql.NullTime
-		deletedAt    sql.NullTime
-		total        int
+		friend          Friend
+		friendID        pgtype.UUID
+		remark          sql.NullString
+		friendGroup     pgtype.UUID
+		friendGroupName sql.NullString
+		userID          pgtype.UUID
+		genderCustom    sql.NullString
+		avatarFileID    pgtype.UUID
+		signature       sql.NullString
+		region          sql.NullString
+		lastSeenAt      sql.NullTime
+		deletedAt       sql.NullTime
+		total           int
 	)
 
 	dest := []any{
 		&friendID,
 		&remark,
 		&friendGroup,
+		&friendGroupName,
 		&friend.IsDND,
 		&friend.Status,
 		&friend.Version,
@@ -914,6 +925,9 @@ func scanFriend(row scanner, withTotal bool) (Friend, int, error) {
 		friend.Remark = &remark.String
 	}
 	friend.FriendGroupID = uuidStringPtr(friendGroup)
+	if friendGroupName.Valid {
+		friend.FriendGroupName = &friendGroupName.String
+	}
 	friend.User.ID = uuidString(userID)
 	if genderCustom.Valid {
 		friend.User.GenderCustom = &genderCustom.String

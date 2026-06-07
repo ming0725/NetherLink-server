@@ -20,6 +20,12 @@ type aiStreamReceiptClaim struct {
 	Receipt       repository.OperationReceipt
 }
 
+type aiStreamReceiptBody struct {
+	Event     string                     `json:"event"`
+	Done      *aiStreamDoneResponse      `json:"done,omitempty"`
+	Cancelled *aiStreamCancelledResponse `json:"cancelled,omitempty"`
+}
+
 func aiStreamOperationType(conversationID string) string {
 	return "ai.message.stream:" + conversationID
 }
@@ -53,10 +59,24 @@ func (s *Server) claimAIStreamReceipt(ctx context.Context, userID string, operat
 }
 
 func (s *Server) completeAIStreamReceipt(ctx context.Context, userID string, claim aiStreamReceiptClaim, done aiStreamDoneResponse) error {
+	return s.completeAIStreamFinalReceipt(ctx, userID, claim, aiStreamReceiptBody{
+		Event: "ai.stream.done",
+		Done:  &done,
+	})
+}
+
+func (s *Server) completeAIStreamCancelledReceipt(ctx context.Context, userID string, claim aiStreamReceiptClaim, cancelled aiStreamCancelledResponse) error {
+	return s.completeAIStreamFinalReceipt(ctx, userID, claim, aiStreamReceiptBody{
+		Event:     "ai.stream.cancelled",
+		Cancelled: &cancelled,
+	})
+}
+
+func (s *Server) completeAIStreamFinalReceipt(ctx context.Context, userID string, claim aiStreamReceiptClaim, final aiStreamReceiptBody) error {
 	if claim.Key == "" || !claim.Claimed || s.repos.OperationReceipts == nil {
 		return nil
 	}
-	body, err := json.Marshal(done)
+	body, err := json.Marshal(final)
 	if err != nil {
 		return err
 	}
@@ -82,26 +102,46 @@ func (s *Server) deleteAIStreamReceipt(userID string, claim aiStreamReceiptClaim
 	}
 }
 
-func aiStreamDoneFromReceipt(receipt repository.OperationReceipt, streamID string) (aiStreamDoneResponse, string, string) {
+func aiStreamFinalFromReceipt(receipt repository.OperationReceipt, streamID string) (string, aiStreamDoneResponse, aiStreamCancelledResponse, string, string) {
 	payload, err := unmarshalReceiptPayload(receipt.ServerResult)
 	if err != nil {
-		return aiStreamDoneResponse{}, "IDEMPOTENCY_KEY_REUSED", "Idempotency key was already used for a different operation result"
+		return "", aiStreamDoneResponse{}, aiStreamCancelledResponse{}, "IDEMPOTENCY_KEY_REUSED", "Idempotency key was already used for a different operation result"
 	}
 	switch payload.Status {
 	case idempotencyPendingStatus:
-		return aiStreamDoneResponse{}, "OPERATION_IN_PROGRESS", "Operation is still in progress"
+		return "", aiStreamDoneResponse{}, aiStreamCancelledResponse{}, "OPERATION_IN_PROGRESS", "Operation is still in progress"
 	case idempotencyCompletedStatus:
-		var done aiStreamDoneResponse
 		if len(payload.Body) == 0 {
-			return aiStreamDoneResponse{}, "IDEMPOTENCY_KEY_REUSED", "Idempotency key was already used for a different operation result"
+			return "", aiStreamDoneResponse{}, aiStreamCancelledResponse{}, "IDEMPOTENCY_KEY_REUSED", "Idempotency key was already used for a different operation result"
 		}
+		var final aiStreamReceiptBody
+		if err := json.Unmarshal(payload.Body, &final); err == nil && final.Event != "" {
+			switch final.Event {
+			case "ai.stream.done":
+				if final.Done == nil {
+					return "", aiStreamDoneResponse{}, aiStreamCancelledResponse{}, "IDEMPOTENCY_KEY_REUSED", "Idempotency key was already used for a different operation result"
+				}
+				final.Done.StreamID = streamID
+				return final.Event, *final.Done, aiStreamCancelledResponse{}, "", ""
+			case "ai.stream.cancelled":
+				if final.Cancelled == nil {
+					return "", aiStreamDoneResponse{}, aiStreamCancelledResponse{}, "IDEMPOTENCY_KEY_REUSED", "Idempotency key was already used for a different operation result"
+				}
+				final.Cancelled.StreamID = streamID
+				return final.Event, aiStreamDoneResponse{}, *final.Cancelled, "", ""
+			default:
+				return "", aiStreamDoneResponse{}, aiStreamCancelledResponse{}, "IDEMPOTENCY_KEY_REUSED", "Idempotency key was already used for a different operation result"
+			}
+		}
+
+		var done aiStreamDoneResponse
 		if err := json.Unmarshal(payload.Body, &done); err != nil {
-			return aiStreamDoneResponse{}, "IDEMPOTENCY_KEY_REUSED", "Idempotency key was already used for a different operation result"
+			return "", aiStreamDoneResponse{}, aiStreamCancelledResponse{}, "IDEMPOTENCY_KEY_REUSED", "Idempotency key was already used for a different operation result"
 		}
 		done.StreamID = streamID
-		return done, "", ""
+		return "ai.stream.done", done, aiStreamCancelledResponse{}, "", ""
 	default:
-		return aiStreamDoneResponse{}, "IDEMPOTENCY_KEY_REUSED", "Idempotency key was already used for a different operation result"
+		return "", aiStreamDoneResponse{}, aiStreamCancelledResponse{}, "IDEMPOTENCY_KEY_REUSED", "Idempotency key was already used for a different operation result"
 	}
 }
 

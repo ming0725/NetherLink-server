@@ -114,6 +114,7 @@ func TestProtectedRouteWithoutTokenReturnsTokenMissing(t *testing.T) {
 		{method: http.MethodDelete, path: "/api/v1/conversations/00000000-0000-0000-0000-000000000000/messages"},
 		{method: http.MethodGet, path: "/api/v1/ai/conversations"},
 		{method: http.MethodPost, path: "/api/v1/ai/conversations"},
+		{method: http.MethodPatch, path: "/api/v1/ai/conversations/00000000-0000-0000-0000-000000000000"},
 		{method: http.MethodGet, path: "/api/v1/ai/conversations/00000000-0000-0000-0000-000000000000/messages"},
 		{method: http.MethodPost, path: "/api/v1/ai/conversations/00000000-0000-0000-0000-000000000000/messages"},
 		{method: http.MethodPost, path: "/api/v1/ai/conversations/00000000-0000-0000-0000-000000000000/files"},
