@@ -55,6 +55,15 @@ type CreateFriendGroupParams struct {
 	SortOrder int
 }
 
+type UpdateFriendGroupParams struct {
+	UserID        string
+	FriendGroupID string
+	NameSet       bool
+	Name          *string
+	SortOrderSet  bool
+	SortOrder     int
+}
+
 type UpdateFriendParams struct {
 	UserID       string
 	FriendUserID string
@@ -138,6 +147,64 @@ func (r *FriendRepository) ListGroups(ctx context.Context, userID string, keywor
 	}
 
 	return groups, nil
+}
+
+func (r *FriendRepository) UpdateGroup(ctx context.Context, params UpdateFriendGroupParams) (FriendGroup, error) {
+	group, err := scanFriendGroup(r.db.QueryRow(ctx, `
+		UPDATE friend_groups
+		SET
+			name = CASE WHEN $3 THEN $4 ELSE name END,
+			sort_order = CASE WHEN $5 THEN $6 ELSE sort_order END
+		WHERE id = $2::uuid
+		  AND user_id = $1::uuid
+		  AND deleted_at IS NULL
+		RETURNING
+			id,
+			user_id,
+			name,
+			sort_order,
+			created_at,
+			updated_at`,
+		normalizeText(params.UserID),
+		normalizeText(params.FriendGroupID),
+		params.NameSet,
+		normalizeTextPtr(params.Name),
+		params.SortOrderSet,
+		params.SortOrder,
+	))
+	return group, translateWriteError(err)
+}
+
+func (r *FriendRepository) DeleteGroup(ctx context.Context, userID string, friendGroupID string) error {
+	var deletedID pgtype.UUID
+	err := r.db.QueryRow(ctx, `
+		WITH deleted AS (
+			UPDATE friend_groups
+			SET deleted_at = now()
+			WHERE id = $2::uuid
+			  AND user_id = $1::uuid
+			  AND deleted_at IS NULL
+			RETURNING id
+		),
+		cleared AS (
+			UPDATE friendships
+			SET
+				friend_group_id = NULL,
+				version = version + 1
+			WHERE user_id = $1::uuid
+			  AND friend_group_id IN (SELECT id FROM deleted)
+			  AND status = 'active'
+			  AND deleted_at IS NULL
+			RETURNING id
+		)
+		SELECT id FROM deleted`,
+		normalizeText(userID),
+		normalizeText(friendGroupID),
+	).Scan(&deletedID)
+	if err != nil {
+		return translateWriteError(err)
+	}
+	return nil
 }
 
 func (r *FriendRepository) GroupExists(ctx context.Context, userID string, groupID string) (bool, error) {

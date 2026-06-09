@@ -89,6 +89,8 @@ func TestProtectedRouteWithoutTokenReturnsTokenMissing(t *testing.T) {
 		{method: http.MethodDelete, path: "/api/v1/friends/00000000-0000-0000-0000-000000000000"},
 		{method: http.MethodGet, path: "/api/v1/friend-groups"},
 		{method: http.MethodPost, path: "/api/v1/friend-groups"},
+		{method: http.MethodPatch, path: "/api/v1/friend-groups/00000000-0000-0000-0000-000000000000"},
+		{method: http.MethodDelete, path: "/api/v1/friend-groups/00000000-0000-0000-0000-000000000000"},
 		{method: http.MethodPost, path: "/api/v1/friend-requests"},
 		{method: http.MethodGet, path: "/api/v1/friend-requests"},
 		{method: http.MethodPost, path: "/api/v1/friend-requests/00000000-0000-0000-0000-000000000000/accept"},

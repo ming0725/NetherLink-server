@@ -37,6 +37,13 @@ type CreateGroupInput struct {
 	SortOrder int
 }
 
+type UpdateGroupInput struct {
+	UserID        string
+	FriendGroupID string
+	Name          *string
+	SortOrder     *int
+}
+
 type UpdateFriendInput struct {
 	UserID       string
 	FriendUserID string
@@ -117,6 +124,49 @@ func (s *Service) CreateGroup(ctx context.Context, input CreateGroupInput) (repo
 	}
 
 	return group, nil
+}
+
+func (s *Service) UpdateGroup(ctx context.Context, input UpdateGroupInput) (repository.FriendGroup, error) {
+	if strings.TrimSpace(input.UserID) == "" || strings.TrimSpace(input.FriendGroupID) == "" {
+		return repository.FriendGroup{}, ErrValidation
+	}
+
+	params := repository.UpdateFriendGroupParams{
+		UserID:        input.UserID,
+		FriendGroupID: input.FriendGroupID,
+		NameSet:       input.Name != nil,
+		SortOrderSet:  input.SortOrder != nil,
+	}
+	if input.Name != nil {
+		name := strings.TrimSpace(*input.Name)
+		if name == "" || len([]rune(name)) > maxFriendGroupNameLength {
+			return repository.FriendGroup{}, ErrValidation
+		}
+		params.Name = &name
+	}
+	if input.SortOrder != nil {
+		if *input.SortOrder < 0 {
+			return repository.FriendGroup{}, ErrValidation
+		}
+		params.SortOrder = *input.SortOrder
+	}
+
+	group, err := s.repos.Friends.UpdateGroup(ctx, params)
+	if err != nil {
+		return repository.FriendGroup{}, mapRepositoryError(err)
+	}
+
+	return group, nil
+}
+
+func (s *Service) DeleteGroup(ctx context.Context, userID string, friendGroupID string) error {
+	if strings.TrimSpace(userID) == "" || strings.TrimSpace(friendGroupID) == "" {
+		return ErrValidation
+	}
+	if err := s.repos.Friends.DeleteGroup(ctx, userID, friendGroupID); err != nil {
+		return mapRepositoryError(err)
+	}
+	return nil
 }
 
 func (s *Service) UpdateFriend(ctx context.Context, input UpdateFriendInput) (repository.Friend, error) {

@@ -22,6 +22,7 @@ const groupJoinRequestSelectColumns = `
 	g.name,
 	g.owner_id,
 	g.avatar_file_id,
+	g.avatar_version,
 	g.introduction,
 	g.announcement,
 	g.version,
@@ -68,15 +69,16 @@ const groupJoinRequestSelectColumns = `
 	gjr.updated_at`
 
 type Group struct {
-	ID           string
-	Name         string
-	OwnerID      string
-	AvatarFileID *string
-	Introduction *string
-	Announcement *string
-	Version      int
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID            string
+	Name          string
+	OwnerID       string
+	AvatarFileID  *string
+	AvatarVersion int
+	Introduction  *string
+	Announcement  *string
+	Version       int
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 type GroupListEntry struct {
@@ -178,6 +180,7 @@ func (r *GroupRepository) Create(ctx context.Context, params CreateGroupParams) 
 			name,
 			owner_id,
 			avatar_file_id,
+			avatar_version,
 			introduction,
 			announcement,
 			version,
@@ -197,6 +200,7 @@ func (r *GroupRepository) Get(ctx context.Context, groupID string) (Group, error
 			name,
 			owner_id,
 			avatar_file_id,
+			avatar_version,
 			introduction,
 			announcement,
 			version,
@@ -218,7 +222,18 @@ func (r *GroupRepository) Update(ctx context.Context, params UpdateGroupParams) 
 			introduction = CASE WHEN $4 THEN $5 ELSE introduction END,
 			announcement = CASE WHEN $6 THEN $7 ELSE announcement END,
 			avatar_file_id = CASE WHEN $8 THEN $9::uuid ELSE avatar_file_id END,
-			version = version + 1
+			avatar_version = CASE
+				WHEN $8 AND avatar_file_id IS DISTINCT FROM $9::uuid THEN avatar_version + 1
+				ELSE avatar_version
+			END,
+			version = CASE
+				WHEN ($2 AND name IS DISTINCT FROM $3)
+				  OR ($4 AND introduction IS DISTINCT FROM $5)
+				  OR ($6 AND announcement IS DISTINCT FROM $7)
+				  OR ($8 AND avatar_file_id IS DISTINCT FROM $9::uuid)
+				THEN version + 1
+				ELSE version
+			END
 		WHERE id = $1::uuid
 		  AND deleted_at IS NULL
 		RETURNING
@@ -226,6 +241,7 @@ func (r *GroupRepository) Update(ctx context.Context, params UpdateGroupParams) 
 			name,
 			owner_id,
 			avatar_file_id,
+			avatar_version,
 			introduction,
 			announcement,
 			version,
@@ -412,6 +428,7 @@ func (r *GroupRepository) UpdateOwner(ctx context.Context, groupID string, owner
 			name,
 			owner_id,
 			avatar_file_id,
+			avatar_version,
 			introduction,
 			announcement,
 			version,
@@ -631,13 +648,14 @@ func (r *GroupRepository) AddEvent(ctx context.Context, groupID string, eventTyp
 	return translateWriteError(err)
 }
 
-func (r *GroupRepository) ListForUser(ctx context.Context, userID string, keyword string, categoryID string, limit int, offset int) ([]GroupListEntry, int, error) {
+func (r *GroupRepository) ListForUser(ctx context.Context, userID string, keyword string, categoryID string, roleFilter string, limit int, offset int) ([]GroupListEntry, int, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT
 			g.id,
 			g.name,
 			g.owner_id,
 			g.avatar_file_id,
+			g.avatar_version,
 			g.introduction,
 			g.announcement,
 			g.version,
@@ -664,11 +682,20 @@ func (r *GroupRepository) ListForUser(ctx context.Context, userID string, keywor
 		  AND g.deleted_at IS NULL
 		  AND ($2 = '' OR g.name ILIKE '%' || $2 || '%' OR gus.remark ILIKE '%' || $2 || '%')
 		  AND ($3 = '' OR gus.list_group_id = NULLIF($3, '')::uuid)
+		  AND (
+		    $4 = ''
+		    OR $4 = 'joined'
+		    OR ($4 IN ('created', 'owner') AND gm.role = 'owner')
+		    OR ($4 = 'admin' AND gm.role = 'admin')
+		    OR ($4 = 'managed' AND gm.role IN ('owner', 'admin'))
+		    OR ($4 = 'member' AND gm.role = 'member')
+		  )
 		ORDER BY COALESCE(gus.remark, g.name) ASC, g.created_at DESC
-		LIMIT $4 OFFSET $5`,
+		LIMIT $5 OFFSET $6`,
 		normalizeText(userID),
 		normalizeText(keyword),
 		normalizeText(categoryID),
+		normalizeText(roleFilter),
 		limit,
 		offset,
 	)
@@ -700,6 +727,7 @@ func (r *GroupRepository) GetForUser(ctx context.Context, userID string, groupID
 			g.name,
 			g.owner_id,
 			g.avatar_file_id,
+			g.avatar_version,
 			g.introduction,
 			g.announcement,
 			g.version,
@@ -984,6 +1012,7 @@ func scanGroupListEntry(row scanner) (GroupListEntry, int, error) {
 		&entry.Group.Name,
 		&ownerID,
 		&avatarFileID,
+		&entry.Group.AvatarVersion,
 		&introduction,
 		&announcement,
 		&entry.Group.Version,
@@ -1040,6 +1069,7 @@ func scanGroup(row scanner) (Group, error) {
 		&group.Name,
 		&ownerID,
 		&avatarFileID,
+		&group.AvatarVersion,
 		&introduction,
 		&announcement,
 		&group.Version,
@@ -1193,11 +1223,12 @@ type groupJoinRequestScanState struct {
 
 	requestID pgtype.UUID
 
-	groupID           pgtype.UUID
-	groupOwnerID      pgtype.UUID
-	groupAvatarFileID pgtype.UUID
-	groupIntroduction sql.NullString
-	groupAnnouncement sql.NullString
+	groupID            pgtype.UUID
+	groupOwnerID       pgtype.UUID
+	groupAvatarFileID  pgtype.UUID
+	groupAvatarVersion int
+	groupIntroduction  sql.NullString
+	groupAnnouncement  sql.NullString
 
 	actorID           pgtype.UUID
 	actorGenderCustom sql.NullString
@@ -1238,6 +1269,7 @@ func (s *groupJoinRequestScanState) dest() []any {
 		&s.request.Group.Name,
 		&s.groupOwnerID,
 		&s.groupAvatarFileID,
+		&s.groupAvatarVersion,
 		&s.groupIntroduction,
 		&s.groupAnnouncement,
 		&s.request.Group.Version,
@@ -1291,6 +1323,7 @@ func (s *groupJoinRequestScanState) build() GroupJoinRequest {
 	request.Group.ID = uuidString(s.groupID)
 	request.Group.OwnerID = uuidString(s.groupOwnerID)
 	request.Group.AvatarFileID = uuidStringPtr(s.groupAvatarFileID)
+	request.Group.AvatarVersion = s.groupAvatarVersion
 	if s.groupIntroduction.Valid {
 		request.Group.Introduction = &s.groupIntroduction.String
 	}

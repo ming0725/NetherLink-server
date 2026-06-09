@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -44,6 +45,12 @@ type createFriendGroupRequest struct {
 	ClientOperationID string `json:"clientOperationId"`
 }
 
+type patchFriendGroupRequest struct {
+	Name              *string `json:"name"`
+	SortOrder         *int    `json:"sortOrder"`
+	ClientOperationID string  `json:"clientOperationId"`
+}
+
 type patchFriendRequest struct {
 	Remark            *string `json:"remark"`
 	GroupID           *string `json:"groupId"`
@@ -81,12 +88,12 @@ type createGroupRequest struct {
 }
 
 type patchGroupRequest struct {
-	Name              *string `json:"name"`
-	Introduction      *string `json:"introduction"`
-	Announcement      *string `json:"announcement"`
-	AvatarFileID      *string `json:"avatarFileId"`
-	ExpectedVersion   *int    `json:"expectedVersion"`
-	ClientOperationID string  `json:"clientOperationId"`
+	Name              *string             `json:"name"`
+	Introduction      *string             `json:"introduction"`
+	Announcement      *string             `json:"announcement"`
+	AvatarFileID      optionalStringField `json:"avatarFileId"`
+	ExpectedVersion   *int                `json:"expectedVersion"`
+	ClientOperationID string              `json:"clientOperationId"`
 }
 
 type addGroupMembersRequest struct {
@@ -237,7 +244,9 @@ type groupsResponse struct {
 }
 
 type groupDetailResponse struct {
-	Group groupResponse `json:"group"`
+	Group         groupResponse `json:"group"`
+	ChangedFields []string      `json:"changedFields,omitempty"`
+	AvatarChanged *bool         `json:"avatarChanged,omitempty"`
 }
 
 type groupSettingsDetailResponse struct {
@@ -328,6 +337,57 @@ type optionalStringInput struct {
 	Value *string
 }
 
+type optionalStringField struct {
+	Set   bool
+	Value *string
+}
+
+func (f *optionalStringField) UnmarshalJSON(data []byte) error {
+	f.Set = true
+	if string(data) == "null" {
+		f.Value = nil
+		return nil
+	}
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	f.Value = &value
+	return nil
+}
+
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+func groupPatchChangedFields(req patchGroupRequest, current repository.GroupListEntry, updated repository.GroupListEntry) ([]string, bool) {
+	changedFields := []string{}
+	if req.Name != nil && current.Group.Name != updated.Group.Name {
+		changedFields = append(changedFields, "name")
+	}
+	if req.Introduction != nil && !optionalStringEqual(current.Group.Introduction, updated.Group.Introduction) {
+		changedFields = append(changedFields, "introduction")
+	}
+	if req.Announcement != nil && !optionalStringEqual(current.Group.Announcement, updated.Group.Announcement) {
+		changedFields = append(changedFields, "announcement")
+	}
+	avatarChanged := false
+	if req.AvatarFileID.Set {
+		avatarChanged = !optionalStringEqual(current.Group.AvatarFileID, updated.Group.AvatarFileID)
+		if avatarChanged {
+			changedFields = append(changedFields, "avatarFileId")
+		}
+	}
+	return changedFields, avatarChanged
+}
+
+func optionalStringEqual(a *string, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
 func parseOptionalFriendGroupID(groupID *string, friendGroupID *string) (optionalStringInput, *requestError) {
 	if groupID == nil && friendGroupID == nil {
 		return optionalStringInput{}, nil
@@ -371,6 +431,19 @@ func parseAcceptFriendGroupID(groupID *string, friendGroupID *string) (optionalS
 		return optionalStringInput{}, nil
 	}
 	return parseOptionalFriendGroupID(groupID, nil)
+}
+
+func validateOptionalGroupRoleFilter(role string) *requestError {
+	switch strings.TrimSpace(role) {
+	case "", "joined", "created", "owner", "managed", "admin", "member":
+		return nil
+	default:
+		return &requestError{
+			Status:  http.StatusBadRequest,
+			Code:    "VALIDATION_ERROR",
+			Message: "role must be one of joined, created, owner, managed, admin, or member",
+		}
+	}
 }
 
 func (s *Server) handleUsersSearch(w http.ResponseWriter, r *http.Request) {
@@ -604,6 +677,87 @@ func (s *Server) handleCreateFriendGroup(w http.ResponseWriter, r *http.Request)
 			Body:   response,
 			After: func() {
 				s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "friend.group.created", response)
+			},
+		}, nil
+	})
+}
+
+func (s *Server) handlePatchFriendGroup(w http.ResponseWriter, r *http.Request) {
+	if !s.requireFriendService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	friendGroupID := r.PathValue("friendGroupId")
+	if reqErr := validateUUID(friendGroupID, "friendGroupId"); reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+
+	var req patchFriendGroupRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeRequestError(w, r, err)
+		return
+	}
+
+	s.handleIdempotentWrite(w, r, principal.UserID, "friend.group.update:"+friendGroupID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
+		writeFriendServiceError(w, r, err)
+	}, func() (idempotentHTTPResult, error) {
+		group, err := s.friendService.UpdateGroup(r.Context(), friendsvc.UpdateGroupInput{
+			UserID:        principal.UserID,
+			FriendGroupID: friendGroupID,
+			Name:          req.Name,
+			SortOrder:     req.SortOrder,
+		})
+		if err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		response := friendGroupDetailResponse{Group: makeFriendGroupResponse(group)}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   response,
+			After: func() {
+				s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "friend.group.updated", response)
+			},
+		}, nil
+	})
+}
+
+func (s *Server) handleDeleteFriendGroup(w http.ResponseWriter, r *http.Request) {
+	if !s.requireFriendService(w, r) {
+		return
+	}
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	friendGroupID := r.PathValue("friendGroupId")
+	if reqErr := validateUUID(friendGroupID, "friendGroupId"); reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+
+	s.handleIdempotentWrite(w, r, principal.UserID, "friend.group.delete:"+friendGroupID, idempotencyKeyFromRequest(r, r.URL.Query().Get("clientOperationId")), func(err error) {
+		writeFriendServiceError(w, r, err)
+	}, func() (idempotentHTTPResult, error) {
+		if err := s.friendService.DeleteGroup(r.Context(), principal.UserID, friendGroupID); err != nil {
+			return idempotentHTTPResult{}, err
+		}
+		payload := map[string]any{
+			"groupId":       friendGroupID,
+			"friendGroupId": friendGroupID,
+		}
+		return idempotentHTTPResult{
+			Status: http.StatusOK,
+			Body:   okResponse{OK: true},
+			After: func() {
+				s.publishSelfRealtimeEvent(r.Context(), principal.UserID, "friend.group.deleted", payload)
 			},
 		}, nil
 	})
@@ -994,12 +1148,17 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, r, reqErr)
 		return
 	}
+	if reqErr := validateOptionalGroupRoleFilter(r.URL.Query().Get("role")); reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
 
 	groups, total, err := s.repos.Groups.ListForUser(
 		r.Context(),
 		principal.UserID,
 		r.URL.Query().Get("keyword"),
 		r.URL.Query().Get("categoryId"),
+		r.URL.Query().Get("role"),
 		limit,
 		offset,
 	)
@@ -1106,8 +1265,8 @@ func (s *Server) handlePatchGroup(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, r, err)
 		return
 	}
-	if req.AvatarFileID != nil {
-		if err := validateOptionalUUID(*req.AvatarFileID, "avatarFileId"); err != nil {
+	if req.AvatarFileID.Set && req.AvatarFileID.Value != nil {
+		if err := validateOptionalUUID(*req.AvatarFileID.Value, "avatarFileId"); err != nil {
 			writeRequestError(w, r, err)
 			return
 		}
@@ -1128,13 +1287,18 @@ func (s *Server) handlePatchGroup(w http.ResponseWriter, r *http.Request) {
 			Name:            req.Name,
 			Introduction:    req.Introduction,
 			Announcement:    req.Announcement,
-			AvatarFileIDSet: req.AvatarFileID != nil,
-			AvatarFileID:    req.AvatarFileID,
+			AvatarFileIDSet: req.AvatarFileID.Set,
+			AvatarFileID:    req.AvatarFileID.Value,
 		})
 		if err != nil {
 			return idempotentHTTPResult{}, err
 		}
-		response := groupDetailResponse{Group: makeGroupResponse(group)}
+		changedFields, avatarChanged := groupPatchChangedFields(req, current, group)
+		response := groupDetailResponse{
+			Group:         makeGroupResponse(group),
+			ChangedFields: changedFields,
+			AvatarChanged: boolPtr(avatarChanged),
+		}
 		return idempotentHTTPResult{
 			Status: http.StatusOK,
 			ETag:   response.Group.ETag,
@@ -1909,7 +2073,7 @@ func makeGroupResponse(entry repository.GroupListEntry) groupResponse {
 		Name:              entry.Group.Name,
 		OwnerUUID:         entry.Group.OwnerID,
 		AvatarURL:         avatarContentURL(entry.Group.AvatarFileID),
-		AvatarVersion:     entry.Group.Version,
+		AvatarVersion:     entry.Group.AvatarVersion,
 		AvatarEtag:        nil,
 		AvatarContentHash: nil,
 		Introduction:      entry.Group.Introduction,

@@ -124,16 +124,17 @@ type ConversationUserSummary struct {
 }
 
 type ConversationGroupSummary struct {
-	ID           string
-	Name         string
-	OwnerID      string
-	AvatarFileID *string
-	Introduction *string
-	Announcement *string
-	MemberCount  int
-	Version      int
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID            string
+	Name          string
+	OwnerID       string
+	AvatarFileID  *string
+	AvatarVersion int
+	Introduction  *string
+	Announcement  *string
+	MemberCount   int
+	Version       int
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 type ConversationEntry struct {
@@ -1041,6 +1042,7 @@ func conversationEntrySelectSQL() string {
 			g.name,
 			g.owner_id,
 			g.avatar_file_id,
+			g.avatar_version,
 			g.introduction,
 			g.announcement,
 			(
@@ -1129,6 +1131,7 @@ func scanConversationEntry(row scanner) (ConversationEntry, error) {
 		groupName              sql.NullString
 		groupOwnerID           pgtype.UUID
 		groupAvatarFileID      pgtype.UUID
+		groupAvatarVersion     sql.NullInt32
 		groupIntroduction      sql.NullString
 		groupAnnouncement      sql.NullString
 		groupMemberCount       sql.NullInt32
@@ -1189,6 +1192,7 @@ func scanConversationEntry(row scanner) (ConversationEntry, error) {
 		&groupName,
 		&groupOwnerID,
 		&groupAvatarFileID,
+		&groupAvatarVersion,
 		&groupIntroduction,
 		&groupAnnouncement,
 		&groupMemberCount,
@@ -1262,12 +1266,13 @@ func scanConversationEntry(row scanner) (ConversationEntry, error) {
 
 	if entryGroupID.Valid {
 		group := ConversationGroupSummary{
-			ID:           uuidString(entryGroupID),
-			Name:         groupName.String,
-			OwnerID:      uuidString(groupOwnerID),
-			AvatarFileID: uuidStringPtr(groupAvatarFileID),
-			MemberCount:  int(groupMemberCount.Int32),
-			Version:      int(groupVersion.Int32),
+			ID:            uuidString(entryGroupID),
+			Name:          groupName.String,
+			OwnerID:       uuidString(groupOwnerID),
+			AvatarFileID:  uuidStringPtr(groupAvatarFileID),
+			AvatarVersion: int(groupAvatarVersion.Int32),
+			MemberCount:   int(groupMemberCount.Int32),
+			Version:       int(groupVersion.Int32),
 		}
 		if groupIntroduction.Valid {
 			group.Introduction = &groupIntroduction.String

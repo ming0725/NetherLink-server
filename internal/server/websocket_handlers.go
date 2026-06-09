@@ -504,6 +504,11 @@ func (s *Server) handleWebSocketPresenceUpdate(ctx context.Context, conn *realti
 	}
 
 	now := time.Now().UTC()
+	if s.repos.Users != nil {
+		if err := s.repos.Users.UpdatePresenceStatus(ctx, principal.UserID, status); err != nil {
+			s.logger.WarnContext(ctx, "failed to update persisted presence status", "error", err, "user_id", principal.UserID, "status", status)
+		}
+	}
 	if s.repos.Users != nil && status != "invisible" {
 		if err := s.repos.Users.TouchLastSeen(ctx, principal.UserID, now); err != nil {
 			s.logger.WarnContext(ctx, "failed to touch user last seen for presence update", "error", err, "user_id", principal.UserID)
@@ -523,12 +528,16 @@ func (s *Server) handleWebSocketPresenceConnect(ctx context.Context, userID stri
 	}
 
 	now := time.Now().UTC()
-	if s.repos.Users != nil {
+	status := s.persistedPresenceStatus(ctx, userID)
+	if status == "" {
+		status = "online"
+	}
+	if s.repos.Users != nil && status != "invisible" {
 		if err := s.repos.Users.TouchLastSeen(ctx, userID, now); err != nil {
 			s.logger.WarnContext(ctx, "failed to touch user last seen for websocket connect", "error", err, "user_id", userID)
 		}
 	}
-	state := s.realtimeHub.SetPresence(userID, "online", now)
+	state := s.realtimeHub.SetPresence(userID, status, now)
 	s.publishPresenceRealtimeEvent(ctx, userID, state.Status, state.LastSeenAt)
 }
 
@@ -549,6 +558,18 @@ func (s *Server) handleWebSocketPresenceDisconnect(ctx context.Context, userID s
 	}
 	state := s.realtimeHub.SetPresence(userID, "offline", now)
 	s.publishPresenceRealtimeEvent(ctx, userID, state.Status, state.LastSeenAt)
+}
+
+func (s *Server) persistedPresenceStatus(ctx context.Context, userID string) string {
+	if s.repos.Users == nil {
+		return ""
+	}
+	user, err := s.repos.Users.GetByID(ctx, userID)
+	if err != nil {
+		s.logger.WarnContext(ctx, "failed to load persisted presence status", "error", err, "user_id", userID)
+		return ""
+	}
+	return normalizePresenceStatus(user.PresenceStatus)
 }
 
 func makePresenceUpdatedPayload(userID string, status string, lastSeenAt time.Time) websocketPresenceUpdatedPayload {

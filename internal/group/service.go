@@ -208,8 +208,21 @@ func (s *Service) UpdateGroup(ctx context.Context, input UpdateGroupInput) (repo
 	}
 
 	if err := repository.WithTx(ctx, s.tx, func(repos repository.Repositories) error {
-		avatarFileID := normalizedOptional(input.AvatarFileID)
-		if input.AvatarFileIDSet && avatarFileID != nil {
+		requestedAvatarFileID := normalizedOptional(input.AvatarFileID)
+		avatarFileID := requestedAvatarFileID
+		current, err := repos.Groups.Get(ctx, input.GroupID)
+		if err != nil {
+			return mapRepositoryError(err)
+		}
+		resetToDefaultAvatar := input.AvatarFileIDSet && requestedAvatarFileID == nil
+		if resetToDefaultAvatar {
+			avatarFileID, err = pickDefaultGroupAvatarFileID(ctx, repos)
+			if err != nil {
+				return err
+			}
+		}
+		avatarChanged := input.AvatarFileIDSet && !optionalStringEqual(current.AvatarFileID, avatarFileID)
+		if avatarChanged && avatarFileID != nil && !resetToDefaultAvatar {
 			if err := validateOwnedGroupAvatarFile(ctx, repos, input.UserID, *avatarFileID); err != nil {
 				return err
 			}
@@ -227,7 +240,7 @@ func (s *Service) UpdateGroup(ctx context.Context, input UpdateGroupInput) (repo
 		}); err != nil {
 			return mapRepositoryError(err)
 		}
-		if input.AvatarFileIDSet {
+		if avatarChanged {
 			if _, err := repos.Files.SoftDeleteUsages(ctx, "group_avatar", input.GroupID); err != nil {
 				return mapRepositoryError(err)
 			}
@@ -665,6 +678,13 @@ func normalizedOptional(value *string) *string {
 		return nil
 	}
 	return &normalized
+}
+
+func optionalStringEqual(a *string, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
 func stringPtr(value string) *string {

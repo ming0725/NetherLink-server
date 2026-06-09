@@ -58,6 +58,10 @@ func NewRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*R
 	if err != nil {
 		return nil, err
 	}
+	if err := database.EnsureRuntimeSchema(ctx, db); err != nil {
+		db.Close()
+		return nil, err
+	}
 
 	redisClient := cache.NewRedisClient(cfg.Redis)
 	repos := repository.New(db)

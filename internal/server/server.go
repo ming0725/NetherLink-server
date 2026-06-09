@@ -214,6 +214,8 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("DELETE /api/v1/friends/{friendUserUuid}", s.withAuthRequired(http.HandlerFunc(s.handleDeleteFriend)))
 	mux.Handle("GET /api/v1/friend-groups", s.withAuthRequired(http.HandlerFunc(s.handleFriendGroups)))
 	mux.Handle("POST /api/v1/friend-groups", s.withAuthRequired(http.HandlerFunc(s.handleCreateFriendGroup)))
+	mux.Handle("PATCH /api/v1/friend-groups/{friendGroupId}", s.withAuthRequired(http.HandlerFunc(s.handlePatchFriendGroup)))
+	mux.Handle("DELETE /api/v1/friend-groups/{friendGroupId}", s.withAuthRequired(http.HandlerFunc(s.handleDeleteFriendGroup)))
 	mux.Handle("POST /api/v1/friend-requests", s.withAuthRequired(http.HandlerFunc(s.handleCreateFriendRequest)))
 	mux.Handle("GET /api/v1/friend-requests", s.withAuthRequired(http.HandlerFunc(s.handleFriendRequests)))
 	mux.Handle("POST /api/v1/friend-requests/{requestId}/accept", s.withAuthRequired(http.HandlerFunc(s.handleAcceptFriendRequest)))

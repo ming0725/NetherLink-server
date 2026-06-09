@@ -184,10 +184,6 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rateKey := clientAddr(r) + ":" + stableKey(strings.ToLower(strings.TrimSpace(req.Account)))
-	if err := s.authRateLimit(r.Context(), "login", rateKey, 10, 10*time.Minute); err != nil {
-		writeRequestError(w, r, err)
-		return
-	}
 
 	result, err := s.authService.Login(r.Context(), authsvc.LoginInput{
 		Account:    req.Account,
@@ -196,6 +192,12 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		DeviceName: req.DeviceName,
 	})
 	if err != nil {
+		if errors.Is(err, authsvc.ErrInvalidCredentials) {
+			if rateErr := s.authRateLimit(r.Context(), "login", rateKey, 10, 10*time.Minute); rateErr != nil {
+				writeRequestError(w, r, rateErr)
+				return
+			}
+		}
 		writeAuthError(w, r, err)
 		return
 	}

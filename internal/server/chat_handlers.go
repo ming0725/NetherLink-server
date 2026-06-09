@@ -863,7 +863,7 @@ func makeConversationGroupSummaryResponse(group repository.ConversationGroupSumm
 		Name:              group.Name,
 		OwnerUUID:         group.OwnerID,
 		AvatarURL:         avatarContentURL(group.AvatarFileID),
-		AvatarVersion:     group.Version,
+		AvatarVersion:     group.AvatarVersion,
 		AvatarEtag:        nil,
 		AvatarContentHash: nil,
 		Introduction:      group.Introduction,

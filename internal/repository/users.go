@@ -24,6 +24,7 @@ const userSelectColumns = `
 	signature,
 	region,
 	last_seen_at,
+	presence_status,
 	token_version,
 	version,
 	created_at,
@@ -43,6 +44,7 @@ const userSelectColumnsU = `
 	u.signature,
 	u.region,
 	u.last_seen_at,
+	u.presence_status,
 	u.token_version,
 	u.version,
 	u.created_at,
@@ -64,23 +66,24 @@ type UserRepository struct {
 }
 
 type User struct {
-	ID           string
-	PublicID     string
-	Email        string
-	PasswordHash string
-	Nick         string
-	Gender       string
-	GenderCustom *string
-	AvatarFileID *string
-	Status       string
-	Signature    *string
-	Region       *string
-	LastSeenAt   *time.Time
-	TokenVersion int
-	Version      int
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	DeletedAt    *time.Time
+	ID             string
+	PublicID       string
+	Email          string
+	PasswordHash   string
+	Nick           string
+	Gender         string
+	GenderCustom   *string
+	AvatarFileID   *string
+	Status         string
+	Signature      *string
+	Region         *string
+	LastSeenAt     *time.Time
+	PresenceStatus string
+	TokenVersion   int
+	Version        int
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	DeletedAt      *time.Time
 }
 
 type UserIDChange struct {
@@ -454,6 +457,24 @@ func (r *UserRepository) TouchLastSeen(ctx context.Context, userID string, seenA
 	return nil
 }
 
+func (r *UserRepository) UpdatePresenceStatus(ctx context.Context, userID string, status string) error {
+	tag, err := r.db.Exec(ctx, `
+		UPDATE users
+		SET presence_status = $2
+		WHERE id = $1::uuid
+		  AND deleted_at IS NULL`,
+		normalizeText(userID),
+		normalizeText(status),
+	)
+	if err != nil {
+		return translateWriteError(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (r *UserRepository) getOne(ctx context.Context, query string, args ...any) (User, error) {
 	user, err := scanUser(r.db.QueryRow(ctx, query, args...))
 	return user, translateReadError(err)
@@ -484,6 +505,7 @@ func scanUser(row scanner) (User, error) {
 		&signature,
 		&region,
 		&lastSeenAt,
+		&user.PresenceStatus,
 		&user.TokenVersion,
 		&user.Version,
 		&user.CreatedAt,
@@ -541,6 +563,7 @@ func scanUserWithTotal(row scanner) (User, int, error) {
 		&signature,
 		&region,
 		&lastSeenAt,
+		&user.PresenceStatus,
 		&user.TokenVersion,
 		&user.Version,
 		&user.CreatedAt,
