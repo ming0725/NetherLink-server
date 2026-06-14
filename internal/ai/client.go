@@ -42,6 +42,7 @@ type CompletionResponse struct {
 
 type CompletionStreamDelta struct {
 	Content      string
+	Thinking     bool
 	FinishReason string
 }
 
@@ -220,13 +221,14 @@ func (c *OpenAICompatibleClient) Stream(ctx context.Context, req CompletionReque
 		if delta.FinishReason != "" {
 			finishReason = delta.FinishReason
 		}
-		if delta.Content == "" {
-			continue
+		if delta.Content != "" {
+			content.WriteString(delta.Content)
 		}
-		content.WriteString(delta.Content)
 		if onDelta != nil {
-			if err := onDelta(delta); err != nil {
-				return streamResponse(), err
+			if delta.Thinking || delta.Content != "" {
+				if err := onDelta(delta); err != nil {
+					return streamResponse(), err
+				}
 			}
 		}
 	}
@@ -240,10 +242,12 @@ func parseStreamData(data string) (CompletionStreamDelta, int, error) {
 	var decoded struct {
 		Choices []struct {
 			Delta struct {
-				Content string `json:"content"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
 			} `json:"delta"`
 			Message struct {
-				Content string `json:"content"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -261,8 +265,13 @@ func parseStreamData(data string) (CompletionStreamDelta, int, error) {
 	if content == "" {
 		content = decoded.Choices[0].Message.Content
 	}
+	reasoningContent := decoded.Choices[0].Delta.ReasoningContent
+	if reasoningContent == "" {
+		reasoningContent = decoded.Choices[0].Message.ReasoningContent
+	}
 	return CompletionStreamDelta{
 		Content:      content,
+		Thinking:     reasoningContent != "",
 		FinishReason: decoded.Choices[0].FinishReason,
 	}, decoded.Usage.TotalTokens, nil
 }

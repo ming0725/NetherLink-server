@@ -96,21 +96,23 @@ type conversationSummaryResponse struct {
 }
 
 type conversationUserSummaryResponse struct {
-	UserUUID     string     `json:"userUuid"`
-	UserID       string     `json:"userId"`
-	NickName     string     `json:"nickName"`
-	Gender       string     `json:"gender"`
-	GenderCustom *string    `json:"genderCustom,omitempty"`
-	Status       string     `json:"status"`
-	Signature    *string    `json:"signature,omitempty"`
-	Region       *string    `json:"region,omitempty"`
-	LastSeenAt   *time.Time `json:"lastSeenAt,omitempty"`
-	Version      int        `json:"version"`
-	UpdatedAt    time.Time  `json:"updatedAt"`
+	UserUUID      string     `json:"userUuid"`
+	UserID        string     `json:"userId"`
+	NickName      string     `json:"nickName"`
+	Gender        string     `json:"gender"`
+	GenderCustom  *string    `json:"genderCustom,omitempty"`
+	AccountStatus string     `json:"accountStatus"`
+	Status        string     `json:"status"`
+	Signature     *string    `json:"signature,omitempty"`
+	Region        *string    `json:"region,omitempty"`
+	LastSeenAt    *time.Time `json:"lastSeenAt,omitempty"`
+	Version       int        `json:"version"`
+	UpdatedAt     time.Time  `json:"updatedAt"`
 }
 
 type conversationGroupSummaryResponse struct {
 	GroupID           string    `json:"groupId"`
+	GroupPublicID     string    `json:"groupPublicId"`
 	Name              string    `json:"name"`
 	OwnerUUID         string    `json:"ownerUuid"`
 	AvatarURL         *string   `json:"avatarUrl"`
@@ -843,23 +845,25 @@ func makeConversationSummaryResponse(entry repository.ConversationEntry) convers
 
 func makeConversationUserSummaryResponse(user repository.ConversationUserSummary) conversationUserSummaryResponse {
 	return conversationUserSummaryResponse{
-		UserUUID:     user.ID,
-		UserID:       user.PublicID,
-		NickName:     user.Nick,
-		Gender:       user.Gender,
-		GenderCustom: user.GenderCustom,
-		Status:       user.Status,
-		Signature:    user.Signature,
-		Region:       user.Region,
-		LastSeenAt:   user.LastSeenAt,
-		Version:      user.Version,
-		UpdatedAt:    user.UpdatedAt,
+		UserUUID:      user.ID,
+		UserID:        user.PublicID,
+		NickName:      user.Nick,
+		Gender:        user.Gender,
+		GenderCustom:  user.GenderCustom,
+		AccountStatus: user.Status,
+		Status:        user.Status,
+		Signature:     user.Signature,
+		Region:        user.Region,
+		LastSeenAt:    user.LastSeenAt,
+		Version:       user.Version,
+		UpdatedAt:     user.UpdatedAt,
 	}
 }
 
 func makeConversationGroupSummaryResponse(group repository.ConversationGroupSummary) conversationGroupSummaryResponse {
 	return conversationGroupSummaryResponse{
 		GroupID:           group.ID,
+		GroupPublicID:     group.PublicID,
 		Name:              group.Name,
 		OwnerUUID:         group.OwnerID,
 		AvatarURL:         avatarContentURL(group.AvatarFileID),

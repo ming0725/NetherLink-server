@@ -16,6 +16,7 @@ import (
 type aiCreateConversationRequest struct {
 	Title             *string `json:"title"`
 	FirstMessage      *string `json:"firstMessage"`
+	Model             string  `json:"model"`
 	ClientOperationID string  `json:"clientOperationId"`
 }
 
@@ -28,6 +29,9 @@ type aiSendMessageRequest struct {
 	Message         string   `json:"message"`
 	ClientMessageID string   `json:"clientMessageId"`
 	AIFileIDs       []string `json:"aiFileIds"`
+	Model           string   `json:"model"`
+	ThinkingType    string   `json:"thinkingType"`
+	ReasoningEffort string   `json:"reasoningEffort"`
 }
 
 type aiBindFileRequest struct {
@@ -100,6 +104,11 @@ type aiStreamStartedResponse struct {
 type aiStreamChunkResponse struct {
 	StreamID string `json:"streamId"`
 	Delta    string `json:"delta"`
+}
+
+type aiStreamThinkingResponse struct {
+	StreamID string `json:"streamId"`
+	Active   bool   `json:"active"`
 }
 
 type aiStreamDoneResponse struct {
@@ -208,6 +217,7 @@ func (s *Server) handleAICreateConversation(w http.ResponseWriter, r *http.Reque
 			UserID:       principal.UserID,
 			Title:        req.Title,
 			FirstMessage: req.FirstMessage,
+			Model:        req.Model,
 		})
 		if err != nil {
 			return idempotentHTTPResult{}, err
@@ -343,6 +353,9 @@ func (s *Server) handleAISendMessage(w http.ResponseWriter, r *http.Request) {
 			Message:         req.Message,
 			ClientMessageID: req.ClientMessageID,
 			AIFileIDs:       req.AIFileIDs,
+			Model:           req.Model,
+			ThinkingType:    req.ThinkingType,
+			ReasoningEffort: req.ReasoningEffort,
 		})
 		if err != nil {
 			return idempotentHTTPResult{}, err
@@ -411,6 +424,18 @@ func (s *Server) handleAISendMessageStream(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	thinkingActive := false
+	writeThinking := func(active bool) error {
+		if thinkingActive == active {
+			return nil
+		}
+		thinkingActive = active
+		return writeSSE(w, flusher, "ai.stream.thinking", aiStreamThinkingResponse{
+			StreamID: streamID,
+			Active:   active,
+		})
+	}
+
 	result, err := s.aiService.StreamMessage(streamCtx, aisvc.StreamMessageInput{
 		SendMessageInput: aisvc.SendMessageInput{
 			UserID:          principal.UserID,
@@ -418,12 +443,26 @@ func (s *Server) handleAISendMessageStream(w http.ResponseWriter, r *http.Reques
 			Message:         req.Message,
 			ClientMessageID: req.ClientMessageID,
 			AIFileIDs:       req.AIFileIDs,
+			Model:           req.Model,
+			ThinkingType:    req.ThinkingType,
+			ReasoningEffort: req.ReasoningEffort,
 		},
 		OnDelta: func(delta aisvc.StreamMessageDelta) error {
 			select {
 			case <-streamCtx.Done():
 				return context.Canceled
 			default:
+			}
+			if delta.Thinking {
+				if err := writeThinking(true); err != nil {
+					return err
+				}
+			}
+			if delta.Content == "" {
+				return nil
+			}
+			if err := writeThinking(false); err != nil {
+				return err
 			}
 			return writeSSE(w, flusher, "ai.stream.chunk", aiStreamChunkResponse{
 				StreamID: streamID,
@@ -439,11 +478,13 @@ func (s *Server) handleAISendMessageStream(w http.ResponseWriter, r *http.Reques
 				s.logger.WarnContext(completeCtx, "failed to complete cancelled AI stream receipt", "error", err, "operation_type", receiptClaim.OperationType)
 			}
 			completeCancel()
+			_ = writeThinking(false)
 			_ = writeSSE(w, flusher, "ai.stream.cancelled", cancelled)
 			return
 		}
 		s.deleteAIStreamReceipt(principal.UserID, receiptClaim)
 		code, message := aiErrorCodeAndMessage(err)
+		_ = writeThinking(false)
 		_ = writeSSE(w, flusher, "client.error", aiStreamErrorResponse{
 			RequestType: "ai.message.send",
 			Code:        code,
@@ -465,6 +506,7 @@ func (s *Server) handleAISendMessageStream(w http.ResponseWriter, r *http.Reques
 		s.logger.WarnContext(completeCtx, "failed to complete AI stream receipt", "error", err, "operation_type", receiptClaim.OperationType)
 	}
 	completeCancel()
+	_ = writeThinking(false)
 	_ = writeSSE(w, flusher, "ai.stream.done", done)
 }
 

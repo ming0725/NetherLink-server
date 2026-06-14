@@ -100,7 +100,7 @@ AI configuration:
 - `NETHERLINK_AI_DEFAULT_MODEL`: required when the AI provider is enabled.
 - `NETHERLINK_AI_TITLE_MODEL`: optional separate title-generation model.
 - `NETHERLINK_AI_THINKING_TYPE`: optional OpenAI-compatible reasoning extension; supported values are `enabled` and `disabled`.
-- `NETHERLINK_AI_REASONING_EFFORT`: optional OpenAI-compatible reasoning extension; supported values are `low`, `medium`, and `high`.
+- `NETHERLINK_AI_REASONING_EFFORT`: optional OpenAI-compatible reasoning extension; supported values are `low`, `medium`, `high`, and `max`.
 - `NETHERLINK_AI_MAX_CONTEXT_TOKENS`: default `0`, meaning no configured backend cap yet.
 - `NETHERLINK_AI_REQUEST_TIMEOUT`: default `1m`.
 - `NETHERLINK_AI_OCR_LANGS`: optional Tesseract language list for scanned PDF OCR when `pdftoppm` and `tesseract` are installed; default `eng`.
@@ -134,8 +134,10 @@ The current API foundation includes:
 - WebSocket endpoint: `GET /api/v1/ws` accepts `Authorization: Bearer <access_token>`, `?accessToken=`, or `?token=`; optional `lastEventSeq` / `lastEventId=evt_N` enables durable replay when PostgreSQL is available.
 - WebSocket command: send `{"type":"chat.message.send","payload":{...}}` with `conversationId` plus the same message fields as REST `POST /conversations/{conversationId}/messages`; success emits durable `chat.message.created` plus non-durable `chat.message.sent` ACK to the sender.
 - Auth endpoints: `POST /api/v1/auth/register`, `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/sessions`, `POST /api/v1/auth/sessions/{sessionId}/revoke`, `GET /api/v1/me`, `PATCH /api/v1/me`, `GET /api/v1/me/user-id/check`, `PATCH /api/v1/me/user-id`, `POST /api/v1/me/avatar`, `GET /api/v1/me/preferences`, and `PATCH /api/v1/me/preferences`.
-- Directory endpoints: `GET /api/v1/users`, `GET /api/v1/users/{userUuid}`, `GET /api/v1/users/by-id/{userId}`, `POST /api/v1/users/batch`, `POST /api/v1/presence/batch`, `GET /api/v1/friends`, `PATCH /api/v1/friends/{friendUserUuid}`, `DELETE /api/v1/friends/{friendUserUuid}`, `GET /api/v1/friend-groups`, `POST /api/v1/friend-groups`, `PATCH /api/v1/friend-groups/{friendGroupId}`, `DELETE /api/v1/friend-groups/{friendGroupId}`, `POST /api/v1/friend-requests`, `GET /api/v1/friend-requests`, `POST /api/v1/friend-requests/{requestId}/accept`, `POST /api/v1/friend-requests/{requestId}/reject`, `GET /api/v1/groups`, `POST /api/v1/groups`, `GET /api/v1/groups/{groupId}`, `PATCH /api/v1/groups/{groupId}`, `DELETE /api/v1/groups/{groupId}`, `GET /api/v1/groups/{groupId}/members`, `POST /api/v1/groups/{groupId}/members`, `DELETE /api/v1/groups/{groupId}/members/{userUuid}`, `PATCH /api/v1/groups/{groupId}/members/{userUuid}`, `POST /api/v1/groups/{groupId}/transfer-owner`, `PATCH /api/v1/groups/{groupId}/my-settings`, `POST /api/v1/group-join-requests`, `GET /api/v1/group-notifications`, `POST /api/v1/group-join-requests/{requestId}/accept`, and `POST /api/v1/group-join-requests/{requestId}/reject`.
-- `GET /api/v1/groups` supports `keyword`, `categoryId`, and `role` filters. `role` may be `joined`, `created`/`owner`, `managed`, `admin`, or `member`; group list responses include per-user `role`, `remark`, `listGroupId`, and `listGroupName` so clients can build system sections and custom/default list groups.
+- Directory endpoints: `GET /api/v1/users`, `GET /api/v1/users/{userUuid}`, `GET /api/v1/users/by-id/{userId}`, `POST /api/v1/users/batch`, `POST /api/v1/presence/batch`, `GET /api/v1/friends`, `PATCH /api/v1/friends/{friendUserUuid}`, `DELETE /api/v1/friends/{friendUserUuid}`, `GET /api/v1/friend-groups`, `POST /api/v1/friend-groups`, `PATCH /api/v1/friend-groups/{friendGroupId}`, `DELETE /api/v1/friend-groups/{friendGroupId}`, `POST /api/v1/friend-requests`, `GET /api/v1/friend-requests`, `POST /api/v1/friend-requests/{requestId}/accept`, `POST /api/v1/friend-requests/{requestId}/reject`, `GET /api/v1/groups`, `POST /api/v1/groups`, `GET /api/v1/groups/by-id`, `GET /api/v1/groups/{groupId}`, `PATCH /api/v1/groups/{groupId}`, `DELETE /api/v1/groups/{groupId}`, `GET /api/v1/groups/{groupId}/members`, `POST /api/v1/groups/{groupId}/members`, `DELETE /api/v1/groups/{groupId}/members/{userUuid}`, `PATCH /api/v1/groups/{groupId}/members/{userUuid}`, `POST /api/v1/groups/{groupId}/transfer-owner`, `PATCH /api/v1/groups/{groupId}/my-settings`, `POST /api/v1/group-join-requests`, `GET /api/v1/group-notifications`, `POST /api/v1/group-join-requests/{requestId}/accept`, and `POST /api/v1/group-join-requests/{requestId}/reject`.
+- Groups have both `groupId` and `groupPublicId`. `groupId` is the internal UUID for existing group management routes; `groupPublicId` is a unique 10-digit numeric group number for display, search, and join-request entry. Group list/detail/conversation-summary responses include `groupPublicId`; UUID values are not matched by group search.
+- `GET /api/v1/groups` supports `keyword`, `categoryId`, and `role` filters. `keyword` matches the readable group number `groupPublicId`, group name, or the current user's group remark, not the UUID `groupId`. `role` may be `joined`, `created`/`owner`, `managed`, `admin`, or `member`; group list responses include per-user `role`, `remark`, `listGroupId`, and `listGroupName` so clients can build system sections and custom/default list groups.
+- `GET /api/v1/groups/by-id?groupPublicId=1000000001` looks up a group by exact numeric group number and returns `{ "group": ... }`. `POST /api/v1/group-join-requests` accepts either legacy `groupId` or the preferred `groupPublicId`; send only one of them.
 - Group `version` and `avatarVersion` are separate contracts. `version` is the group metadata version and may change when name, introduction, announcement, owner, or other group metadata changes. `avatarVersion` changes only when the persisted group avatar file reference changes; name/introduction/announcement/member/settings changes keep `avatarUrl`, `avatarVersion`, and `avatarContentHash` stable. Omitted `avatarFileId` leaves the avatar untouched; `avatarFileId: null` or an empty string explicitly resets the group to a persisted default avatar. `PATCH /api/v1/groups/{groupId}` returns `changedFields` and `avatarChanged`:
   ```json
   {
@@ -158,7 +160,7 @@ The current API foundation includes:
 - Chat endpoints: `GET /api/v1/conversations`, `POST /api/v1/conversations/direct`, `POST /api/v1/conversations/group`, `GET /api/v1/conversations/{conversationId}`, `PATCH /api/v1/conversations/{conversationId}/settings`, `POST /api/v1/conversations/{conversationId}/read`, `POST /api/v1/conversations/{conversationId}/unread`, `POST /api/v1/conversations/{conversationId}/messages`, `GET /api/v1/conversations/{conversationId}/messages`, `POST /api/v1/conversations/{conversationId}/messages/{messageId}/recall`, and `DELETE /api/v1/conversations/{conversationId}/messages`. Image messages must include attachment `width` and `height`; message responses include those fields on each attachment.
 - Post endpoints: `GET /api/v1/posts`, `POST /api/v1/posts`, `GET /api/v1/posts/{postId}`, `PATCH /api/v1/posts/{postId}`, `DELETE /api/v1/posts/{postId}`, `POST /api/v1/posts/{postId}/like`, `POST /api/v1/users/{authorUuid}/follow`, `GET /api/v1/posts/{postId}/comments`, `POST /api/v1/posts/{postId}/comments`, `POST /api/v1/comments/{commentId}/like`, `POST /api/v1/comments/{commentId}/replies`, `POST /api/v1/replies/{replyId}/like`, `DELETE /api/v1/comments/{commentId}`, and `DELETE /api/v1/replies/{replyId}`.
 - Notification and operation endpoints: `GET /api/v1/notifications`, `POST /api/v1/notifications/read-all`, `POST /api/v1/notifications/{notificationId}/read`, and `POST /api/v1/operations/receipt`.
-- AI endpoints: `GET /api/v1/ai/conversations`, `POST /api/v1/ai/conversations`, `PATCH /api/v1/ai/conversations/{conversationId}`, `DELETE /api/v1/ai/conversations/{conversationId}`, `GET /api/v1/ai/conversations/{conversationId}/messages`, `POST /api/v1/ai/conversations/{conversationId}/messages`, `POST /api/v1/ai/conversations/{conversationId}/files`, `GET /api/v1/ai/conversations/{conversationId}/files`, `GET /api/v1/ai/files/{aiFileId}`, `DELETE /api/v1/ai/files/{aiFileId}`, `GET /api/v1/ai/conversations/{conversationId}/context`, `POST /api/v1/ai/messages/{messageId}/feedback`, and `POST /api/v1/ai/title`. REST message generation uses the configured provider synchronously by default; `Accept: text/event-stream` or `?stream=true` switches the same endpoint to SSE events (`ai.stream.started`, `ai.stream.chunk`, `ai.stream.done`, `ai.stream.cancelled`, and `client.error`). WebSocket `ai.message.send` streams chunks from the same OpenAI-compatible provider, and `ai.stream.cancel` cancels in-flight provider requests. SSE and WebSocket streaming sends use `operation_receipts` keyed by `clientMessageId`; duplicate completed requests replay `ai.stream.done` or `ai.stream.cancelled` without a second provider call. First-round message completion returns and stores a generated conversation title when the title is still automatic. File binding creates `ai_parse` jobs for text-like, PDF, docx, pptx, and xlsx files, the worker writes private extracted-text file metadata plus `ai_file_chunks`, and message sending uses BM25-style local retrieval for the model input.
+- AI endpoints: `GET /api/v1/ai/conversations`, `POST /api/v1/ai/conversations`, `PATCH /api/v1/ai/conversations/{conversationId}`, `DELETE /api/v1/ai/conversations/{conversationId}`, `GET /api/v1/ai/conversations/{conversationId}/messages`, `POST /api/v1/ai/conversations/{conversationId}/messages`, `POST /api/v1/ai/conversations/{conversationId}/files`, `GET /api/v1/ai/conversations/{conversationId}/files`, `GET /api/v1/ai/files/{aiFileId}`, `DELETE /api/v1/ai/files/{aiFileId}`, `GET /api/v1/ai/conversations/{conversationId}/context`, `POST /api/v1/ai/messages/{messageId}/feedback`, and `POST /api/v1/ai/title`. REST message generation uses the configured provider synchronously by default; `Accept: text/event-stream` or `?stream=true` switches the same endpoint to SSE events (`ai.stream.started`, `ai.stream.thinking`, `ai.stream.chunk`, `ai.stream.done`, `ai.stream.cancelled`, and `client.error`). WebSocket `ai.message.send` streams chunks from the same OpenAI-compatible provider, and `ai.stream.cancel` cancels in-flight provider requests. Message sends may override `model`, `thinkingType`, and `reasoningEffort`; provider API keys remain server-side only. SSE and WebSocket streaming sends use `operation_receipts` keyed by `clientMessageId`; duplicate completed requests replay `ai.stream.done` or `ai.stream.cancelled` without a second provider call. First-round message completion returns and stores a generated conversation title when the title is still automatic. File binding creates `ai_parse` jobs for text-like, PDF, docx, pptx, and xlsx files, the worker writes private extracted-text file metadata plus `ai_file_chunks`, and message sending uses BM25-style local retrieval for the model input.
 
 PostgreSQL:
 
@@ -232,7 +234,7 @@ The first PostgreSQL repositories cover:
 - `files`: create file metadata, upload sessions, multipart part tracking, upload completion, status transitions, object-storage metadata bookkeeping, file processing job claims/results, file variant records, file usage records, and business-aware access checks for signing downloads, including AI uploaded files and extracted-text files.
 - `chat`: list/open/read/update conversations, persist participant sync state, persist messages, assign per-conversation `message_seq`, persist message attachments and `chat_attachment` file usages, recall sender messages, hide current-user history with `hidden_at`, return attachment file metadata, and preserve image `width` and `height`.
 - `friends`: create and list current-user friend groups, list active friends with keyword/group filters, read current-user friendship relation metadata, update/delete friendship settings, create/list/accept/reject friend requests, and upsert bidirectional friendships when accepting requests.
-- `groups`: list current-user groups with keyword/category filters, read group details only for members, page group members only when the viewer belongs to the group, create/update/soft-delete groups, maintain group-avatar `file_usages`, add/remove/update members, transfer ownership, upsert current-user group settings, create/list/accept/reject join requests, and record group events.
+- `groups`: generate and enforce unique numeric group public IDs, list current-user groups with keyword/category filters, read group details only for members, read public group cards by group public ID, page group members only when the viewer belongs to the group, create/update/soft-delete groups, maintain group-avatar `file_usages`, add/remove/update members, transfer ownership, upsert current-user group settings, create/list/accept/reject join requests, and record group events.
 - `posts`: list feed entries with viewer state, read post details, create/update/soft-delete posts, replace post media, record `file_usages` for post media and cover files with visibility matching the post, set post likes, set follows, list/create/delete comments and replies, and maintain persisted like/comment/reply counts.
 - `ai`: list/create AI conversations, store user/assistant messages, bind uploaded files to AI conversations, track parse status and retention metadata, list/delete AI file bindings, expose context token counters, and store AI message feedback.
 - `realtime_events`: persist globally sequenced WebSocket business events, record per-user recipients, list durable replay events after a client cursor, and report the latest sequence.
@@ -267,7 +269,91 @@ When an AI binding uses `retentionPolicy=temporary`, the service sets a default 
 
 `internal/ai` owns AI conversation service logic and the OpenAI-compatible `/chat/completions` provider client. The service stores user messages before model calls, stores assistant messages after successful provider responses, rejects unparsed AI files with `AI_FILE_NOT_READY`, and maps failed parses to `AI_FILE_PARSE_FAILED`. Provider credentials are read only from `NETHERLINK_AI_API_KEY`; code and docs must not contain real API keys.
 
-REST generation is synchronous by default. `POST /api/v1/ai/conversations/{conversationId}/messages` returns the stored user message, created assistant message ID, an empty `streamId`, used files, and a generated `title` after the first round completes. With `Accept: text/event-stream` or `?stream=true`, the same endpoint streams `ai.stream.started`, `ai.stream.chunk`, `ai.stream.done`, `ai.stream.cancelled`, and `client.error` SSE events, stores the final assistant message on successful provider completion, returns the generated first-round title on `ai.stream.done`, and cancels the provider request when the HTTP client disconnects. WebSocket `ai.message.send` returns `ai.stream.started`, streams `ai.stream.chunk` control events, stores the final assistant message on successful provider completion, and returns `ai.stream.done`; `ai.stream.cancel` cancels an in-flight stream by `streamId` and returns `ai.stream.cancelled`. If a stream is cancelled after partial output, the service stores the partial assistant message and includes it in `ai.stream.cancelled` so clients can replace local temporary text with the persisted message. Streaming sends claim `operation_receipts` by `clientMessageId`; duplicate pending requests return `OPERATION_IN_PROGRESS`, while duplicate completed requests emit a new `ai.stream.started` and replay the saved `ai.stream.done` or `ai.stream.cancelled` without calling the provider again. When `aiFileIds` are supplied, the service rejects pending/failed parses and injects a bounded set of BM25-ranked `ai_file_chunks` into the provider prompt, including adjacent chunks for local context. `source_deleted_after_parse` keeps extracted text and chunks while removing the original source object after successful parsing, provided the file is not shared with any non-AI business reference; `temporary` bindings expire after 24 hours and are removed by the file cleanup worker.
+REST generation is synchronous by default. `POST /api/v1/ai/conversations/{conversationId}/messages` returns the stored user message, created assistant message ID, an empty `streamId`, used files, and a generated `title` after the first round completes. With `Accept: text/event-stream` or `?stream=true`, the same endpoint streams `ai.stream.started`, `ai.stream.thinking`, `ai.stream.chunk`, `ai.stream.done`, `ai.stream.cancelled`, and `client.error` SSE events, stores the final assistant message on successful provider completion, returns the generated first-round title on `ai.stream.done`, and cancels the provider request when the HTTP client disconnects. WebSocket `ai.message.send` returns `ai.stream.started`, streams `ai.stream.thinking` and `ai.stream.chunk` control events, stores the final assistant message on successful provider completion, and returns `ai.stream.done`; `ai.stream.cancel` cancels an in-flight stream by `streamId` and returns `ai.stream.cancelled`. If a stream is cancelled after partial output, the service stores the partial assistant message and includes it in `ai.stream.cancelled` so clients can replace local temporary text with the persisted message. Streaming sends claim `operation_receipts` by `clientMessageId`; duplicate pending requests return `OPERATION_IN_PROGRESS`, while duplicate completed requests emit a new `ai.stream.started` and replay the saved `ai.stream.done` or `ai.stream.cancelled` without calling the provider again. When `aiFileIds` are supplied, the service rejects pending/failed parses and injects a bounded set of BM25-ranked `ai_file_chunks` into the provider prompt, including adjacent chunks for local context. `source_deleted_after_parse` keeps extracted text and chunks while removing the original source object after successful parsing, provided the file is not shared with any non-AI business reference; `temporary` bindings expire after 24 hours and are removed by the file cleanup worker.
+
+Frontend AI send request fields:
+
+```json
+{
+  "message": "Explain this file",
+  "clientMessageId": "client-generated-id",
+  "aiFileIds": [],
+  "model": "deepseek-v4-flash",
+  "thinkingType": "enabled",
+  "reasoningEffort": "high"
+}
+```
+
+`model`, `thinkingType`, and `reasoningEffort` are optional per-message overrides. Empty values fall back to the conversation/default backend configuration. `thinkingType` accepts `enabled` or `disabled`; `reasoningEffort` accepts `low`, `medium`, `high`, or `max`. Clients never send provider API keys; the backend always uses `NETHERLINK_AI_API_KEY`.
+
+HTTP JSON mode:
+
+```http
+POST /api/v1/ai/conversations/{conversationId}/messages
+Authorization: Bearer <accessToken>
+Content-Type: application/json
+```
+
+Response:
+
+```json
+{
+  "userMessage": { "role": "user", "text": "Explain this file" },
+  "assistantMessageId": "uuid",
+  "streamId": "",
+  "usedFiles": [],
+  "title": "Optional generated title"
+}
+```
+
+SSE mode:
+
+```http
+POST /api/v1/ai/conversations/{conversationId}/messages?stream=true
+Authorization: Bearer <accessToken>
+Accept: text/event-stream
+Content-Type: application/json
+```
+
+Events:
+
+```text
+event: ai.stream.started
+data: {"streamId":"ais_...","conversationId":"...","clientMessageId":"..."}
+
+event: ai.stream.thinking
+data: {"streamId":"ais_...","active":true}
+
+event: ai.stream.thinking
+data: {"streamId":"ais_...","active":false}
+
+event: ai.stream.chunk
+data: {"streamId":"ais_...","delta":"answer text"}
+
+event: ai.stream.done
+data: {"streamId":"ais_...","userMessage":{},"assistantMessage":{},"usedFiles":[],"finishReason":"stop","title":"..."}
+```
+
+The backend never forwards provider reasoning text. `ai.stream.thinking active=true` means the provider has begun reasoning, so the UI can show a thinking indicator. `active=false` means the indicator should be hidden; answer text is only delivered through `ai.stream.chunk` and the final stored `assistantMessage`.
+
+WebSocket mode:
+
+```json
+{
+  "type": "ai.message.send",
+  "payload": {
+    "conversationId": "uuid",
+    "clientMessageId": "client-generated-id",
+    "message": "Explain this file",
+    "aiFileIds": [],
+    "model": "deepseek-v4-flash",
+    "thinkingType": "enabled",
+    "reasoningEffort": "high"
+  }
+}
+```
+
+The connection receives the same event names as SSE: `ai.stream.started`, `ai.stream.thinking`, `ai.stream.chunk`, `ai.stream.done`, `ai.stream.cancelled`, and `client.error`.
 
 ## Chat Boundary
 
@@ -299,7 +385,7 @@ Current pushed events:
 - `notification.read.updated` after single-notification or read-all changes; payloads include `type` when scoped and the remaining `unreadCount`.
 - `post.created`, `post.updated`, `post.deleted`, `post.like.updated`, `post.comment.created`, `post.comment.deleted`, `post.reply.created`, `post.reply.deleted`, `post.comment.like.updated`, `post.reply.like.updated`, and `post.author.follow.updated` after post/count/viewer-state changes.
 - `presence.updated` after WebSocket connect/disconnect and `presence.update`; recipients are the user and active friends. The user receives the real status, while friends see `invisible` as `offline`.
-- `ai.stream.started`, `ai.stream.chunk`, `ai.stream.done`, and `ai.stream.cancelled` as connection-control events for WebSocket AI generation.
+- `ai.stream.started`, `ai.stream.thinking`, `ai.stream.chunk`, `ai.stream.done`, and `ai.stream.cancelled` as connection-control events for WebSocket AI generation.
 
 Incoming WebSocket command:
 
@@ -307,8 +393,8 @@ Incoming WebSocket command:
 - `chat.message.send` with `conversationId`, `clientMessageId`, `type`, `content`, `attachments`, `clientSentAt`, and `referencedMessageId`; it reuses the REST chat service validation and idempotency path.
 - `chat.message.recall` with `conversationId` and `messageId`; it reuses REST sender-only recall validation and broadcasts `chat.message.recalled`.
 - `chat.read` with `conversationId`, `lastReadMessageId`, and `lastReadAt`; it marks the conversation read and publishes both sync-state and read-state events.
-- `presence.update` with `status` (`online`, `mining`, `airplane`, `invisible`, or `offline`; legacy `busy`/`dnd` map to `mining`, legacy `away` maps to `airplane`). It persists the selected status on `users.presence_status`, updates process-local presence, and publishes `presence.updated`. Visible statuses touch `users.last_seen_at`; `invisible` does not update public last-seen time. Disconnect broadcasts `offline` without overwriting the persisted selection, so the next WebSocket connect restores the previous selected status and notifies clients. HTTP user responses include viewer-visible `user.presence`, so non-friend group members can actively query profile/member endpoints instead of receiving realtime presence fanout.
-- `ai.message.send` with `conversationId`, `clientMessageId`, `message`, and `aiFileIds`; it stores the user message, streams OpenAI-compatible provider chunks, stores the final assistant message on success, and replays completed stream results for duplicate `clientMessageId` requests.
+- `presence.update` with `status` (`online`, `mining`, `airplane`, or `invisible`; legacy `busy`/`dnd` map to `mining`, legacy `away` maps to `airplane`). It persists the selected status on `users.presence_status`, updates process-local presence, and publishes `presence.updated`; `offline` is a server-only runtime state used for disconnects and external visibility. Visible statuses touch `users.last_seen_at`; `invisible` does not update public last-seen time. Disconnect broadcasts `offline` to friends without overwriting the persisted selection; reconnecting while invisible only syncs the user's own client and does not emit a friend-visible presence event. HTTP user responses include viewer-visible `user.presence`, so non-friend group members can actively query profile/member endpoints instead of receiving realtime presence fanout. In user JSON, `presence.status` is the online presence value; `accountStatus` is the account lifecycle value. The legacy top-level `status` is still emitted as the account lifecycle value for backward compatibility.
+- `ai.message.send` with `conversationId`, `clientMessageId`, `message`, `aiFileIds`, optional `model`, optional `thinkingType`, and optional `reasoningEffort`; it stores the user message, streams OpenAI-compatible provider thinking state and answer chunks, stores the final assistant message on success, and replays completed stream results for duplicate `clientMessageId` requests.
 - `ai.stream.cancel` with `streamId`; it cancels a same-user in-flight AI stream.
 
 PostgreSQL remains the source of truth. Redis only fans out already-persisted events between API instances; replay after reconnect reads from PostgreSQL when available.
@@ -317,7 +403,7 @@ PostgreSQL remains the source of truth. Redis only fans out already-persisted ev
 
 `internal/auth` owns password hashing, refresh token hashing, access-token signing, refresh token rotation, access-token validation, current-user profile validation, public ID policy, and user session management. PostgreSQL remains authoritative for users and refresh token sessions. Redis keys used by auth are namespaced as `nl:rate:auth:*`, have TTLs, and are only rate-limit counters.
 
-Public IDs must match `[A-Za-z0-9_]{4,32}`. `PATCH /api/v1/me/user-id` requires `clientOperationId`, records successful changes in `user_id_changes`, and enforces a 30-day cooldown after each successful public ID change. Self-service `PATCH /api/v1/me` accepts `status` only as `active`; online presence states belong to the later realtime presence layer, not the account-active status used by token validation.
+Public IDs must match `[A-Za-z0-9_]{4,32}`. `PATCH /api/v1/me/user-id` requires `clientOperationId`, records successful changes in `user_id_changes`, and enforces a 30-day cooldown after each successful public ID change. Self-service `PATCH /api/v1/me` accepts `status` only as `active`; online presence states belong to the later realtime presence layer, not the account-active status used by token validation. User responses expose this account lifecycle value as `accountStatus` and keep top-level `status` as a compatibility alias.
 
 ## Testing
 

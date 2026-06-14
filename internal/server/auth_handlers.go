@@ -91,6 +91,7 @@ type userResponse struct {
 	AvatarVersion     int               `json:"avatarVersion"`
 	AvatarEtag        *string           `json:"avatarEtag"`
 	AvatarContentHash *string           `json:"avatarContentHash"`
+	AccountStatus     string            `json:"accountStatus"`
 	Status            string            `json:"status"`
 	Signature         *string           `json:"signature"`
 	Region            *string           `json:"region"`
@@ -511,6 +512,7 @@ func makeUserResponse(user repository.User) userResponse {
 		AvatarVersion:     user.Version,
 		AvatarEtag:        nil,
 		AvatarContentHash: nil,
+		AccountStatus:     user.Status,
 		Status:            user.Status,
 		Signature:         user.Signature,
 		Region:            user.Region,

@@ -293,8 +293,8 @@ func validate(cfg Config, validationErrors *[]string) {
 		if cfg.AI.ThinkingType != "" && cfg.AI.ThinkingType != "enabled" && cfg.AI.ThinkingType != "disabled" {
 			*validationErrors = append(*validationErrors, "NETHERLINK_AI_THINKING_TYPE must be enabled or disabled")
 		}
-		if cfg.AI.ReasoningEffort != "" && cfg.AI.ReasoningEffort != "low" && cfg.AI.ReasoningEffort != "medium" && cfg.AI.ReasoningEffort != "high" {
-			*validationErrors = append(*validationErrors, "NETHERLINK_AI_REASONING_EFFORT must be low, medium, or high")
+		if cfg.AI.ReasoningEffort != "" && cfg.AI.ReasoningEffort != "low" && cfg.AI.ReasoningEffort != "medium" && cfg.AI.ReasoningEffort != "high" && cfg.AI.ReasoningEffort != "max" {
+			*validationErrors = append(*validationErrors, "NETHERLINK_AI_REASONING_EFFORT must be low, medium, high, or max")
 		}
 	default:
 		*validationErrors = append(*validationErrors, "NETHERLINK_AI_PROVIDER must be disabled, openai, or openai-compatible")

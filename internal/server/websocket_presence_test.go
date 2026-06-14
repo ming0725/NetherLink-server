@@ -35,6 +35,40 @@ func TestWebSocketPresenceConnectRestoresPersistedStatus(t *testing.T) {
 	}
 }
 
+func TestWebSocketPresenceConnectTreatsPersistedOfflineAsOnline(t *testing.T) {
+	db := &presenceStatusDB{status: "offline"}
+	userID := "00000000-0000-0000-0000-000000000001"
+	hub := realtime.NewHub()
+	srv := newPresenceTestServer(db, hub)
+
+	srv.handleWebSocketPresenceConnect(context.Background(), userID)
+
+	state, ok := hub.Presence(userID)
+	if !ok || state.Status != "online" {
+		t.Fatalf("presence = %+v ok=%v, want restored online", state, ok)
+	}
+	if !db.executedSQLContains("last_seen_at") {
+		t.Fatalf("connect did not touch last_seen_at; execs = %v", db.execs)
+	}
+}
+
+func TestWebSocketPresenceConnectRestoresInvisibleWithoutTouchingLastSeen(t *testing.T) {
+	db := &presenceStatusDB{status: "invisible"}
+	userID := "00000000-0000-0000-0000-000000000001"
+	hub := realtime.NewHub()
+	srv := newPresenceTestServer(db, hub)
+
+	srv.handleWebSocketPresenceConnect(context.Background(), userID)
+
+	state, ok := hub.Presence(userID)
+	if !ok || state.Status != "invisible" {
+		t.Fatalf("presence = %+v ok=%v, want restored invisible", state, ok)
+	}
+	if db.executedSQLContains("last_seen_at") {
+		t.Fatalf("invisible connect touched last_seen_at; execs = %v", db.execs)
+	}
+}
+
 func TestWebSocketPresenceDisconnectDoesNotOverwritePersistedStatus(t *testing.T) {
 	db := &presenceStatusDB{status: "mining"}
 	userID := "00000000-0000-0000-0000-000000000001"
@@ -50,6 +84,68 @@ func TestWebSocketPresenceDisconnectDoesNotOverwritePersistedStatus(t *testing.T
 	}
 	if db.executedSQLContains("presence_status") {
 		t.Fatalf("disconnect overwrote persisted presence status; execs = %v", db.execs)
+	}
+
+	conn, replay, _ := hub.Connect(userID, "new-session", "new-device", 0)
+	defer hub.Disconnect(conn)
+	if len(replay) != 0 {
+		t.Fatalf("disconnect created self replay events = %+v, want none", replay)
+	}
+}
+
+func TestWebSocketPresenceUpdateRejectsOfflineSelection(t *testing.T) {
+	db := &presenceStatusDB{status: "online"}
+	userID := "00000000-0000-0000-0000-000000000001"
+	hub := realtime.NewHub()
+	conn, _, _ := hub.Connect(userID, "session", "device", 0)
+	defer hub.Disconnect(conn)
+	srv := newPresenceTestServer(db, hub)
+
+	srv.handleWebSocketPresenceUpdate(context.Background(), conn, AuthPrincipal{UserID: userID}, []byte(`{"status":"offline"}`))
+
+	if db.executedSQLContains("presence_status") {
+		t.Fatalf("offline update persisted presence status; execs = %v", db.execs)
+	}
+	if state, ok := hub.Presence(userID); ok {
+		t.Fatalf("presence = %+v, want no runtime presence update", state)
+	}
+	select {
+	case event := <-conn.Events():
+		if event.Type != "client.error" {
+			t.Fatalf("event type = %q, want client.error", event.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing client.error for offline presence selection")
+	}
+}
+
+func TestFilterSelfOfflinePresenceEvents(t *testing.T) {
+	now := time.Now().UTC()
+	events := []realtime.Event{
+		{
+			EventSeq: 1,
+			Type:     "presence.updated",
+			Payload:  realtime.MarshalPayload(makePresenceUpdatedPayload("user_self", "offline", now)),
+		},
+		{
+			EventSeq: 2,
+			Type:     "presence.updated",
+			Payload:  realtime.MarshalPayload(makePresenceUpdatedPayload("user_self", "online", now)),
+		},
+		{
+			EventSeq: 3,
+			Type:     "presence.updated",
+			Payload:  realtime.MarshalPayload(makePresenceUpdatedPayload("user_other", "offline", now)),
+		},
+	}
+
+	filtered := filterSelfOfflinePresenceEvents("user_self", events)
+
+	if len(filtered) != 2 {
+		t.Fatalf("filtered length = %d, want 2", len(filtered))
+	}
+	if filtered[0].EventSeq != 2 || filtered[1].EventSeq != 3 {
+		t.Fatalf("filtered seqs = %+v, want seq 2 and 3", filtered)
 	}
 }
 

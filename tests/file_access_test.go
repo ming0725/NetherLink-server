@@ -311,8 +311,8 @@ func seedFileAccessFixtures(t *testing.T, pool *pgxpool.Pool) {
 		INSERT INTO message_attachments (message_id, file_id, display_name, width, height)
 		VALUES ($11::uuid, $5::uuid, 'chat.jpg', 320, 240);
 
-		INSERT INTO groups (id, name, owner_id, avatar_file_id)
-		VALUES ($12::uuid, 'Group', $1::uuid, $6::uuid);
+		INSERT INTO groups (id, public_id, name, owner_id, avatar_file_id)
+		VALUES ($12::uuid, '1000000001', 'Group', $1::uuid, $6::uuid);
 		INSERT INTO group_members (group_id, user_id, role)
 		VALUES ($12::uuid, $2::uuid, 'member');
 

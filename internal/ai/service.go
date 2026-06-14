@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -25,10 +26,13 @@ var (
 const (
 	maxAIMessageLength = 20000
 	maxAITitleLength   = 120
+	maxAIModelLength   = 128
 	maxAIContextChunks = 8
 	maxAIContextChars  = 12000
 	temporaryFileTTL   = 24 * time.Hour
 )
+
+var aiModelPattern = regexp.MustCompile(`^[A-Za-z0-9._:/@+-]{1,128}$`)
 
 type Service struct {
 	cfg    config.AIConfig
@@ -41,6 +45,7 @@ type CreateConversationInput struct {
 	UserID       string
 	Title        *string
 	FirstMessage *string
+	Model        string
 }
 
 type UpdateConversationTitleInput struct {
@@ -55,6 +60,9 @@ type SendMessageInput struct {
 	Message         string
 	ClientMessageID string
 	AIFileIDs       []string
+	Model           string
+	ThinkingType    string
+	ReasoningEffort string
 }
 
 type SendMessageResult struct {
@@ -71,7 +79,8 @@ type StreamMessageInput struct {
 }
 
 type StreamMessageDelta struct {
-	Content string
+	Content  string
+	Thinking bool
 }
 
 type StreamMessageResult struct {
@@ -117,6 +126,10 @@ func (s *Service) CreateConversation(ctx context.Context, input CreateConversati
 		fallbackTitle := fallbackConversationTitle(firstMessage)
 		title = &fallbackTitle
 	}
+	model, err := normalizeAIModel(input.Model, s.cfg.DefaultModel)
+	if err != nil {
+		return repository.AIConversation{}, err
+	}
 
 	var conversation repository.AIConversation
 	if s.tx != nil {
@@ -124,7 +137,7 @@ func (s *Service) CreateConversation(ctx context.Context, input CreateConversati
 			created, err := repos.AI.CreateConversation(ctx, repository.CreateAIConversationParams{
 				UserID:           input.UserID,
 				Title:            title,
-				Model:            s.cfg.DefaultModel,
+				Model:            model,
 				ContextMaxTokens: s.cfg.MaxContextTokens,
 			})
 			if err != nil {
@@ -149,7 +162,7 @@ func (s *Service) CreateConversation(ctx context.Context, input CreateConversati
 	created, err := s.repos.AI.CreateConversation(ctx, repository.CreateAIConversationParams{
 		UserID:           input.UserID,
 		Title:            title,
-		Model:            s.cfg.DefaultModel,
+		Model:            model,
 		ContextMaxTokens: s.cfg.MaxContextTokens,
 	})
 	if err != nil {
@@ -213,8 +226,8 @@ func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (Send
 	completion, err := s.client.Complete(providerCtx, CompletionRequest{
 		Model:           prepared.model,
 		Messages:        prepared.messages,
-		ThinkingType:    s.cfg.ThinkingType,
-		ReasoningEffort: s.cfg.ReasoningEffort,
+		ThinkingType:    prepared.thinkingType,
+		ReasoningEffort: prepared.reasoningEffort,
 	})
 	if err != nil {
 		return SendMessageResult{}, err
@@ -249,13 +262,13 @@ func (s *Service) StreamMessage(ctx context.Context, input StreamMessageInput) (
 	completion, err := s.client.Stream(providerCtx, CompletionRequest{
 		Model:           prepared.model,
 		Messages:        prepared.messages,
-		ThinkingType:    s.cfg.ThinkingType,
-		ReasoningEffort: s.cfg.ReasoningEffort,
+		ThinkingType:    prepared.thinkingType,
+		ReasoningEffort: prepared.reasoningEffort,
 	}, func(delta CompletionStreamDelta) error {
-		if input.OnDelta == nil || delta.Content == "" {
+		if input.OnDelta == nil || (!delta.Thinking && delta.Content == "") {
 			return nil
 		}
-		if err := input.OnDelta(StreamMessageDelta{Content: delta.Content}); err != nil {
+		if err := input.OnDelta(StreamMessageDelta{Content: delta.Content, Thinking: delta.Thinking}); err != nil {
 			return streamDeliveryError{err: err}
 		}
 		return nil
@@ -365,14 +378,16 @@ func isStreamDeliveryError(err error) bool {
 }
 
 type preparedMessageCompletion struct {
-	conversation repository.AIConversation
-	userMessage  repository.AIMessage
-	usedFiles    []repository.AIUploadedFile
-	model        string
-	messages     []ChatMessage
-	firstRound   bool
-	autoTitle    bool
-	titleInput   string
+	conversation    repository.AIConversation
+	userMessage     repository.AIMessage
+	usedFiles       []repository.AIUploadedFile
+	model           string
+	thinkingType    string
+	reasoningEffort string
+	messages        []ChatMessage
+	firstRound      bool
+	autoTitle       bool
+	titleInput      string
 }
 
 func (s *Service) prepareMessageCompletion(ctx context.Context, input SendMessageInput) (preparedMessageCompletion, error) {
@@ -443,15 +458,29 @@ func (s *Service) prepareMessageCompletion(ctx context.Context, input SendMessag
 	if conversation.Model != nil && strings.TrimSpace(*conversation.Model) != "" {
 		model = strings.TrimSpace(*conversation.Model)
 	}
+	model, err = normalizeAIModel(input.Model, model)
+	if err != nil {
+		return preparedMessageCompletion{}, err
+	}
+	thinkingType, err := normalizeThinkingType(input.ThinkingType, s.cfg.ThinkingType)
+	if err != nil {
+		return preparedMessageCompletion{}, err
+	}
+	reasoningEffort, err := normalizeReasoningEffort(input.ReasoningEffort, s.cfg.ReasoningEffort)
+	if err != nil {
+		return preparedMessageCompletion{}, err
+	}
 	return preparedMessageCompletion{
-		conversation: conversation,
-		userMessage:  userMessage,
-		usedFiles:    usedFiles,
-		model:        model,
-		messages:     makeCompletionMessages(history, contextChunks),
-		firstRound:   firstRound,
-		autoTitle:    autoTitle,
-		titleInput:   titleInput,
+		conversation:    conversation,
+		userMessage:     userMessage,
+		usedFiles:       usedFiles,
+		model:           model,
+		thinkingType:    thinkingType,
+		reasoningEffort: reasoningEffort,
+		messages:        makeCompletionMessages(history, contextChunks),
+		firstRound:      firstRound,
+		autoTitle:       autoTitle,
+		titleInput:      titleInput,
 	}, nil
 }
 
@@ -614,6 +643,43 @@ func mapRepositoryError(err error) error {
 		return repository.ErrConflict
 	default:
 		return err
+	}
+}
+
+func normalizeAIModel(value string, fallback string) (string, error) {
+	model := strings.TrimSpace(value)
+	if model == "" {
+		model = strings.TrimSpace(fallback)
+	}
+	if model == "" || len([]rune(model)) > maxAIModelLength || !aiModelPattern.MatchString(model) {
+		return "", ErrValidation
+	}
+	return model, nil
+}
+
+func normalizeThinkingType(value string, fallback string) (string, error) {
+	thinkingType := strings.TrimSpace(value)
+	if thinkingType == "" {
+		thinkingType = strings.TrimSpace(fallback)
+	}
+	switch thinkingType {
+	case "", "enabled", "disabled":
+		return thinkingType, nil
+	default:
+		return "", ErrValidation
+	}
+}
+
+func normalizeReasoningEffort(value string, fallback string) (string, error) {
+	reasoningEffort := strings.TrimSpace(value)
+	if reasoningEffort == "" {
+		reasoningEffort = strings.TrimSpace(fallback)
+	}
+	switch reasoningEffort {
+	case "", "low", "medium", "high", "max":
+		return reasoningEffort, nil
+	default:
+		return "", ErrValidation
 	}
 }
 

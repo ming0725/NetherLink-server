@@ -25,6 +25,7 @@ const (
 	maxGroupNicknameLength    = 64
 	maxGroupListNameLength    = 64
 	maxGroupJoinMessageLength = 256
+	groupPublicIDLength       = 10
 	groupRoleOwner            = "owner"
 	groupRoleAdmin            = "admin"
 	groupRoleMember           = "member"
@@ -138,13 +139,28 @@ func (s *Service) CreateGroup(ctx context.Context, input CreateGroupInput) (repo
 				return err
 			}
 		}
-		group, err := repos.Groups.Create(ctx, repository.CreateGroupParams{
-			Name:         name,
-			OwnerID:      input.UserID,
-			AvatarFileID: avatarFileID,
-		})
-		if err != nil {
-			return mapRepositoryError(err)
+		var group repository.Group
+		for i := 0; i < 8; i++ {
+			publicID, err := generateAvailableGroupPublicID(ctx, repos)
+			if err != nil {
+				return err
+			}
+			group, err = repos.Groups.Create(ctx, repository.CreateGroupParams{
+				PublicID:     publicID,
+				Name:         name,
+				OwnerID:      input.UserID,
+				AvatarFileID: avatarFileID,
+			})
+			if errors.Is(err, repository.ErrConflict) {
+				continue
+			}
+			if err != nil {
+				return mapRepositoryError(err)
+			}
+			break
+		}
+		if group.ID == "" {
+			return ErrConflict
 		}
 		groupID = group.ID
 		if avatarFileID != nil {
@@ -667,6 +683,46 @@ func validateOptionalText(value *string, maxRunes int, requiredWhenSet bool) (*s
 		return nil, ErrValidation
 	}
 	return &normalized, nil
+}
+
+func generateAvailableGroupPublicID(ctx context.Context, repos repository.Repositories) (string, error) {
+	if repos.Groups == nil {
+		return "", ErrUnavailable
+	}
+	for i := 0; i < 8; i++ {
+		publicID, err := randomNumericID(groupPublicIDLength)
+		if err != nil {
+			return "", err
+		}
+		exists, err := repos.Groups.PublicIDExists(ctx, publicID)
+		if err != nil {
+			return "", err
+		}
+		if !exists {
+			return publicID, nil
+		}
+	}
+	return "", ErrConflict
+}
+
+func randomNumericID(length int) (string, error) {
+	if length <= 0 {
+		return "", ErrValidation
+	}
+	digits := make([]byte, length)
+	first, err := rand.Int(rand.Reader, big.NewInt(9))
+	if err != nil {
+		return "", err
+	}
+	digits[0] = byte('1' + first.Int64())
+	for i := 1; i < length; i++ {
+		value, err := rand.Int(rand.Reader, big.NewInt(10))
+		if err != nil {
+			return "", err
+		}
+		digits[i] = byte('0' + value.Int64())
+	}
+	return string(digits), nil
 }
 
 func normalizedOptional(value *string) *string {

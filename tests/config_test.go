@@ -75,7 +75,7 @@ func TestConfigLoadAIProvider(t *testing.T) {
 	t.Setenv("NETHERLINK_AI_DEFAULT_MODEL", "test-model")
 	t.Setenv("NETHERLINK_AI_TITLE_MODEL", "test-title-model")
 	t.Setenv("NETHERLINK_AI_THINKING_TYPE", "enabled")
-	t.Setenv("NETHERLINK_AI_REASONING_EFFORT", "high")
+	t.Setenv("NETHERLINK_AI_REASONING_EFFORT", "max")
 	t.Setenv("NETHERLINK_AI_MAX_CONTEXT_TOKENS", "8192")
 	t.Setenv("NETHERLINK_AI_REQUEST_TIMEOUT", "45s")
 
@@ -95,8 +95,8 @@ func TestConfigLoadAIProvider(t *testing.T) {
 	if cfg.AI.ThinkingType != "enabled" {
 		t.Fatalf("ai thinking type = %q, want enabled", cfg.AI.ThinkingType)
 	}
-	if cfg.AI.ReasoningEffort != "high" {
-		t.Fatalf("ai reasoning effort = %q, want high", cfg.AI.ReasoningEffort)
+	if cfg.AI.ReasoningEffort != "max" {
+		t.Fatalf("ai reasoning effort = %q, want max", cfg.AI.ReasoningEffort)
 	}
 	if cfg.AI.MaxContextTokens != 8192 {
 		t.Fatalf("ai max context tokens = %d, want 8192", cfg.AI.MaxContextTokens)
@@ -134,7 +134,7 @@ func TestConfigLoadAIProviderRejectsMalformedReasoningSettings(t *testing.T) {
 	if !strings.Contains(err.Error(), "NETHERLINK_AI_THINKING_TYPE must be enabled or disabled") {
 		t.Fatalf("Load() error = %q, want thinking type error", err)
 	}
-	if !strings.Contains(err.Error(), "NETHERLINK_AI_REASONING_EFFORT must be low, medium, or high") {
+	if !strings.Contains(err.Error(), "NETHERLINK_AI_REASONING_EFFORT must be low, medium, high, or max") {
 		t.Fatalf("Load() error = %q, want reasoning effort error", err)
 	}
 }

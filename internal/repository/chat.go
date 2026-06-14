@@ -125,6 +125,7 @@ type ConversationUserSummary struct {
 
 type ConversationGroupSummary struct {
 	ID            string
+	PublicID      string
 	Name          string
 	OwnerID       string
 	AvatarFileID  *string
@@ -224,6 +225,7 @@ func (r *ChatRepository) ListConversationsForUser(ctx context.Context, userID st
 		    $2 = ''
 		    OR peer.public_id ILIKE '%' || $2 || '%'
 		    OR peer.nick ILIKE '%' || $2 || '%'
+		    OR g.public_id ILIKE '%' || $2 || '%'
 		    OR g.name ILIKE '%' || $2 || '%'
 		  )
 		ORDER BY cp.is_pinned DESC, COALESCE(c.last_message_at, c.updated_at) DESC, c.created_at DESC
@@ -1039,6 +1041,7 @@ func conversationEntrySelectSQL() string {
 			peer.version,
 			peer.updated_at,
 			g.id,
+			g.public_id,
 			g.name,
 			g.owner_id,
 			g.avatar_file_id,
@@ -1128,6 +1131,7 @@ func scanConversationEntry(row scanner) (ConversationEntry, error) {
 		peerUpdatedAt    pgtype.Timestamptz
 
 		entryGroupID           pgtype.UUID
+		groupPublicID          sql.NullString
 		groupName              sql.NullString
 		groupOwnerID           pgtype.UUID
 		groupAvatarFileID      pgtype.UUID
@@ -1189,6 +1193,7 @@ func scanConversationEntry(row scanner) (ConversationEntry, error) {
 		&peerVersion,
 		&peerUpdatedAt,
 		&entryGroupID,
+		&groupPublicID,
 		&groupName,
 		&groupOwnerID,
 		&groupAvatarFileID,
@@ -1267,6 +1272,7 @@ func scanConversationEntry(row scanner) (ConversationEntry, error) {
 	if entryGroupID.Valid {
 		group := ConversationGroupSummary{
 			ID:            uuidString(entryGroupID),
+			PublicID:      groupPublicID.String,
 			Name:          groupName.String,
 			OwnerID:       uuidString(groupOwnerID),
 			AvatarFileID:  uuidStringPtr(groupAvatarFileID),

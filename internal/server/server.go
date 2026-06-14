@@ -222,6 +222,7 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/v1/friend-requests/{requestId}/reject", s.withAuthRequired(http.HandlerFunc(s.handleRejectFriendRequest)))
 	mux.Handle("GET /api/v1/groups", s.withAuthRequired(http.HandlerFunc(s.handleGroups)))
 	mux.Handle("POST /api/v1/groups", s.withAuthRequired(http.HandlerFunc(s.handleCreateGroup)))
+	mux.Handle("GET /api/v1/groups/by-id", s.withAuthRequired(http.HandlerFunc(s.handleGroupByPublicID)))
 	mux.Handle("GET /api/v1/groups/{groupId}", s.withAuthRequired(http.HandlerFunc(s.handleGroupDetail)))
 	mux.Handle("PATCH /api/v1/groups/{groupId}", s.withAuthRequired(http.HandlerFunc(s.handlePatchGroup)))
 	mux.Handle("DELETE /api/v1/groups/{groupId}", s.withAuthRequired(http.HandlerFunc(s.handleDeleteGroup)))

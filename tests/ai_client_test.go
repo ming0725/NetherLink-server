@@ -149,3 +149,51 @@ func TestOpenAICompatibleClientStreamParsesSSEChunks(t *testing.T) {
 		t.Fatalf("stream = %v, want true", captured["stream"])
 	}
 }
+
+func TestOpenAICompatibleClientStreamReportsReasoningWithoutLeakingText(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private chain of thought\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}],\"usage\":{\"total_tokens\":5}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	client, err := ai.NewChatClient(config.AIConfig{
+		Provider:       "openai-compatible",
+		APIKey:         "test-key",
+		BaseURL:        server.URL,
+		RequestTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewChatClient() error = %v", err)
+	}
+
+	var deltas []ai.CompletionStreamDelta
+	output, err := client.Stream(context.Background(), ai.CompletionRequest{
+		Model:    "mock-model",
+		Messages: []ai.ChatMessage{{Role: "user", Content: "stream"}},
+	}, func(delta ai.CompletionStreamDelta) error {
+		deltas = append(deltas, delta)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+
+	if output.Content != "answer" {
+		t.Fatalf("Content = %q, want answer", output.Content)
+	}
+	if len(deltas) != 2 {
+		t.Fatalf("len(deltas) = %d, want 2", len(deltas))
+	}
+	if !deltas[0].Thinking || deltas[0].Content != "" {
+		t.Fatalf("reasoning delta = %#v, want thinking-only delta", deltas[0])
+	}
+	if strings.Contains(deltas[0].Content, "private chain of thought") {
+		t.Fatalf("reasoning text leaked in content: %#v", deltas[0])
+	}
+	if deltas[1].Thinking || deltas[1].Content != "answer" {
+		t.Fatalf("answer delta = %#v, want content-only answer", deltas[1])
+	}
+}

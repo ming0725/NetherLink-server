@@ -11,6 +11,17 @@ func (s *Server) publishSelfRealtimeEvent(ctx context.Context, userID string, ev
 
 func (s *Server) publishPresenceRealtimeEvent(ctx context.Context, userID string, status string, lastSeenAt time.Time) {
 	s.publishRealtimeEvent(ctx, []string{userID}, "presence.updated", makePresenceUpdatedPayload(userID, status, lastSeenAt))
+	s.publishPresenceRealtimeEventToFriends(ctx, userID, status, lastSeenAt)
+}
+
+func (s *Server) publishPresenceConnectRealtimeEvent(ctx context.Context, userID string, status string, lastSeenAt time.Time) {
+	s.publishRealtimeEvent(ctx, []string{userID}, "presence.updated", makePresenceUpdatedPayload(userID, status, lastSeenAt))
+	if status != "invisible" {
+		s.publishPresenceRealtimeEventToFriends(ctx, userID, status, lastSeenAt)
+	}
+}
+
+func (s *Server) publishPresenceRealtimeEventToFriends(ctx context.Context, userID string, status string, lastSeenAt time.Time) {
 	if s.repos.Friends != nil {
 		friendUserIDs, err := s.repos.Friends.ListActiveFriendUserIDs(ctx, userID)
 		if err != nil {

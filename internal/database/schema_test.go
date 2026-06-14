@@ -18,6 +18,8 @@ func TestEnsureRuntimeSchemaAddsCompatibilityColumns(t *testing.T) {
 	for _, want := range []string{
 		"ALTER TABLE users ADD COLUMN IF NOT EXISTS presence_status",
 		"ALTER TABLE groups ADD COLUMN IF NOT EXISTS avatar_version",
+		"ALTER TABLE groups ADD COLUMN IF NOT EXISTS public_id",
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_public_id_unique",
 	} {
 		if !db.executed(want) {
 			t.Fatalf("missing schema statement containing %q; statements = %v", want, db.statements)

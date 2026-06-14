@@ -19,6 +19,7 @@ type GroupRepository struct {
 const groupJoinRequestSelectColumns = `
 	gjr.id,
 	g.id,
+	g.public_id,
 	g.name,
 	g.owner_id,
 	g.avatar_file_id,
@@ -70,6 +71,7 @@ const groupJoinRequestSelectColumns = `
 
 type Group struct {
 	ID            string
+	PublicID      string
 	Name          string
 	OwnerID       string
 	AvatarFileID  *string
@@ -128,6 +130,7 @@ type GroupJoinRequest struct {
 }
 
 type CreateGroupParams struct {
+	PublicID     string
 	Name         string
 	OwnerID      string
 	AvatarFileID *string
@@ -173,10 +176,11 @@ func NewGroupRepository(db DBTX) *GroupRepository {
 
 func (r *GroupRepository) Create(ctx context.Context, params CreateGroupParams) (Group, error) {
 	group, err := scanGroup(r.db.QueryRow(ctx, `
-		INSERT INTO groups (name, owner_id, avatar_file_id)
-		VALUES ($1, $2::uuid, $3::uuid)
+		INSERT INTO groups (public_id, name, owner_id, avatar_file_id)
+		VALUES ($1, $2, $3::uuid, $4::uuid)
 		RETURNING
 			id,
+			public_id,
 			name,
 			owner_id,
 			avatar_file_id,
@@ -186,6 +190,7 @@ func (r *GroupRepository) Create(ctx context.Context, params CreateGroupParams) 
 			version,
 			created_at,
 			updated_at`,
+		normalizeText(params.PublicID),
 		normalizeText(params.Name),
 		normalizeText(params.OwnerID),
 		normalizeTextPtr(params.AvatarFileID),
@@ -197,6 +202,7 @@ func (r *GroupRepository) Get(ctx context.Context, groupID string) (Group, error
 	group, err := scanGroup(r.db.QueryRow(ctx, `
 		SELECT
 			id,
+			public_id,
 			name,
 			owner_id,
 			avatar_file_id,
@@ -212,6 +218,42 @@ func (r *GroupRepository) Get(ctx context.Context, groupID string) (Group, error
 		normalizeText(groupID),
 	))
 	return group, translateReadError(err)
+}
+
+func (r *GroupRepository) GetByPublicID(ctx context.Context, publicID string) (Group, error) {
+	group, err := scanGroup(r.db.QueryRow(ctx, `
+		SELECT
+			id,
+			public_id,
+			name,
+			owner_id,
+			avatar_file_id,
+			avatar_version,
+			introduction,
+			announcement,
+			version,
+			created_at,
+			updated_at
+		FROM groups
+		WHERE public_id = $1
+		  AND deleted_at IS NULL`,
+		normalizeText(publicID),
+	))
+	return group, translateReadError(err)
+}
+
+func (r *GroupRepository) PublicIDExists(ctx context.Context, publicID string) (bool, error) {
+	var exists bool
+	err := r.db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM groups
+			WHERE public_id = $1
+			  AND deleted_at IS NULL
+		)`,
+		normalizeText(publicID),
+	).Scan(&exists)
+	return exists, translateReadError(err)
 }
 
 func (r *GroupRepository) Update(ctx context.Context, params UpdateGroupParams) (Group, error) {
@@ -238,6 +280,7 @@ func (r *GroupRepository) Update(ctx context.Context, params UpdateGroupParams) 
 		  AND deleted_at IS NULL
 		RETURNING
 			id,
+			public_id,
 			name,
 			owner_id,
 			avatar_file_id,
@@ -425,6 +468,7 @@ func (r *GroupRepository) UpdateOwner(ctx context.Context, groupID string, owner
 		  AND deleted_at IS NULL
 		RETURNING
 			id,
+			public_id,
 			name,
 			owner_id,
 			avatar_file_id,
@@ -652,6 +696,7 @@ func (r *GroupRepository) ListForUser(ctx context.Context, userID string, keywor
 	rows, err := r.db.Query(ctx, `
 		SELECT
 			g.id,
+			g.public_id,
 			g.name,
 			g.owner_id,
 			g.avatar_file_id,
@@ -680,7 +725,7 @@ func (r *GroupRepository) ListForUser(ctx context.Context, userID string, keywor
 		 AND gus.user_id = $1::uuid
 		WHERE gm.user_id = $1::uuid
 		  AND g.deleted_at IS NULL
-		  AND ($2 = '' OR g.name ILIKE '%' || $2 || '%' OR gus.remark ILIKE '%' || $2 || '%')
+		  AND ($2 = '' OR g.public_id ILIKE '%' || $2 || '%' OR g.name ILIKE '%' || $2 || '%' OR gus.remark ILIKE '%' || $2 || '%')
 		  AND ($3 = '' OR gus.list_group_id = NULLIF($3, '')::uuid)
 		  AND (
 		    $4 = ''
@@ -724,6 +769,7 @@ func (r *GroupRepository) GetForUser(ctx context.Context, userID string, groupID
 	entry, _, err := scanGroupListEntry(r.db.QueryRow(ctx, `
 		SELECT
 			g.id,
+			g.public_id,
 			g.name,
 			g.owner_id,
 			g.avatar_file_id,
@@ -755,6 +801,47 @@ func (r *GroupRepository) GetForUser(ctx context.Context, userID string, groupID
 		  AND g.deleted_at IS NULL`,
 		normalizeText(userID),
 		normalizeText(groupID),
+	))
+	return entry, translateReadError(err)
+}
+
+func (r *GroupRepository) GetByPublicIDForUser(ctx context.Context, userID string, publicID string) (GroupListEntry, error) {
+	entry, _, err := scanGroupListEntry(r.db.QueryRow(ctx, `
+		SELECT
+			g.id,
+			g.public_id,
+			g.name,
+			g.owner_id,
+			g.avatar_file_id,
+			g.avatar_version,
+			g.introduction,
+			g.announcement,
+			g.version,
+			g.created_at,
+			g.updated_at,
+			COALESCE(gm.role, '') AS role,
+			gm.nickname,
+			COALESCE(gm.is_dnd, false) AS is_dnd,
+			gus.remark,
+			gus.list_group_id,
+			gus.list_group_name,
+			(
+			  SELECT count(*)::int
+			  FROM group_members member_count
+			  WHERE member_count.group_id = g.id
+			) AS member_count,
+			1 AS total_count
+		FROM groups g
+		LEFT JOIN group_members gm
+		  ON gm.group_id = g.id
+		 AND gm.user_id = $1::uuid
+		LEFT JOIN group_user_settings gus
+		  ON gus.group_id = g.id
+		 AND gus.user_id = $1::uuid
+		WHERE g.public_id = $2
+		  AND g.deleted_at IS NULL`,
+		normalizeText(userID),
+		normalizeText(publicID),
 	))
 	return entry, translateReadError(err)
 }
@@ -1009,6 +1096,7 @@ func scanGroupListEntry(row scanner) (GroupListEntry, int, error) {
 
 	err := row.Scan(
 		&groupID,
+		&entry.Group.PublicID,
 		&entry.Group.Name,
 		&ownerID,
 		&avatarFileID,
@@ -1066,6 +1154,7 @@ func scanGroup(row scanner) (Group, error) {
 
 	err := row.Scan(
 		&groupID,
+		&group.PublicID,
 		&group.Name,
 		&ownerID,
 		&avatarFileID,
@@ -1266,6 +1355,7 @@ func (s *groupJoinRequestScanState) dest() []any {
 	return []any{
 		&s.requestID,
 		&s.groupID,
+		&s.request.Group.PublicID,
 		&s.request.Group.Name,
 		&s.groupOwnerID,
 		&s.groupAvatarFileID,

@@ -123,6 +123,7 @@ type patchGroupMySettingsRequest struct {
 
 type createGroupJoinRequestRequest struct {
 	GroupID           string  `json:"groupId"`
+	GroupPublicID     string  `json:"groupPublicId"`
 	Message           *string `json:"message"`
 	ClientOperationID string  `json:"clientOperationId"`
 }
@@ -255,6 +256,7 @@ type groupSettingsDetailResponse struct {
 
 type groupResponse struct {
 	GroupID           string    `json:"groupId"`
+	GroupPublicID     string    `json:"groupPublicId"`
 	Name              string    `json:"name"`
 	OwnerUUID         string    `json:"ownerUuid"`
 	AvatarURL         *string   `json:"avatarUrl"`
@@ -1170,6 +1172,28 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, groupsResponse{Groups: makeGroupResponses(groups), Total: total})
 }
 
+func (s *Server) handleGroupByPublicID(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authPrincipalFromContext(r.Context())
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "TOKEN_INVALID", "Invalid access token")
+		return
+	}
+
+	groupPublicID := r.URL.Query().Get("groupPublicId")
+	if reqErr := validateGroupPublicID(groupPublicID, "groupPublicId"); reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+
+	group, err := s.repos.Groups.GetByPublicIDForUser(r.Context(), principal.UserID, groupPublicID)
+	if err != nil {
+		writeRepositoryError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupDetailResponse{Group: makeGroupResponse(group)})
+}
+
 func (s *Server) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
 	if !s.requireGroupService(w, r) {
 		return
@@ -1734,17 +1758,23 @@ func (s *Server) handleCreateGroupJoinRequest(w http.ResponseWriter, r *http.Req
 		writeRequestError(w, r, err)
 		return
 	}
-	if err := validateUUID(req.GroupID, "groupId"); err != nil {
-		writeRequestError(w, r, err)
+
+	groupID, reqErr, repoErr := s.resolveGroupJoinRequestGroupID(r.Context(), req)
+	if reqErr != nil {
+		writeRequestError(w, r, reqErr)
+		return
+	}
+	if repoErr != nil {
+		writeRepositoryError(w, r, repoErr)
 		return
 	}
 
-	s.handleIdempotentWrite(w, r, principal.UserID, "group.join_request.create:"+req.GroupID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
+	s.handleIdempotentWrite(w, r, principal.UserID, "group.join_request.create:"+groupID, idempotencyKeyFromRequest(r, req.ClientOperationID), func(err error) {
 		writeGroupServiceError(w, r, err)
 	}, func() (idempotentHTTPResult, error) {
 		request, err := s.groupService.CreateJoinRequest(r.Context(), groupsvc.CreateJoinRequestInput{
 			UserID:  principal.UserID,
-			GroupID: req.GroupID,
+			GroupID: groupID,
 			Message: req.Message,
 		})
 		if err != nil {
@@ -1771,6 +1801,39 @@ func (s *Server) handleCreateGroupJoinRequest(w http.ResponseWriter, r *http.Req
 			},
 		}, nil
 	})
+}
+
+func (s *Server) resolveGroupJoinRequestGroupID(ctx context.Context, req createGroupJoinRequestRequest) (string, *requestError, error) {
+	groupID := strings.TrimSpace(req.GroupID)
+	groupPublicID := strings.TrimSpace(req.GroupPublicID)
+	if groupID == "" && groupPublicID == "" {
+		return "", &requestError{
+			Status:  http.StatusBadRequest,
+			Code:    "VALIDATION_ERROR",
+			Message: "groupId or groupPublicId is required",
+		}, nil
+	}
+	if groupID != "" && groupPublicID != "" {
+		return "", &requestError{
+			Status:  http.StatusBadRequest,
+			Code:    "VALIDATION_ERROR",
+			Message: "use either groupId or groupPublicId, not both",
+		}, nil
+	}
+	if groupID != "" {
+		if err := validateUUID(groupID, "groupId"); err != nil {
+			return "", err, nil
+		}
+		return groupID, nil, nil
+	}
+	if err := validateGroupPublicID(groupPublicID, "groupPublicId"); err != nil {
+		return "", err, nil
+	}
+	group, err := s.repos.Groups.GetByPublicID(ctx, groupPublicID)
+	if err != nil {
+		return "", nil, err
+	}
+	return group.ID, nil, nil
 }
 
 func (s *Server) handleGroupNotifications(w http.ResponseWriter, r *http.Request) {
@@ -2070,6 +2133,7 @@ func makeGroupResponses(groups []repository.GroupListEntry) []groupResponse {
 func makeGroupResponse(entry repository.GroupListEntry) groupResponse {
 	return groupResponse{
 		GroupID:           entry.Group.ID,
+		GroupPublicID:     entry.Group.PublicID,
 		Name:              entry.Group.Name,
 		OwnerUUID:         entry.Group.OwnerID,
 		AvatarURL:         avatarContentURL(entry.Group.AvatarFileID),

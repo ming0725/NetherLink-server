@@ -190,6 +190,7 @@ CREATE TABLE friend_requests (
 
 CREATE TABLE groups (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  public_id TEXT NOT NULL UNIQUE,
   name TEXT NOT NULL,
   owner_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
   avatar_file_id UUID REFERENCES files(id) ON DELETE SET NULL,
@@ -512,6 +513,7 @@ CREATE TABLE operation_receipts (
 );
 
 CREATE INDEX idx_users_public_id ON users(public_id);
+CREATE INDEX idx_groups_public_id ON groups(public_id);
 CREATE INDEX idx_users_email ON users(email);
 CREATE INDEX idx_files_owner_user_id ON files(owner_user_id);
 CREATE INDEX idx_files_cleanup_status_updated ON files(storage_status, updated_at) WHERE deleted_at IS NULL;

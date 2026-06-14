@@ -103,6 +103,9 @@ type websocketAIMessagePayload struct {
 	Message         string   `json:"message"`
 	ClientMessageID string   `json:"clientMessageId"`
 	AIFileIDs       []string `json:"aiFileIds"`
+	Model           string   `json:"model"`
+	ThinkingType    string   `json:"thinkingType"`
+	ReasoningEffort string   `json:"reasoningEffort"`
 }
 
 type websocketAIStreamCancelPayload struct {
@@ -118,6 +121,11 @@ type websocketAIStreamStartedPayload struct {
 type websocketAIStreamChunkPayload struct {
 	StreamID string `json:"streamId"`
 	Delta    string `json:"delta"`
+}
+
+type websocketAIStreamThinkingPayload struct {
+	StreamID string `json:"streamId"`
+	Active   bool   `json:"active"`
 }
 
 type websocketAIStreamDonePayload struct {
@@ -211,6 +219,7 @@ func (s *Server) serveWebSocket(ctx context.Context, conn *websocket.Conn, princ
 		replay = durableReplay
 		syncRequired = durableSyncRequired
 	}
+	replay = filterSelfOfflinePresenceEvents(principal.UserID, replay)
 
 	s.realtimeHub.Send(connection, "realtime.ready", websocketReadyPayload{
 		ConnectionID: connection.ID(),
@@ -348,6 +357,7 @@ func (s *Server) handleWebSocketResume(ctx context.Context, conn *realtime.Conne
 		})
 		return
 	}
+	replay = filterSelfOfflinePresenceEvents(principal.UserID, replay)
 
 	s.realtimeHub.Send(conn, "event.replay", websocketEventReplayPayload{
 		LastEventSeq: lastEventSeq,
@@ -497,7 +507,7 @@ func (s *Server) handleWebSocketPresenceUpdate(ctx context.Context, conn *realti
 		s.sendWebSocketError(conn, "presence.update", "VALIDATION_ERROR", "Invalid presence payload")
 		return
 	}
-	status := normalizePresenceStatus(req.Status)
+	status := normalizeSelectablePresenceStatus(req.Status)
 	if status == "" {
 		s.sendWebSocketError(conn, "presence.update", "VALIDATION_ERROR", "Invalid presence status")
 		return
@@ -538,7 +548,7 @@ func (s *Server) handleWebSocketPresenceConnect(ctx context.Context, userID stri
 		}
 	}
 	state := s.realtimeHub.SetPresence(userID, status, now)
-	s.publishPresenceRealtimeEvent(ctx, userID, state.Status, state.LastSeenAt)
+	s.publishPresenceConnectRealtimeEvent(ctx, userID, state.Status, state.LastSeenAt)
 }
 
 func (s *Server) handleWebSocketPresenceDisconnect(ctx context.Context, userID string) {
@@ -557,7 +567,7 @@ func (s *Server) handleWebSocketPresenceDisconnect(ctx context.Context, userID s
 		}
 	}
 	state := s.realtimeHub.SetPresence(userID, "offline", now)
-	s.publishPresenceRealtimeEvent(ctx, userID, state.Status, state.LastSeenAt)
+	s.publishPresenceRealtimeEventToFriends(ctx, userID, state.Status, state.LastSeenAt)
 }
 
 func (s *Server) persistedPresenceStatus(ctx context.Context, userID string) string {
@@ -569,7 +579,7 @@ func (s *Server) persistedPresenceStatus(ctx context.Context, userID string) str
 		s.logger.WarnContext(ctx, "failed to load persisted presence status", "error", err, "user_id", userID)
 		return ""
 	}
-	return normalizePresenceStatus(user.PresenceStatus)
+	return normalizeSelectablePresenceStatus(user.PresenceStatus)
 }
 
 func makePresenceUpdatedPayload(userID string, status string, lastSeenAt time.Time) websocketPresenceUpdatedPayload {
@@ -578,6 +588,31 @@ func makePresenceUpdatedPayload(userID string, status string, lastSeenAt time.Ti
 		Status:     status,
 		LastSeenAt: lastSeenAt,
 	}
+}
+
+func filterSelfOfflinePresenceEvents(userID string, events []realtime.Event) []realtime.Event {
+	if userID == "" || len(events) == 0 {
+		return events
+	}
+	filtered := events[:0]
+	for _, event := range events {
+		if isSelfOfflinePresenceEvent(userID, event) {
+			continue
+		}
+		filtered = append(filtered, event)
+	}
+	return filtered
+}
+
+func isSelfOfflinePresenceEvent(userID string, event realtime.Event) bool {
+	if event.Type != "presence.updated" {
+		return false
+	}
+	var payload websocketPresenceUpdatedPayload
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return false
+	}
+	return payload.UserUUID == userID && payload.Status == "offline"
 }
 
 func externallyVisiblePresenceStatus(status string) string {
@@ -711,6 +746,14 @@ func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connec
 			s.aiStreams.Remove(streamID)
 		}
 	}()
+	thinkingActive := false
+	sendThinking := func(active bool) {
+		if thinkingActive == active {
+			return
+		}
+		thinkingActive = active
+		s.sendWebSocketAIThinking(conn, streamID, active)
+	}
 	result, err := s.aiService.StreamMessage(ctx, aisvc.StreamMessageInput{
 		SendMessageInput: aisvc.SendMessageInput{
 			UserID:          principal.UserID,
@@ -718,6 +761,9 @@ func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connec
 			Message:         req.Message,
 			ClientMessageID: req.ClientMessageID,
 			AIFileIDs:       req.AIFileIDs,
+			Model:           req.Model,
+			ThinkingType:    req.ThinkingType,
+			ReasoningEffort: req.ReasoningEffort,
 		},
 		OnDelta: func(delta aisvc.StreamMessageDelta) error {
 			select {
@@ -725,6 +771,13 @@ func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connec
 				return context.Canceled
 			default:
 			}
+			if delta.Thinking {
+				sendThinking(true)
+			}
+			if delta.Content == "" {
+				return nil
+			}
+			sendThinking(false)
 			s.realtimeHub.Send(conn, "ai.stream.chunk", websocketAIStreamChunkPayload{
 				StreamID: streamID,
 				Delta:    delta.Content,
@@ -740,11 +793,13 @@ func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connec
 				s.logger.WarnContext(completeCtx, "failed to complete cancelled AI websocket stream receipt", "error", err, "operation_type", receiptClaim.OperationType)
 			}
 			completeCancel()
+			sendThinking(false)
 			s.realtimeHub.Send(conn, "ai.stream.cancelled", makeWebSocketAIStreamCancelledPayload(cancelled))
 			return
 		}
 		s.deleteAIStreamReceipt(principal.UserID, receiptClaim)
 		code, message := aiErrorCodeAndMessage(err)
+		sendThinking(false)
 		s.sendWebSocketError(conn, "ai.message.send", code, message)
 		return
 	}
@@ -761,7 +816,15 @@ func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connec
 		s.logger.WarnContext(completeCtx, "failed to complete AI websocket stream receipt", "error", err, "operation_type", receiptClaim.OperationType)
 	}
 	completeCancel()
+	sendThinking(false)
 	s.realtimeHub.Send(conn, "ai.stream.done", makeWebSocketAIStreamDonePayload(done))
+}
+
+func (s *Server) sendWebSocketAIThinking(conn *realtime.Connection, streamID string, active bool) {
+	s.realtimeHub.Send(conn, "ai.stream.thinking", websocketAIStreamThinkingPayload{
+		StreamID: streamID,
+		Active:   active,
+	})
 }
 
 func (s *Server) handleWebSocketAIStreamCancel(conn *realtime.Connection, principal AuthPrincipal, payload json.RawMessage) {
@@ -841,6 +904,14 @@ func normalizePresenceStatus(value string) string {
 	default:
 		return ""
 	}
+}
+
+func normalizeSelectablePresenceStatus(value string) string {
+	status := normalizePresenceStatus(value)
+	if status == "offline" {
+		return ""
+	}
+	return status
 }
 
 func (s *Server) publishRealtimeEvent(ctx context.Context, userIDs []string, eventType string, payload any) realtime.Event {
