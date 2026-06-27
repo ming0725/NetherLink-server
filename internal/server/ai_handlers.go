@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	aisvc "nlserver/internal/ai"
+	aisvc "nlserver/internal/agent/conversation"
 	"nlserver/internal/repository"
 )
 
@@ -32,6 +32,7 @@ type aiSendMessageRequest struct {
 	Model           string   `json:"model"`
 	ThinkingType    string   `json:"thinkingType"`
 	ReasoningEffort string   `json:"reasoningEffort"`
+	Timezone        string   `json:"timezone"`
 }
 
 type aiBindFileRequest struct {
@@ -102,13 +103,28 @@ type aiStreamStartedResponse struct {
 }
 
 type aiStreamChunkResponse struct {
-	StreamID string `json:"streamId"`
-	Delta    string `json:"delta"`
+	StreamID     string `json:"streamId"`
+	Delta        string `json:"delta"`
+	Kind         string `json:"kind"`
+	Transient    bool   `json:"transient"`
+	StepID       string `json:"stepId,omitempty"`
+	SegmentID    string `json:"segmentId,omitempty"`
+	SegmentStart bool   `json:"segmentStart,omitempty"`
+	SegmentEnd   bool   `json:"segmentEnd,omitempty"`
 }
 
 type aiStreamThinkingResponse struct {
-	StreamID string `json:"streamId"`
-	Active   bool   `json:"active"`
+	StreamID    string   `json:"streamId"`
+	Active      bool     `json:"active"`
+	UserVisible bool     `json:"userVisible"`
+	StepID      string   `json:"stepId,omitempty"`
+	Sequence    int      `json:"sequence,omitempty"`
+	Phase       string   `json:"phase,omitempty"`
+	Status      string   `json:"status,omitempty"`
+	Message     string   `json:"message,omitempty"`
+	Tool        string   `json:"tool,omitempty"`
+	Query       string   `json:"query,omitempty"`
+	URLs        []string `json:"urls,omitempty"`
 }
 
 type aiStreamDoneResponse struct {
@@ -149,14 +165,25 @@ type aiConversationResponse struct {
 }
 
 type aiMessageResponse struct {
-	MessageID      string    `json:"messageId"`
-	ConversationID string    `json:"conversationId"`
-	Role           string    `json:"role"`
-	Text           string    `json:"text"`
-	TokenCount     int       `json:"tokenCount"`
-	Feedback       *string   `json:"feedback,omitempty"`
-	CreatedAt      time.Time `json:"createdAt"`
-	UpdatedAt      time.Time `json:"updatedAt"`
+	MessageID      string                  `json:"messageId"`
+	ConversationID string                  `json:"conversationId"`
+	Role           string                  `json:"role"`
+	Text           string                  `json:"text"`
+	TokenCount     int                     `json:"tokenCount"`
+	Feedback       *string                 `json:"feedback,omitempty"`
+	Trace          *aiMessageTraceResponse `json:"trace,omitempty"`
+	CreatedAt      time.Time               `json:"createdAt"`
+	UpdatedAt      time.Time               `json:"updatedAt"`
+}
+
+type aiMessageTraceResponse struct {
+	TraceID    string          `json:"traceId"`
+	Status     string          `json:"status"`
+	Summary    string          `json:"summary"`
+	Steps      json.RawMessage `json:"steps"`
+	SourceRefs json.RawMessage `json:"sourceRefs"`
+	CreatedAt  time.Time       `json:"createdAt"`
+	UpdatedAt  time.Time       `json:"updatedAt"`
 }
 
 type aiUploadedFileResponse struct {
@@ -347,6 +374,7 @@ func (s *Server) handleAISendMessage(w http.ResponseWriter, r *http.Request) {
 	s.handleIdempotentWrite(w, r, principal.UserID, "ai.message.send:"+conversationID, idempotencyKeyFromRequest(r, req.ClientMessageID), func(err error) {
 		writeAIServiceError(w, r, err)
 	}, func() (idempotentHTTPResult, error) {
+		startedAt := time.Now()
 		result, err := s.aiService.SendMessage(r.Context(), aisvc.SendMessageInput{
 			UserID:          principal.UserID,
 			ConversationID:  conversationID,
@@ -356,8 +384,24 @@ func (s *Server) handleAISendMessage(w http.ResponseWriter, r *http.Request) {
 			Model:           req.Model,
 			ThinkingType:    req.ThinkingType,
 			ReasoningEffort: req.ReasoningEffort,
+			UserTimezone:    req.Timezone,
 		})
 		if err != nil {
+			code, _ := aiErrorCodeAndMessage(err)
+			s.logAIMessageSendError(r.Context(), aiMessageSendErrorLogInput{
+				Transport:        "http",
+				Err:              err,
+				Code:             code,
+				UserID:           principal.UserID,
+				ConversationID:   conversationID,
+				ClientMessageID:  req.ClientMessageID,
+				Model:            req.Model,
+				ThinkingType:     req.ThinkingType,
+				ReasoningEffort:  req.ReasoningEffort,
+				AIFileCount:      len(req.AIFileIDs),
+				MessageRuneCount: len([]rune(req.Message)),
+				StartedAt:        startedAt,
+			})
 			return idempotentHTTPResult{}, err
 		}
 		return idempotentHTTPResult{
@@ -425,17 +469,29 @@ func (s *Server) handleAISendMessageStream(w http.ResponseWriter, r *http.Reques
 	}
 
 	thinkingActive := false
-	writeThinking := func(active bool) error {
-		if thinkingActive == active {
+	writeThinking := func(active bool, progress *aisvc.StreamProgress) error {
+		if thinkingActive == active && (!active || progress == nil) {
 			return nil
 		}
 		thinkingActive = active
-		return writeSSE(w, flusher, "ai.stream.thinking", aiStreamThinkingResponse{
+		payload := aiStreamThinkingResponse{
 			StreamID: streamID,
 			Active:   active,
-		})
+		}
+		if progress != nil {
+			payload.StepID = progress.StepID
+			payload.Sequence = progress.Sequence
+			payload.Phase = progress.Phase
+			payload.Status = progress.Status
+			payload.Message = progress.Message
+			payload.Tool = progress.Tool
+			payload.Query = progress.Query
+			payload.URLs = progress.URLs
+		}
+		return writeSSE(w, flusher, "ai.stream.thinking", payload)
 	}
 
+	startedAt := time.Now()
 	result, err := s.aiService.StreamMessage(streamCtx, aisvc.StreamMessageInput{
 		SendMessageInput: aisvc.SendMessageInput{
 			UserID:          principal.UserID,
@@ -446,6 +502,7 @@ func (s *Server) handleAISendMessageStream(w http.ResponseWriter, r *http.Reques
 			Model:           req.Model,
 			ThinkingType:    req.ThinkingType,
 			ReasoningEffort: req.ReasoningEffort,
+			UserTimezone:    req.Timezone,
 		},
 		OnDelta: func(delta aisvc.StreamMessageDelta) error {
 			select {
@@ -454,19 +511,27 @@ func (s *Server) handleAISendMessageStream(w http.ResponseWriter, r *http.Reques
 			default:
 			}
 			if delta.Thinking {
-				if err := writeThinking(true); err != nil {
+				if err := writeThinking(true, delta.Progress); err != nil {
 					return err
 				}
 			}
 			if delta.Content == "" {
 				return nil
 			}
-			if err := writeThinking(false); err != nil {
-				return err
+			if !delta.Transient {
+				if err := writeThinking(false, nil); err != nil {
+					return err
+				}
 			}
 			return writeSSE(w, flusher, "ai.stream.chunk", aiStreamChunkResponse{
-				StreamID: streamID,
-				Delta:    delta.Content,
+				StreamID:     streamID,
+				Delta:        delta.Content,
+				Kind:         streamChunkKind(delta),
+				Transient:    delta.Transient,
+				StepID:       delta.StepID,
+				SegmentID:    delta.SegmentID,
+				SegmentStart: delta.SegmentStart,
+				SegmentEnd:   delta.SegmentEnd,
 			})
 		},
 	})
@@ -478,13 +543,28 @@ func (s *Server) handleAISendMessageStream(w http.ResponseWriter, r *http.Reques
 				s.logger.WarnContext(completeCtx, "failed to complete cancelled AI stream receipt", "error", err, "operation_type", receiptClaim.OperationType)
 			}
 			completeCancel()
-			_ = writeThinking(false)
+			_ = writeThinking(false, nil)
 			_ = writeSSE(w, flusher, "ai.stream.cancelled", cancelled)
 			return
 		}
 		s.deleteAIStreamReceipt(principal.UserID, receiptClaim)
 		code, message := aiErrorCodeAndMessage(err)
-		_ = writeThinking(false)
+		s.logAIMessageSendError(r.Context(), aiMessageSendErrorLogInput{
+			Transport:        "sse",
+			Err:              err,
+			Code:             code,
+			UserID:           principal.UserID,
+			ConversationID:   conversationID,
+			ClientMessageID:  req.ClientMessageID,
+			StreamID:         streamID,
+			Model:            req.Model,
+			ThinkingType:     req.ThinkingType,
+			ReasoningEffort:  req.ReasoningEffort,
+			AIFileCount:      len(req.AIFileIDs),
+			MessageRuneCount: len([]rune(req.Message)),
+			StartedAt:        startedAt,
+		})
+		_ = writeThinking(false, nil)
 		_ = writeSSE(w, flusher, "client.error", aiStreamErrorResponse{
 			RequestType: "ai.message.send",
 			Code:        code,
@@ -506,7 +586,7 @@ func (s *Server) handleAISendMessageStream(w http.ResponseWriter, r *http.Reques
 		s.logger.WarnContext(completeCtx, "failed to complete AI stream receipt", "error", err, "operation_type", receiptClaim.OperationType)
 	}
 	completeCancel()
-	_ = writeThinking(false)
+	_ = writeThinking(false, nil)
 	_ = writeSSE(w, flusher, "ai.stream.done", done)
 }
 
@@ -529,6 +609,131 @@ func makeAIStreamCancelledResponse(streamID string, result aisvc.StreamMessageRe
 		response.AssistantMessage = &assistantMessage
 	}
 	return response
+}
+
+func streamChunkKind(delta aisvc.StreamMessageDelta) string {
+	if delta.Kind != "" {
+		return delta.Kind
+	}
+	if delta.Transient {
+		return "progress"
+	}
+	return "answer"
+}
+
+type aiMessageSendErrorLogInput struct {
+	Transport        string
+	Err              error
+	Code             string
+	UserID           string
+	ConversationID   string
+	ClientMessageID  string
+	StreamID         string
+	Model            string
+	ThinkingType     string
+	ReasoningEffort  string
+	AIFileCount      int
+	MessageRuneCount int
+	StartedAt        time.Time
+}
+
+func (s *Server) logAIMessageSendError(ctx context.Context, input aiMessageSendErrorLogInput) {
+	if s.logger == nil || input.Err == nil {
+		return
+	}
+	duration := time.Duration(0)
+	if !input.StartedAt.IsZero() {
+		duration = time.Since(input.StartedAt)
+	}
+	s.logger.ErrorContext(ctx, "AI message send failed",
+		"error", input.Err,
+		"error_detail", input.Err.Error(),
+		"error_cause", aiInternalErrorCause(input.Err),
+		"error_kind", aiInternalErrorKind(input.Err),
+		"error_provider", aiInternalErrorProvider(input.Err),
+		"mapped_code", input.Code,
+		"transport", input.Transport,
+		"request_id", requestIDFromContext(ctx),
+		"user_id", input.UserID,
+		"conversation_id", input.ConversationID,
+		"client_message_id", input.ClientMessageID,
+		"stream_id", input.StreamID,
+		"model", input.Model,
+		"thinking_type", input.ThinkingType,
+		"reasoning_effort", input.ReasoningEffort,
+		"ai_file_count", input.AIFileCount,
+		"message_rune_count", input.MessageRuneCount,
+		"duration_ms", duration.Milliseconds(),
+	)
+}
+
+func aiInternalErrorCause(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := strings.TrimSpace(err.Error())
+	if text == "" {
+		return ""
+	}
+	if len([]rune(text)) > 1000 {
+		return string([]rune(text)[:1000]) + "..."
+	}
+	return text
+}
+
+func aiInternalErrorKind(err error) string {
+	if err == nil {
+		return ""
+	}
+	lower := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(lower, "context deadline exceeded"),
+		strings.Contains(lower, "client.timeout exceeded"),
+		strings.Contains(lower, "i/o timeout"),
+		strings.Contains(lower, "timeout"):
+		return "timeout"
+	case strings.Contains(lower, "lookup "):
+		return "dns"
+	case strings.Contains(lower, "dial tcp"),
+		strings.Contains(lower, "connection refused"),
+		strings.Contains(lower, "connection reset"):
+		return "connectivity"
+	case strings.Contains(lower, "returned 401"),
+		strings.Contains(lower, "returned 403"),
+		strings.Contains(lower, "unauthorized"),
+		strings.Contains(lower, "forbidden"):
+		return "auth"
+	case strings.Contains(lower, "returned 429"),
+		strings.Contains(lower, "rate limit"):
+		return "rate_limit"
+	case strings.Contains(lower, "decode "):
+		return "decode"
+	default:
+		return "internal"
+	}
+}
+
+func aiInternalErrorProvider(err error) string {
+	if err == nil {
+		return ""
+	}
+	lower := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(lower, "tavily"):
+		return "tavily"
+	case strings.Contains(lower, "brave"):
+		return "brave"
+	case strings.Contains(lower, "browserless"):
+		return "browserless"
+	case strings.Contains(lower, "deepseek"):
+		return "deepseek"
+	case strings.Contains(lower, "openai"):
+		return "openai"
+	case strings.Contains(lower, "web search"):
+		return "web_search"
+	default:
+		return ""
+	}
 }
 
 func (s *Server) replayAISSEStreamReceipt(w http.ResponseWriter, flusher http.Flusher, r *http.Request, conversationID string, clientMessageID string, receipt repository.OperationReceipt) {
@@ -864,7 +1069,7 @@ func makeAIMessageResponses(messages []repository.AIMessage) []aiMessageResponse
 }
 
 func makeAIMessageResponse(message repository.AIMessage) aiMessageResponse {
-	return aiMessageResponse{
+	response := aiMessageResponse{
 		MessageID:      message.ID,
 		ConversationID: message.ConversationID,
 		Role:           message.Role,
@@ -874,6 +1079,18 @@ func makeAIMessageResponse(message repository.AIMessage) aiMessageResponse {
 		CreatedAt:      message.CreatedAt,
 		UpdatedAt:      message.UpdatedAt,
 	}
+	if message.Trace != nil {
+		response.Trace = &aiMessageTraceResponse{
+			TraceID:    message.Trace.ID,
+			Status:     message.Trace.Status,
+			Summary:    message.Trace.Summary,
+			Steps:      message.Trace.Steps,
+			SourceRefs: message.Trace.SourceRefs,
+			CreatedAt:  message.Trace.CreatedAt,
+			UpdatedAt:  message.Trace.UpdatedAt,
+		}
+	}
+	return response
 }
 
 func makeAIUploadedFileResponses(files []repository.AIUploadedFile) []aiUploadedFileResponse {

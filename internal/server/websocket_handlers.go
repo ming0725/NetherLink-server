@@ -11,7 +11,7 @@ import (
 
 	"golang.org/x/net/websocket"
 
-	aisvc "nlserver/internal/ai"
+	aisvc "nlserver/internal/agent/conversation"
 	authsvc "nlserver/internal/auth"
 	chatsvc "nlserver/internal/chat"
 	"nlserver/internal/realtime"
@@ -106,6 +106,7 @@ type websocketAIMessagePayload struct {
 	Model           string   `json:"model"`
 	ThinkingType    string   `json:"thinkingType"`
 	ReasoningEffort string   `json:"reasoningEffort"`
+	Timezone        string   `json:"timezone"`
 }
 
 type websocketAIStreamCancelPayload struct {
@@ -119,13 +120,28 @@ type websocketAIStreamStartedPayload struct {
 }
 
 type websocketAIStreamChunkPayload struct {
-	StreamID string `json:"streamId"`
-	Delta    string `json:"delta"`
+	StreamID     string `json:"streamId"`
+	Delta        string `json:"delta"`
+	Kind         string `json:"kind"`
+	Transient    bool   `json:"transient"`
+	StepID       string `json:"stepId,omitempty"`
+	SegmentID    string `json:"segmentId,omitempty"`
+	SegmentStart bool   `json:"segmentStart,omitempty"`
+	SegmentEnd   bool   `json:"segmentEnd,omitempty"`
 }
 
 type websocketAIStreamThinkingPayload struct {
-	StreamID string `json:"streamId"`
-	Active   bool   `json:"active"`
+	StreamID    string   `json:"streamId"`
+	Active      bool     `json:"active"`
+	UserVisible bool     `json:"userVisible"`
+	StepID      string   `json:"stepId,omitempty"`
+	Sequence    int      `json:"sequence,omitempty"`
+	Phase       string   `json:"phase,omitempty"`
+	Status      string   `json:"status,omitempty"`
+	Message     string   `json:"message,omitempty"`
+	Tool        string   `json:"tool,omitempty"`
+	Query       string   `json:"query,omitempty"`
+	URLs        []string `json:"urls,omitempty"`
 }
 
 type websocketAIStreamDonePayload struct {
@@ -747,13 +763,14 @@ func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connec
 		}
 	}()
 	thinkingActive := false
-	sendThinking := func(active bool) {
-		if thinkingActive == active {
+	sendThinking := func(active bool, progress *aisvc.StreamProgress) {
+		if thinkingActive == active && (!active || progress == nil) {
 			return
 		}
 		thinkingActive = active
-		s.sendWebSocketAIThinking(conn, streamID, active)
+		s.sendWebSocketAIThinking(conn, streamID, active, progress)
 	}
+	startedAt := time.Now()
 	result, err := s.aiService.StreamMessage(ctx, aisvc.StreamMessageInput{
 		SendMessageInput: aisvc.SendMessageInput{
 			UserID:          principal.UserID,
@@ -764,6 +781,7 @@ func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connec
 			Model:           req.Model,
 			ThinkingType:    req.ThinkingType,
 			ReasoningEffort: req.ReasoningEffort,
+			UserTimezone:    req.Timezone,
 		},
 		OnDelta: func(delta aisvc.StreamMessageDelta) error {
 			select {
@@ -772,15 +790,23 @@ func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connec
 			default:
 			}
 			if delta.Thinking {
-				sendThinking(true)
+				sendThinking(true, delta.Progress)
 			}
 			if delta.Content == "" {
 				return nil
 			}
-			sendThinking(false)
+			if !delta.Transient {
+				sendThinking(false, nil)
+			}
 			s.realtimeHub.Send(conn, "ai.stream.chunk", websocketAIStreamChunkPayload{
-				StreamID: streamID,
-				Delta:    delta.Content,
+				StreamID:     streamID,
+				Delta:        delta.Content,
+				Kind:         streamChunkKind(delta),
+				Transient:    delta.Transient,
+				StepID:       delta.StepID,
+				SegmentID:    delta.SegmentID,
+				SegmentStart: delta.SegmentStart,
+				SegmentEnd:   delta.SegmentEnd,
 			})
 			return nil
 		},
@@ -793,13 +819,28 @@ func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connec
 				s.logger.WarnContext(completeCtx, "failed to complete cancelled AI websocket stream receipt", "error", err, "operation_type", receiptClaim.OperationType)
 			}
 			completeCancel()
-			sendThinking(false)
+			sendThinking(false, nil)
 			s.realtimeHub.Send(conn, "ai.stream.cancelled", makeWebSocketAIStreamCancelledPayload(cancelled))
 			return
 		}
 		s.deleteAIStreamReceipt(principal.UserID, receiptClaim)
 		code, message := aiErrorCodeAndMessage(err)
-		sendThinking(false)
+		s.logAIMessageSendError(ctx, aiMessageSendErrorLogInput{
+			Transport:        "websocket",
+			Err:              err,
+			Code:             code,
+			UserID:           principal.UserID,
+			ConversationID:   req.ConversationID,
+			ClientMessageID:  req.ClientMessageID,
+			StreamID:         streamID,
+			Model:            req.Model,
+			ThinkingType:     req.ThinkingType,
+			ReasoningEffort:  req.ReasoningEffort,
+			AIFileCount:      len(req.AIFileIDs),
+			MessageRuneCount: len([]rune(req.Message)),
+			StartedAt:        startedAt,
+		})
+		sendThinking(false, nil)
 		s.sendWebSocketError(conn, "ai.message.send", code, message)
 		return
 	}
@@ -816,15 +857,26 @@ func (s *Server) runWebSocketAIStream(ctx context.Context, conn *realtime.Connec
 		s.logger.WarnContext(completeCtx, "failed to complete AI websocket stream receipt", "error", err, "operation_type", receiptClaim.OperationType)
 	}
 	completeCancel()
-	sendThinking(false)
+	sendThinking(false, nil)
 	s.realtimeHub.Send(conn, "ai.stream.done", makeWebSocketAIStreamDonePayload(done))
 }
 
-func (s *Server) sendWebSocketAIThinking(conn *realtime.Connection, streamID string, active bool) {
-	s.realtimeHub.Send(conn, "ai.stream.thinking", websocketAIStreamThinkingPayload{
+func (s *Server) sendWebSocketAIThinking(conn *realtime.Connection, streamID string, active bool, progress *aisvc.StreamProgress) {
+	payload := websocketAIStreamThinkingPayload{
 		StreamID: streamID,
 		Active:   active,
-	})
+	}
+	if progress != nil {
+		payload.StepID = progress.StepID
+		payload.Sequence = progress.Sequence
+		payload.Phase = progress.Phase
+		payload.Status = progress.Status
+		payload.Message = progress.Message
+		payload.Tool = progress.Tool
+		payload.Query = progress.Query
+		payload.URLs = progress.URLs
+	}
+	s.realtimeHub.Send(conn, "ai.stream.thinking", payload)
 }
 
 func (s *Server) handleWebSocketAIStreamCancel(conn *realtime.Connection, principal AuthPrincipal, payload json.RawMessage) {
@@ -856,8 +908,33 @@ func aiErrorCodeAndMessage(err error) (string, string) {
 	case errors.Is(err, repository.ErrConflict):
 		return "CONFLICT", "Resource conflict"
 	default:
+		if message := providerErrorMessage(err); message != "" {
+			return "AI_PROVIDER_ERROR", message
+		}
 		return "INTERNAL_ERROR", "Internal server error"
 	}
+}
+
+func providerErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := strings.TrimSpace(err.Error())
+	if text == "" {
+		return ""
+	}
+	if strings.Contains(text, "model provider returned") ||
+		strings.Contains(text, "context deadline exceeded") ||
+		strings.Contains(text, "Client.Timeout exceeded") ||
+		strings.Contains(text, "dial tcp") ||
+		strings.Contains(text, "lookup ") ||
+		strings.Contains(text, "i/o timeout") {
+		if len([]rune(text)) > 500 {
+			text = string([]rune(text)[:500]) + "..."
+		}
+		return text
+	}
+	return ""
 }
 
 func webSocketAccessToken(r *http.Request) string {

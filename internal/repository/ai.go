@@ -34,6 +34,17 @@ const aiMessageSelectColumns = `
 	updated_at,
 	deleted_at`
 
+const aiMessageTraceSelectColumns = `
+	id,
+	conversation_id,
+	message_id,
+	status,
+	summary,
+	steps_json,
+	source_refs_json,
+	created_at,
+	updated_at`
+
 const aiUploadedFileSelectColumns = `
 	id,
 	conversation_id,
@@ -84,9 +95,22 @@ type AIMessage struct {
 	Text           string
 	TokenCount     int
 	Feedback       *string
+	Trace          *AIMessageTrace
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 	DeletedAt      *time.Time
+}
+
+type AIMessageTrace struct {
+	ID             string
+	ConversationID string
+	MessageID      string
+	Status         string
+	Summary        string
+	Steps          json.RawMessage
+	SourceRefs     json.RawMessage
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 type AIUploadedFile struct {
@@ -134,6 +158,15 @@ type CreateAIMessageParams struct {
 	Role           string
 	Text           string
 	TokenCount     int
+}
+
+type CreateAIMessageTraceParams struct {
+	ConversationID string
+	MessageID      string
+	Status         string
+	Summary        string
+	Steps          json.RawMessage
+	SourceRefs     json.RawMessage
 }
 
 type CreateAIUploadedFileParams struct {
@@ -253,6 +286,11 @@ func (r *AIRepository) DeleteConversation(ctx context.Context, userID string, co
 			WHERE m.conversation_id = dc.id
 			  AND m.deleted_at IS NULL
 		),
+		deleted_traces AS (
+			DELETE FROM ai_message_traces trace
+			USING deleted_conversation dc
+			WHERE trace.conversation_id = dc.id
+		),
 		deleted_files AS (
 			UPDATE ai_uploaded_files auf
 			SET deleted_at = now(),
@@ -352,6 +390,61 @@ func (r *AIRepository) ListMessages(ctx context.Context, userID string, conversa
 		return nil, err
 	}
 	return messages, nil
+}
+
+func (r *AIRepository) CreateMessageTrace(ctx context.Context, params CreateAIMessageTraceParams) (AIMessageTrace, error) {
+	trace, err := scanAIMessageTrace(r.db.QueryRow(ctx, `
+		INSERT INTO ai_message_traces (
+			conversation_id,
+			message_id,
+			status,
+			summary,
+			steps_json,
+			source_refs_json
+		)
+		VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6)
+		RETURNING `+aiMessageTraceSelectColumns,
+		normalizeText(params.ConversationID),
+		normalizeText(params.MessageID),
+		normalizeText(params.Status),
+		normalizeText(params.Summary),
+		jsonArrayOrDefault(params.Steps),
+		jsonArrayOrDefault(params.SourceRefs),
+	))
+	return trace, translateWriteError(err)
+}
+
+func (r *AIRepository) ListMessageTraces(ctx context.Context, userID string, conversationID string) ([]AIMessageTrace, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT `+prefixedColumns(aiMessageTraceSelectColumns, "trace")+`
+		FROM ai_message_traces trace
+		JOIN ai_conversations c ON c.id = trace.conversation_id
+		JOIN ai_messages m ON m.id = trace.message_id
+		WHERE c.id = $1::uuid
+		  AND c.user_id = $2::uuid
+		  AND c.deleted_at IS NULL
+		  AND m.deleted_at IS NULL
+		ORDER BY trace.created_at ASC, trace.id ASC`,
+		normalizeText(conversationID),
+		normalizeText(userID),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	traces := []AIMessageTrace{}
+	for rows.Next() {
+		trace, err := scanAIMessageTrace(rows)
+		if err != nil {
+			return nil, err
+		}
+		traces = append(traces, trace)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return traces, nil
 }
 
 func (r *AIRepository) SetMessageFeedback(ctx context.Context, userID string, messageID string, feedback string) (AIMessage, error) {
@@ -816,6 +909,40 @@ func scanAIMessage(row scanner) (AIMessage, error) {
 	message.ID = uuidString(id)
 	message.ConversationID = uuidString(conversationID)
 	return message, nil
+}
+
+func scanAIMessageTrace(row scanner) (AIMessageTrace, error) {
+	var (
+		trace          AIMessageTrace
+		id             pgtype.UUID
+		conversationID pgtype.UUID
+		messageID      pgtype.UUID
+	)
+	err := row.Scan(
+		&id,
+		&conversationID,
+		&messageID,
+		&trace.Status,
+		&trace.Summary,
+		&trace.Steps,
+		&trace.SourceRefs,
+		&trace.CreatedAt,
+		&trace.UpdatedAt,
+	)
+	if err != nil {
+		return AIMessageTrace{}, err
+	}
+	trace.ID = uuidString(id)
+	trace.ConversationID = uuidString(conversationID)
+	trace.MessageID = uuidString(messageID)
+	return trace, nil
+}
+
+func jsonArrayOrDefault(value json.RawMessage) json.RawMessage {
+	if len(value) == 0 {
+		return json.RawMessage(`[]`)
+	}
+	return value
 }
 
 func scanAIUploadedFile(row scanner) (AIUploadedFile, error) {

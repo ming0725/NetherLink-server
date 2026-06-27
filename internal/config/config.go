@@ -72,20 +72,41 @@ type StorageBuckets struct {
 }
 
 type AIConfig struct {
-	Provider         string
-	APIKey           string
-	BaseURL          string
-	DefaultModel     string
-	TitleModel       string
-	ThinkingType     string
-	ReasoningEffort  string
-	MaxContextTokens int
-	RequestTimeout   time.Duration
+	Provider           string
+	APIKey             string
+	BaseURL            string
+	DefaultModel       string
+	TitleModel         string
+	ThinkingType       string
+	ReasoningEffort    string
+	MaxContextTokens   int
+	MaxOutputTokens    int
+	RequestTimeout     time.Duration
+	TavilyAPIKey       string
+	BraveSearchAPIKey  string
+	BrowserlessAPIKey  string
+	BrowserlessBaseURL string
+	LangSmith          LangSmithConfig
+}
+
+type LangSmithConfig struct {
+	Tracing        bool
+	Endpoint       string
+	APIKey         string
+	Project        string
+	WorkspaceID    string
+	RequestTimeout time.Duration
 }
 
 func Load() (Config, error) {
 	var validationErrors []string
 	storageEndpoint := getEnv("NETHERLINK_OBJECT_STORAGE_ENDPOINT", "http://localhost:9000")
+	aiProvider := getEnv("NETHERLINK_AI_PROVIDER", "disabled")
+	aiBaseURL := getEnv("NETHERLINK_AI_BASE_URL", "")
+	aiAPIKey := getEnv("NETHERLINK_AI_API_KEY", "")
+	if aiAPIKey == "" && openAIAPIKeyFallbackAllowed(aiProvider, aiBaseURL) {
+		aiAPIKey = getEnv("OPENAI_API_KEY", "")
+	}
 
 	cfg := Config{
 		Env: getEnv("NETHERLINK_ENV", "local"),
@@ -134,15 +155,28 @@ func Load() (Config, error) {
 			},
 		},
 		AI: AIConfig{
-			Provider:         getEnv("NETHERLINK_AI_PROVIDER", "disabled"),
-			APIKey:           getEnv("NETHERLINK_AI_API_KEY", ""),
-			BaseURL:          getEnv("NETHERLINK_AI_BASE_URL", ""),
-			DefaultModel:     getEnv("NETHERLINK_AI_DEFAULT_MODEL", ""),
-			TitleModel:       getEnv("NETHERLINK_AI_TITLE_MODEL", ""),
-			ThinkingType:     getEnv("NETHERLINK_AI_THINKING_TYPE", ""),
-			ReasoningEffort:  getEnv("NETHERLINK_AI_REASONING_EFFORT", ""),
-			MaxContextTokens: getEnvNonNegativeInt(&validationErrors, "NETHERLINK_AI_MAX_CONTEXT_TOKENS", 0),
-			RequestTimeout:   getEnvDuration(&validationErrors, "NETHERLINK_AI_REQUEST_TIMEOUT", time.Minute),
+			Provider:           aiProvider,
+			APIKey:             aiAPIKey,
+			BaseURL:            aiBaseURL,
+			DefaultModel:       getEnv("NETHERLINK_AI_DEFAULT_MODEL", ""),
+			TitleModel:         getEnv("NETHERLINK_AI_TITLE_MODEL", ""),
+			ThinkingType:       getEnv("NETHERLINK_AI_THINKING_TYPE", ""),
+			ReasoningEffort:    getEnv("NETHERLINK_AI_REASONING_EFFORT", ""),
+			MaxContextTokens:   getEnvNonNegativeInt(&validationErrors, "NETHERLINK_AI_MAX_CONTEXT_TOKENS", 0),
+			MaxOutputTokens:    getEnvNonNegativeInt(&validationErrors, "NETHERLINK_AI_MAX_OUTPUT_TOKENS", 4096),
+			RequestTimeout:     getEnvDuration(&validationErrors, "NETHERLINK_AI_REQUEST_TIMEOUT", time.Minute),
+			TavilyAPIKey:       getEnv("NETHERLINK_TAVILY_API_KEY", ""),
+			BraveSearchAPIKey:  getEnv("NETHERLINK_BRAVE_SEARCH_API_KEY", ""),
+			BrowserlessAPIKey:  getEnv("NETHERLINK_BROWSERLESS_API_KEY", ""),
+			BrowserlessBaseURL: getEnv("NETHERLINK_BROWSERLESS_BASE_URL", "https://production-sfo.browserless.io"),
+			LangSmith: LangSmithConfig{
+				Tracing:        getEnvBool(&validationErrors, "LANGSMITH_TRACING", false),
+				Endpoint:       getEnv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com"),
+				APIKey:         getEnv("LANGSMITH_API_KEY", ""),
+				Project:        getEnv("LANGSMITH_PROJECT", ""),
+				WorkspaceID:    getEnv("LANGSMITH_WORKSPACE_ID", ""),
+				RequestTimeout: getEnvDuration(&validationErrors, "LANGSMITH_REQUEST_TIMEOUT", 5*time.Second),
+			},
 		},
 	}
 
@@ -159,6 +193,12 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func openAIAPIKeyFallbackAllowed(provider string, baseURL string) bool {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	baseURL = strings.ToLower(strings.TrimSpace(baseURL))
+	return provider == "openai" || (provider == "openai-compatible" && (baseURL == "" || strings.Contains(baseURL, "api.openai.com")))
 }
 
 func requiredEnv(validationErrors *[]string, key string) string {
@@ -298,6 +338,9 @@ func validate(cfg Config, validationErrors *[]string) {
 		}
 	default:
 		*validationErrors = append(*validationErrors, "NETHERLINK_AI_PROVIDER must be disabled, openai, or openai-compatible")
+	}
+	if cfg.AI.LangSmith.Tracing && cfg.AI.LangSmith.APIKey == "" {
+		*validationErrors = append(*validationErrors, "LANGSMITH_API_KEY is required when LANGSMITH_TRACING is true")
 	}
 	if cfg.Env == "production" {
 		if cfg.Postgres.SSLMode == "disable" {

@@ -9,7 +9,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
-	aisvc "nlserver/internal/ai"
+	aisvc "nlserver/internal/agent/conversation"
+	agentmodel "nlserver/internal/agent/model"
+	agentprofile "nlserver/internal/agent/profile"
 	authsvc "nlserver/internal/auth"
 	"nlserver/internal/cache"
 	chatsvc "nlserver/internal/chat"
@@ -31,6 +33,8 @@ type Runtime struct {
 	Repos               repository.Repositories
 	AuthService         *authsvc.Service
 	AIService           *aisvc.Service
+	AgentService        *agentprofile.Service
+	ModelGateway        agentmodel.ModelGateway
 	ChatService         *chatsvc.Service
 	FileService         *filesvc.Service
 	FileWorker          *filesvc.ProcessingWorker
@@ -66,6 +70,14 @@ func NewRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*R
 	redisClient := cache.NewRedisClient(cfg.Redis)
 	repos := repository.New(db)
 	runtimeCtx, cancel := context.WithCancel(ctx)
+	var modelGateway agentmodel.ModelGateway
+	if gateway, err := agentmodel.NewModelGateway(cfg.AI); err == nil {
+		modelGateway = gateway
+	} else if !errors.Is(err, agentmodel.ErrModelProviderUnavailable) {
+		redisClient.Close()
+		db.Close()
+		return nil, err
+	}
 
 	runtime := &Runtime{
 		Config:        cfg,
@@ -73,6 +85,8 @@ func NewRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*R
 		Redis:         redisClient,
 		Repos:         repos,
 		AuthService:   authsvc.NewServiceWithTx(cfg.Auth, repos, db),
+		AgentService:  agentprofile.NewServiceWithModelGateway(repos, db, modelGateway, cfg.AI),
+		ModelGateway:  modelGateway,
 		ChatService:   chatsvc.NewService(repos, db),
 		FileService:   filesvc.NewService(cfg.Storage, repos, db, nil),
 		FriendService: friendsvc.NewService(repos, db),
@@ -82,14 +96,16 @@ func NewRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*R
 		Logger:        logger,
 		cancel:        cancel,
 	}
-	if aiClient, err := aisvc.NewChatClient(cfg.AI); err == nil {
-		runtime.AIService = aisvc.NewService(cfg.AI, repos, db, aiClient)
-	} else if !errors.Is(err, aisvc.ErrProviderUnavailable) {
+	if err := runtime.AgentService.SyncDefaultMCPManifests(ctx); err != nil {
 		runtime.Close()
 		return nil, err
+	}
+	if aiClient := aisvc.NewChatClientFromModelGateway(modelGateway); aiClient != nil {
+		runtime.AIService = aisvc.NewService(cfg.AI, repos, db, aiClient)
 	} else {
 		runtime.AIService = aisvc.NewService(cfg.AI, repos, db, nil)
 	}
+	runtime.AIService.SetLogger(logger)
 	runtime.RealtimeFanout = realtime.NewRedisFanout(redisClient, runtime.RealtimeHub)
 	runtime.RealtimeFanout.Start(runtimeCtx, logger)
 	runtime.RealtimeCleanup = realtime.NewCleanupWorker(

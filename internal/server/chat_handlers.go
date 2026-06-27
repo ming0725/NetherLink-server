@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -234,10 +235,11 @@ func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	entries, err := s.chatService.ListConversations(r.Context(), chatsvc.ListConversationsInput{
-		UserID:  principal.UserID,
-		Keyword: r.URL.Query().Get("keyword"),
-		Limit:   limit,
-		Offset:  offset,
+		UserID:   principal.UserID,
+		DeviceID: principal.DeviceID,
+		Keyword:  r.URL.Query().Get("keyword"),
+		Limit:    limit,
+		Offset:   offset,
 	})
 	if err != nil {
 		writeChatError(w, r, err)
@@ -602,16 +604,15 @@ func (s *Server) handleHideConversationHistory(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	participant, err := s.chatService.HideConversationHistory(r.Context(), chatsvc.HideConversationHistoryInput{
+	_, err = s.chatService.HideConversationHistory(r.Context(), chatsvc.HideConversationHistoryInput{
 		UserID:         principal.UserID,
+		DeviceID:       principal.DeviceID,
 		ConversationID: conversationID,
 	})
 	if err != nil {
 		writeChatError(w, r, err)
 		return
 	}
-	s.publishConversationSyncState(r.Context(), participant, "history.hidden")
-	s.publishConversationUpdatedForParticipant(r.Context(), principal.UserID, conversationID, "history.hidden")
 	writeJSONWithETag(w, r, http.StatusOK, conversationETag, okResponse{OK: true})
 }
 
@@ -712,6 +713,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 
 	messages, err := s.chatService.ListMessages(r.Context(), chatsvc.ListMessagesInput{
 		UserID:         principal.UserID,
+		DeviceID:       principal.DeviceID,
 		ConversationID: conversationID,
 		BeforeSeq:      beforeSeq,
 		AfterSeq:       afterSeq,
@@ -719,6 +721,13 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		writeChatError(w, r, err)
+		return
+	}
+
+	messagesETag := makeMessagesETag(conversationID, beforeSeq, afterSeq, limit, messages)
+	if messagesETag != "" && ifNoneMatch(r, messagesETag) {
+		w.Header().Set("ETag", messagesETag)
+		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 
@@ -737,7 +746,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, messagesResponse{
+	writeJSONWithETag(w, r, http.StatusOK, messagesETag, messagesResponse{
 		Messages:      responses,
 		HasMoreBefore: beforeSeq != nil && len(responses) == limit,
 		HasMoreAfter:  afterSeq != nil && len(responses) == limit,
@@ -971,6 +980,40 @@ func makeMessageSyncCursor(messages []repository.Message) *messageSyncCursor {
 		FirstMessageSeq: &first,
 		LastMessageSeq:  &last,
 	}
+}
+
+func makeMessagesETag(conversationID string, beforeSeq *int64, afterSeq *int64, limit int, messages []repository.Message) string {
+	var firstSeq int64
+	var lastSeq int64
+	var maxUpdatedUnixNano int64
+	if len(messages) > 0 {
+		firstSeq = messages[0].MessageSeq
+		lastSeq = messages[len(messages)-1].MessageSeq
+		for _, message := range messages {
+			updated := message.UpdatedAt.UnixNano()
+			if updated > maxUpdatedUnixNano {
+				maxUpdatedUnixNano = updated
+			}
+		}
+	}
+	return fmt.Sprintf(
+		`"messages-%s-b%s-a%s-l%d-n%d-f%d-t%d-u%d"`,
+		conversationID,
+		messageSeqETagPart(beforeSeq),
+		messageSeqETagPart(afterSeq),
+		limit,
+		len(messages),
+		firstSeq,
+		lastSeq,
+		maxUpdatedUnixNano,
+	)
+}
+
+func messageSeqETagPart(seq *int64) string {
+	if seq == nil {
+		return "none"
+	}
+	return strconv.FormatInt(*seq, 10)
 }
 
 func (s *Server) publishConversationMessage(ctx context.Context, conversationID string, eventType string, message messageResponse) {

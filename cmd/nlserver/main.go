@@ -13,6 +13,7 @@ import (
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
 	cfg, err := config.Load()
 	if err != nil {
 		logger.Error("failed to load configuration", "error", err)
@@ -32,6 +33,13 @@ func main() {
 		"postgres_db", cfg.Postgres.Database,
 		"redis_addr", cache.RedisAddr(cfg.Redis),
 		"minio_endpoint", cfg.Storage.Endpoint,
+		"ai_provider", cfg.AI.Provider,
+		"ai_model", cfg.AI.DefaultModel,
+		"langsmith_tracing", cfg.AI.LangSmith.Tracing,
+		"langsmith_endpoint", cfg.AI.LangSmith.Endpoint,
+		"langsmith_project", cfg.AI.LangSmith.Project,
+		"langsmith_workspace_configured", cfg.AI.LangSmith.WorkspaceID != "",
+		"langsmith_request_timeout", cfg.AI.LangSmith.RequestTimeout,
 	)
 
 	if err := server.NewWithDependencies(server.Dependencies{
@@ -41,6 +49,7 @@ func main() {
 		Repos:           runtime.Repos,
 		AuthService:     runtime.AuthService,
 		AIService:       runtime.AIService,
+		AgentService:    runtime.AgentService,
 		ChatService:     runtime.ChatService,
 		FileService:     runtime.FileService,
 		FriendService:   runtime.FriendService,

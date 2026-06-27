@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"nlserver/internal/ai"
+	ai "nlserver/internal/agent/conversation"
 	"nlserver/internal/repository"
 )
 

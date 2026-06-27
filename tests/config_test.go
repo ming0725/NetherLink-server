@@ -49,6 +49,18 @@ func TestConfigLoadWithValidEnvironment(t *testing.T) {
 	if cfg.AI.RequestTimeout != time.Minute {
 		t.Fatalf("ai request timeout = %v, want 1m", cfg.AI.RequestTimeout)
 	}
+	if cfg.AI.MaxOutputTokens != 4096 {
+		t.Fatalf("ai max output tokens = %d, want 4096", cfg.AI.MaxOutputTokens)
+	}
+	if cfg.AI.LangSmith.Tracing {
+		t.Fatal("langsmith tracing = true, want false")
+	}
+	if cfg.AI.LangSmith.Endpoint != "https://api.smith.langchain.com" {
+		t.Fatalf("langsmith endpoint = %q, want default endpoint", cfg.AI.LangSmith.Endpoint)
+	}
+	if cfg.AI.LangSmith.RequestTimeout != 5*time.Second {
+		t.Fatalf("langsmith request timeout = %v, want 5s", cfg.AI.LangSmith.RequestTimeout)
+	}
 }
 
 func TestConfigLoadRejectsMalformedValues(t *testing.T) {
@@ -77,7 +89,18 @@ func TestConfigLoadAIProvider(t *testing.T) {
 	t.Setenv("NETHERLINK_AI_THINKING_TYPE", "enabled")
 	t.Setenv("NETHERLINK_AI_REASONING_EFFORT", "max")
 	t.Setenv("NETHERLINK_AI_MAX_CONTEXT_TOKENS", "8192")
+	t.Setenv("NETHERLINK_AI_MAX_OUTPUT_TOKENS", "6000")
 	t.Setenv("NETHERLINK_AI_REQUEST_TIMEOUT", "45s")
+	t.Setenv("NETHERLINK_TAVILY_API_KEY", "test-tavily-key")
+	t.Setenv("NETHERLINK_BRAVE_SEARCH_API_KEY", "test-brave-key")
+	t.Setenv("NETHERLINK_BROWSERLESS_API_KEY", "test-browserless-key")
+	t.Setenv("NETHERLINK_BROWSERLESS_BASE_URL", "https://browserless.example")
+	t.Setenv("LANGSMITH_TRACING", "true")
+	t.Setenv("LANGSMITH_ENDPOINT", "https://langsmith.example")
+	t.Setenv("LANGSMITH_API_KEY", "test-langsmith-key")
+	t.Setenv("LANGSMITH_PROJECT", "NLServer")
+	t.Setenv("LANGSMITH_WORKSPACE_ID", "workspace-1")
+	t.Setenv("LANGSMITH_REQUEST_TIMEOUT", "15s")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -101,8 +124,74 @@ func TestConfigLoadAIProvider(t *testing.T) {
 	if cfg.AI.MaxContextTokens != 8192 {
 		t.Fatalf("ai max context tokens = %d, want 8192", cfg.AI.MaxContextTokens)
 	}
+	if cfg.AI.MaxOutputTokens != 6000 {
+		t.Fatalf("ai max output tokens = %d, want 6000", cfg.AI.MaxOutputTokens)
+	}
 	if cfg.AI.RequestTimeout != 45*time.Second {
 		t.Fatalf("ai request timeout = %v, want 45s", cfg.AI.RequestTimeout)
+	}
+	if cfg.AI.TavilyAPIKey != "test-tavily-key" {
+		t.Fatalf("tavily api key = %q, want test-tavily-key", cfg.AI.TavilyAPIKey)
+	}
+	if cfg.AI.BraveSearchAPIKey != "test-brave-key" {
+		t.Fatalf("brave search api key = %q, want test-brave-key", cfg.AI.BraveSearchAPIKey)
+	}
+	if cfg.AI.BrowserlessAPIKey != "test-browserless-key" {
+		t.Fatalf("browserless api key = %q, want test-browserless-key", cfg.AI.BrowserlessAPIKey)
+	}
+	if cfg.AI.BrowserlessBaseURL != "https://browserless.example" {
+		t.Fatalf("browserless base URL = %q, want https://browserless.example", cfg.AI.BrowserlessBaseURL)
+	}
+	if !cfg.AI.LangSmith.Tracing {
+		t.Fatal("langsmith tracing = false, want true")
+	}
+	if cfg.AI.LangSmith.Endpoint != "https://langsmith.example" {
+		t.Fatalf("langsmith endpoint = %q, want https://langsmith.example", cfg.AI.LangSmith.Endpoint)
+	}
+	if cfg.AI.LangSmith.APIKey != "test-langsmith-key" {
+		t.Fatalf("langsmith api key = %q, want test-langsmith-key", cfg.AI.LangSmith.APIKey)
+	}
+	if cfg.AI.LangSmith.Project != "NLServer" {
+		t.Fatalf("langsmith project = %q, want NLServer", cfg.AI.LangSmith.Project)
+	}
+	if cfg.AI.LangSmith.WorkspaceID != "workspace-1" {
+		t.Fatalf("langsmith workspace id = %q, want workspace-1", cfg.AI.LangSmith.WorkspaceID)
+	}
+	if cfg.AI.LangSmith.RequestTimeout != 15*time.Second {
+		t.Fatalf("langsmith request timeout = %v, want 15s", cfg.AI.LangSmith.RequestTimeout)
+	}
+}
+
+func TestConfigLoadAIProviderUsesOpenAIAPIKeyFallback(t *testing.T) {
+	setValidRequiredConfig(t)
+	t.Setenv("NETHERLINK_AI_PROVIDER", "openai")
+	t.Setenv("NETHERLINK_AI_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "fallback-openai-key")
+	t.Setenv("NETHERLINK_AI_DEFAULT_MODEL", "test-model")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.AI.APIKey != "fallback-openai-key" {
+		t.Fatalf("ai api key = %q, want fallback-openai-key", cfg.AI.APIKey)
+	}
+}
+
+func TestConfigLoadAIProviderDoesNotUseOpenAIAPIKeyFallbackForCustomBaseURL(t *testing.T) {
+	setValidRequiredConfig(t)
+	t.Setenv("NETHERLINK_AI_PROVIDER", "openai-compatible")
+	t.Setenv("NETHERLINK_AI_BASE_URL", "https://api.deepseek.com")
+	t.Setenv("NETHERLINK_AI_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "fallback-openai-key")
+	t.Setenv("NETHERLINK_AI_DEFAULT_MODEL", "deepseek-v4-flash")
+
+	_, err := config.Load()
+	if err == nil {
+		t.Fatal("Load() error = nil, want missing NetherLink AI API key error")
+	}
+	if !strings.Contains(err.Error(), "NETHERLINK_AI_API_KEY is required") {
+		t.Fatalf("Load() error = %q, want AI API key error", err)
 	}
 }
 
@@ -152,6 +241,20 @@ func TestConfigLoadAIProviderRequiresRuntimeSettings(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "NETHERLINK_AI_DEFAULT_MODEL is required") {
 		t.Fatalf("Load() error = %q, want AI default model error", err)
+	}
+}
+
+func TestConfigLoadLangSmithTracingRequiresAPIKey(t *testing.T) {
+	setValidRequiredConfig(t)
+	t.Setenv("LANGSMITH_TRACING", "true")
+	t.Setenv("LANGSMITH_API_KEY", "")
+
+	_, err := config.Load()
+	if err == nil {
+		t.Fatal("Load() error = nil, want LangSmith API key validation error")
+	}
+	if !strings.Contains(err.Error(), "LANGSMITH_API_KEY is required when LANGSMITH_TRACING is true") {
+		t.Fatalf("Load() error = %q, want LangSmith API key error", err)
 	}
 }
 

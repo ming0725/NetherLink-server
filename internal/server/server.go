@@ -10,7 +10,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
-	aisvc "nlserver/internal/ai"
+	aisvc "nlserver/internal/agent/conversation"
+	agentmodel "nlserver/internal/agent/model"
+	agentprofile "nlserver/internal/agent/profile"
 	authsvc "nlserver/internal/auth"
 	chatsvc "nlserver/internal/chat"
 	"nlserver/internal/config"
@@ -30,6 +32,8 @@ type Server struct {
 	repos           repository.Repositories
 	authService     *authsvc.Service
 	aiService       *aisvc.Service
+	agentService    *agentprofile.Service
+	modelGateway    agentmodel.ModelGateway
 	chatService     *chatsvc.Service
 	fileService     *filesvc.Service
 	friendService   *friendsvc.Service
@@ -51,6 +55,8 @@ type Dependencies struct {
 	Repos           repository.Repositories
 	AuthService     *authsvc.Service
 	AIService       *aisvc.Service
+	AgentService    *agentprofile.Service
+	ModelGateway    agentmodel.ModelGateway
 	ChatService     *chatsvc.Service
 	FileService     *filesvc.Service
 	FriendService   *friendsvc.Service
@@ -88,12 +94,23 @@ func NewWithDependencies(deps Dependencies) *Server {
 	if deps.AuthService == nil && deps.Repos.Users != nil && deps.Repos.Sessions != nil {
 		deps.AuthService = authsvc.NewServiceWithTx(deps.Config.Auth, deps.Repos, deps.DB)
 	}
+	if deps.ModelGateway == nil {
+		if gateway, err := agentmodel.NewModelGateway(deps.Config.AI); err == nil {
+			deps.ModelGateway = gateway
+		}
+	}
 	if deps.AIService == nil && deps.Repos.AI != nil {
-		if aiClient, err := aisvc.NewChatClient(deps.Config.AI); err == nil {
+		if aiClient := aisvc.NewChatClientFromModelGateway(deps.ModelGateway); aiClient != nil {
 			deps.AIService = aisvc.NewService(deps.Config.AI, deps.Repos, deps.DB, aiClient)
 		} else {
 			deps.AIService = aisvc.NewService(deps.Config.AI, deps.Repos, deps.DB, nil)
 		}
+	}
+	if deps.AIService != nil {
+		deps.AIService.SetLogger(deps.Logger)
+	}
+	if deps.AgentService == nil && deps.Repos.Agents != nil {
+		deps.AgentService = agentprofile.NewServiceWithModelGateway(deps.Repos, deps.DB, deps.ModelGateway, deps.Config.AI)
 	}
 	if deps.ChatService == nil && deps.Repos.Chat != nil {
 		deps.ChatService = chatsvc.NewService(deps.Repos, deps.DB)
@@ -125,6 +142,8 @@ func NewWithDependencies(deps Dependencies) *Server {
 		repos:           deps.Repos,
 		authService:     deps.AuthService,
 		aiService:       deps.AIService,
+		agentService:    deps.AgentService,
+		modelGateway:    deps.ModelGateway,
 		chatService:     deps.ChatService,
 		fileService:     deps.FileService,
 		friendService:   deps.FriendService,
@@ -155,6 +174,7 @@ func repositoriesConfigured(repos repository.Repositories) bool {
 		repos.Groups != nil ||
 		repos.Posts != nil ||
 		repos.AI != nil ||
+		repos.Agents != nil ||
 		repos.Notifications != nil ||
 		repos.RealtimeEvents != nil ||
 		repos.OperationReceipts != nil
@@ -256,6 +276,10 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/v1/notifications/read-all", s.withAuthRequired(http.HandlerFunc(s.handleNotificationsReadAll)))
 	mux.Handle("POST /api/v1/notifications/{notificationId}/read", s.withAuthRequired(http.HandlerFunc(s.handleNotificationRead)))
 	mux.Handle("POST /api/v1/operations/receipt", s.withAuthRequired(http.HandlerFunc(s.handleOperationReceipt)))
+	mux.Handle("GET /api/v1/agents", s.withAuthRequired(http.HandlerFunc(s.handleAgentList)))
+	mux.Handle("POST /api/v1/agents", s.withAuthRequired(http.HandlerFunc(s.handleAgentCreate)))
+	mux.Handle("GET /api/v1/agents/{agentId}", s.withAuthRequired(http.HandlerFunc(s.handleAgentGet)))
+	mux.Handle("DELETE /api/v1/agents/{agentId}", s.withAuthRequired(http.HandlerFunc(s.handleAgentDelete)))
 	mux.Handle("GET /api/v1/conversations", s.withAuthRequired(http.HandlerFunc(s.handleListConversations)))
 	mux.Handle("POST /api/v1/conversations/direct", s.withAuthRequired(http.HandlerFunc(s.handleOpenDirectConversation)))
 	mux.Handle("POST /api/v1/conversations/group", s.withAuthRequired(http.HandlerFunc(s.handleOpenGroupConversation)))

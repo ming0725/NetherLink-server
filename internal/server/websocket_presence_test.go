@@ -192,8 +192,8 @@ type presenceUserRow struct {
 }
 
 func (row presenceUserRow) Scan(dest ...any) error {
-	if len(dest) != 18 {
-		return fmt.Errorf("scan dest count = %d, want 18", len(dest))
+	if len(dest) != 19 {
+		return fmt.Errorf("scan dest count = %d, want 19", len(dest))
 	}
 	now := time.Date(2026, 6, 9, 12, 0, 0, 0, time.UTC)
 	userID := pgtype.UUID{Bytes: [16]byte{15: 1}, Valid: true}
@@ -206,6 +206,7 @@ func (row presenceUserRow) Scan(dest ...any) error {
 		"unspecified",
 		sql.NullString{},
 		pgtype.UUID{},
+		"human",
 		"active",
 		sql.NullString{},
 		sql.NullString{},

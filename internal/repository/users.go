@@ -20,6 +20,7 @@ const userSelectColumns = `
 	gender,
 	gender_custom,
 	avatar_file_id,
+	account_type,
 	status,
 	signature,
 	region,
@@ -40,6 +41,7 @@ const userSelectColumnsU = `
 	u.gender,
 	u.gender_custom,
 	u.avatar_file_id,
+	u.account_type,
 	u.status,
 	u.signature,
 	u.region,
@@ -74,6 +76,7 @@ type User struct {
 	Gender         string
 	GenderCustom   *string
 	AvatarFileID   *string
+	AccountType    string
 	Status         string
 	Signature      *string
 	Region         *string
@@ -105,6 +108,7 @@ type CreateUserParams struct {
 	Gender       string
 	GenderCustom *string
 	AvatarFileID *string
+	AccountType  string
 	Status       string
 	Signature    *string
 	Region       *string
@@ -134,6 +138,10 @@ func (r *UserRepository) Create(ctx context.Context, params CreateUserParams) (U
 	if status == "" {
 		status = "active"
 	}
+	accountType := normalizeText(params.AccountType)
+	if accountType == "" {
+		accountType = "human"
+	}
 
 	row := r.db.QueryRow(ctx, `
 		INSERT INTO users (
@@ -144,11 +152,12 @@ func (r *UserRepository) Create(ctx context.Context, params CreateUserParams) (U
 			gender,
 			gender_custom,
 			avatar_file_id,
+			account_type,
 			status,
 			signature,
 			region
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7::uuid, $8, $9, $10)
+		VALUES ($1, $2, $3, $4, $5, $6, $7::uuid, $8, $9, $10, $11)
 		RETURNING `+userSelectColumns,
 		normalizeText(params.PublicID),
 		normalizeEmail(params.Email),
@@ -157,6 +166,7 @@ func (r *UserRepository) Create(ctx context.Context, params CreateUserParams) (U
 		gender,
 		normalizeTextPtr(params.GenderCustom),
 		normalizeTextPtr(params.AvatarFileID),
+		accountType,
 		status,
 		normalizeTextPtr(params.Signature),
 		normalizeTextPtr(params.Region),
@@ -501,6 +511,7 @@ func scanUser(row scanner) (User, error) {
 		&user.Gender,
 		&genderCustom,
 		&avatarFileID,
+		&user.AccountType,
 		&user.Status,
 		&signature,
 		&region,

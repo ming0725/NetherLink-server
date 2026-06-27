@@ -216,21 +216,31 @@ func NewChatRepository(db DBTX) *ChatRepository {
 	return &ChatRepository{db: db}
 }
 
-func (r *ChatRepository) ListConversationsForUser(ctx context.Context, userID string, keyword string, limit int, offset int) ([]ConversationEntry, error) {
+func (r *ChatRepository) ListConversationsForUser(ctx context.Context, userID string, deviceID string, keyword string, limit int, offset int) ([]ConversationEntry, error) {
 	rows, err := r.db.Query(ctx, conversationEntrySelectSQL()+`
 		WHERE cp.user_id = $1::uuid
 		  AND c.deleted_at IS NULL
 		  AND cp.hidden_at IS NULL
+		  AND NOT EXISTS (
+		    SELECT 1
+		    FROM conversation_device_states cds
+		    WHERE cds.conversation_id = cp.conversation_id
+		      AND cds.user_id = cp.user_id
+		      AND cds.device_id = $2
+		      AND cds.hidden_at IS NOT NULL
+		      AND (c.last_message_at IS NULL OR c.last_message_at <= cds.hidden_at)
+		  )
 		  AND (
-		    $2 = ''
-		    OR peer.public_id ILIKE '%' || $2 || '%'
-		    OR peer.nick ILIKE '%' || $2 || '%'
-		    OR g.public_id ILIKE '%' || $2 || '%'
-		    OR g.name ILIKE '%' || $2 || '%'
+		    $3 = ''
+		    OR peer.public_id ILIKE '%' || $3 || '%'
+		    OR peer.nick ILIKE '%' || $3 || '%'
+		    OR g.public_id ILIKE '%' || $3 || '%'
+		    OR g.name ILIKE '%' || $3 || '%'
 		  )
 		ORDER BY cp.is_pinned DESC, COALESCE(c.last_message_at, c.updated_at) DESC, c.created_at DESC
-		LIMIT $3 OFFSET $4`,
+		LIMIT $4 OFFSET $5`,
 		normalizeText(userID),
+		normalizeText(deviceID),
 		normalizeText(keyword),
 		limit,
 		offset,
@@ -695,27 +705,43 @@ func (r *ChatRepository) RecallMessage(ctx context.Context, userID string, conve
 	return messages[0], nil
 }
 
-func (r *ChatRepository) HideConversationHistory(ctx context.Context, userID string, conversationID string) (ConversationParticipant, error) {
+func (r *ChatRepository) HideConversationHistory(ctx context.Context, userID string, deviceID string, conversationID string) (ConversationParticipant, error) {
 	participant, err := scanConversationParticipant(r.db.QueryRow(ctx, `
-		UPDATE conversation_participants cp
-		SET hidden_at = now(),
-		    last_read_message_id = c.last_message_id,
-		    last_read_at = now(),
-		    unread_count = 0,
-		    updated_at = now()
-		FROM conversations c
-		WHERE c.id = cp.conversation_id
-		  AND cp.user_id = $1::uuid
-		  AND cp.conversation_id = $2::uuid
-		  AND c.deleted_at IS NULL
-		RETURNING `+participantSelectColumns,
+		WITH device_state AS (
+			INSERT INTO conversation_device_states (
+				conversation_id,
+				user_id,
+				device_id,
+				hidden_at
+			)
+			SELECT cp.conversation_id,
+			       cp.user_id,
+			       $2,
+			       now()
+			FROM conversation_participants cp
+			JOIN conversations c
+			  ON c.id = cp.conversation_id
+			 AND c.deleted_at IS NULL
+			WHERE cp.user_id = $1::uuid
+			  AND cp.conversation_id = $3::uuid
+			ON CONFLICT (conversation_id, user_id, device_id)
+			DO UPDATE SET hidden_at = EXCLUDED.hidden_at,
+			              updated_at = now()
+			RETURNING conversation_id, user_id
+		)
+		SELECT `+participantSelectColumns+`
+		FROM conversation_participants cp
+		JOIN device_state ds
+		  ON ds.conversation_id = cp.conversation_id
+		 AND ds.user_id = cp.user_id`,
 		normalizeText(userID),
+		normalizeText(deviceID),
 		normalizeText(conversationID),
 	))
 	return participant, translateWriteError(err)
 }
 
-func (r *ChatRepository) ListMessagesForParticipant(ctx context.Context, userID string, conversationID string, beforeSeq *int64, afterSeq *int64, limit int) ([]Message, error) {
+func (r *ChatRepository) ListMessagesForParticipant(ctx context.Context, userID string, deviceID string, conversationID string, beforeSeq *int64, afterSeq *int64, limit int) ([]Message, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT `+messageSelectColumns+`
 		FROM messages m
@@ -725,14 +751,20 @@ func (r *ChatRepository) ListMessagesForParticipant(ctx context.Context, userID 
 		JOIN conversations c
 		  ON c.id = m.conversation_id
 		 AND c.deleted_at IS NULL
+		LEFT JOIN conversation_device_states cds
+		  ON cds.conversation_id = m.conversation_id
+		 AND cds.user_id = cp.user_id
+		 AND cds.device_id = $3
 		WHERE m.conversation_id = $1::uuid
 		  AND (cp.hidden_at IS NULL OR m.created_at > cp.hidden_at)
-		  AND ($3::bigint IS NULL OR m.message_seq < $3)
-		  AND ($4::bigint IS NULL OR m.message_seq > $4)
+		  AND (cds.hidden_at IS NULL OR m.created_at > cds.hidden_at)
+		  AND ($4::bigint IS NULL OR m.message_seq < $4)
+		  AND ($5::bigint IS NULL OR m.message_seq > $5)
 		ORDER BY m.message_seq DESC
-		LIMIT $5`,
+		LIMIT $6`,
 		normalizeText(conversationID),
 		normalizeText(userID),
+		normalizeText(deviceID),
 		beforeSeq,
 		afterSeq,
 		limit,

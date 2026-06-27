@@ -15,6 +15,7 @@ CREATE TABLE users (
   gender TEXT NOT NULL DEFAULT 'unspecified',
   gender_custom TEXT,
   avatar_file_id UUID,
+  account_type TEXT NOT NULL DEFAULT 'human',
   status TEXT NOT NULL DEFAULT 'active',
   signature TEXT,
   region TEXT,
@@ -278,6 +279,17 @@ CREATE TABLE conversation_participants (
   PRIMARY KEY (conversation_id, user_id)
 );
 
+CREATE TABLE conversation_device_states (
+  conversation_id UUID NOT NULL,
+  user_id UUID NOT NULL,
+  device_id TEXT NOT NULL,
+  hidden_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (conversation_id, user_id, device_id),
+  FOREIGN KEY (conversation_id, user_id) REFERENCES conversation_participants(conversation_id, user_id) ON DELETE CASCADE
+);
+
 CREATE TABLE messages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -472,6 +484,18 @@ CREATE TABLE ai_messages (
   deleted_at TIMESTAMPTZ
 );
 
+CREATE TABLE ai_message_traces (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  conversation_id UUID NOT NULL REFERENCES ai_conversations(id) ON DELETE CASCADE,
+  message_id UUID NOT NULL UNIQUE REFERENCES ai_messages(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'completed',
+  summary TEXT NOT NULL DEFAULT '',
+  steps_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  source_refs_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE ai_uploaded_files (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   conversation_id UUID NOT NULL REFERENCES ai_conversations(id) ON DELETE CASCADE,
@@ -501,6 +525,155 @@ CREATE TABLE ai_file_chunks (
   UNIQUE (ai_file_id, chunk_index)
 );
 
+CREATE TABLE agent_style_profiles (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  source_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  consent_status TEXT NOT NULL DEFAULT 'pending',
+  sample_refs_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  style_summary TEXT NOT NULL DEFAULT '',
+  style_embedding DOUBLE PRECISION[],
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at TIMESTAMPTZ
+);
+
+CREATE TABLE agent_profiles (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  bot_user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+  owner_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  visibility TEXT NOT NULL DEFAULT 'private',
+  name TEXT NOT NULL,
+  avatar_file_id UUID REFERENCES files(id) ON DELETE SET NULL,
+  base_prompt TEXT NOT NULL DEFAULT '',
+  model TEXT,
+  tool_policy_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  safety_policy_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  style_profile_id UUID REFERENCES agent_style_profiles(id) ON DELETE SET NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at TIMESTAMPTZ
+);
+
+CREATE TABLE agent_bindings (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id UUID NOT NULL REFERENCES agent_profiles(id) ON DELETE CASCADE,
+  scope_type TEXT NOT NULL,
+  scope_id UUID NOT NULL,
+  trigger_mode TEXT NOT NULL DEFAULT 'manual',
+  enabled BOOLEAN NOT NULL DEFAULT true,
+  cooldown_seconds INTEGER NOT NULL DEFAULT 0,
+  created_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at TIMESTAMPTZ,
+  UNIQUE (agent_id, scope_type, scope_id)
+);
+
+CREATE TABLE agent_runs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id UUID NOT NULL REFERENCES agent_profiles(id) ON DELETE CASCADE,
+  invoker_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  source_type TEXT NOT NULL,
+  source_id UUID,
+  status TEXT NOT NULL DEFAULT 'queued',
+  input_snapshot_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  context_refs_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  tool_calls_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  output_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  model TEXT,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  latency_ms INTEGER NOT NULL DEFAULT 0,
+  error_code TEXT,
+  client_operation_id TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at TIMESTAMPTZ
+);
+
+CREATE TABLE agent_memories (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id UUID NOT NULL REFERENCES agent_profiles(id) ON DELETE CASCADE,
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  scope_type TEXT NOT NULL,
+  scope_id UUID,
+  memory_type TEXT NOT NULL,
+  content TEXT NOT NULL,
+  source_refs_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  confidence DOUBLE PRECISION NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at TIMESTAMPTZ
+);
+
+CREATE TABLE rag_documents (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  source_type TEXT NOT NULL,
+  source_id UUID NOT NULL,
+  owner_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  visibility TEXT NOT NULL,
+  title TEXT,
+  metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at TIMESTAMPTZ,
+  UNIQUE (source_type, source_id)
+);
+
+CREATE TABLE rag_chunks (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  document_id UUID NOT NULL REFERENCES rag_documents(id) ON DELETE CASCADE,
+  chunk_index INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  token_count INTEGER NOT NULL DEFAULT 0,
+  embedding_vector DOUBLE PRECISION[],
+  metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (document_id, chunk_index)
+);
+
+CREATE TABLE mcp_servers (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL UNIQUE,
+  display_name TEXT NOT NULL DEFAULT '',
+  transport TEXT NOT NULL,
+  endpoint TEXT,
+  command TEXT,
+  args_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  env_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  secret_refs_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status TEXT NOT NULL DEFAULT 'disabled',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at TIMESTAMPTZ
+);
+
+CREATE TABLE mcp_tools (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  server_id UUID NOT NULL REFERENCES mcp_servers(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  namespaced_name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  input_schema_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  output_schema_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  side_effect BOOLEAN NOT NULL DEFAULT false,
+  requires_confirmation BOOLEAN NOT NULL DEFAULT true,
+  status TEXT NOT NULL DEFAULT 'active',
+  last_synced_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at TIMESTAMPTZ,
+  UNIQUE (server_id, name),
+  UNIQUE (namespaced_name)
+);
+
 CREATE TABLE operation_receipts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -528,6 +701,7 @@ CREATE INDEX idx_friendships_user_id ON friendships(user_id);
 CREATE INDEX idx_friend_requests_to_user_status ON friend_requests(to_user_id, status);
 CREATE INDEX idx_group_members_user_id ON group_members(user_id);
 CREATE INDEX idx_conversation_participants_user_id ON conversation_participants(user_id);
+CREATE INDEX idx_conversation_device_states_user_device ON conversation_device_states(user_id, device_id);
 CREATE INDEX idx_messages_conversation_seq ON messages(conversation_id, message_seq DESC);
 CREATE INDEX idx_notifications_user_read ON notifications(user_id, read_at);
 CREATE INDEX idx_realtime_events_emitted_seq ON realtime_events(emitted_at, event_seq);
@@ -536,6 +710,17 @@ CREATE INDEX idx_posts_author_created ON posts(author_id, created_at DESC);
 CREATE INDEX idx_post_comments_post_created ON post_comments(post_id, created_at DESC);
 CREATE INDEX idx_post_replies_comment_created ON post_comment_replies(comment_id, created_at ASC);
 CREATE INDEX idx_ai_conversations_user_updated ON ai_conversations(user_id, updated_at DESC);
+CREATE INDEX idx_ai_message_traces_conversation_created ON ai_message_traces(conversation_id, created_at ASC);
+CREATE INDEX idx_agent_profiles_owner_updated ON agent_profiles(owner_user_id, updated_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX idx_agent_profiles_kind_status ON agent_profiles(kind, status) WHERE deleted_at IS NULL;
+CREATE INDEX idx_agent_bindings_scope ON agent_bindings(scope_type, scope_id) WHERE deleted_at IS NULL;
+CREATE INDEX idx_agent_runs_agent_created ON agent_runs(agent_id, created_at DESC);
+CREATE INDEX idx_agent_runs_invoker_created ON agent_runs(invoker_user_id, created_at DESC);
+CREATE INDEX idx_agent_memories_scope ON agent_memories(agent_id, user_id, scope_type, scope_id) WHERE deleted_at IS NULL;
+CREATE INDEX idx_rag_documents_source ON rag_documents(source_type, source_id);
+CREATE INDEX idx_rag_chunks_document_index ON rag_chunks(document_id, chunk_index);
+CREATE INDEX idx_mcp_servers_status_name ON mcp_servers(status, name) WHERE deleted_at IS NULL;
+CREATE INDEX idx_mcp_tools_server_status ON mcp_tools(server_id, status) WHERE deleted_at IS NULL;
 
 DO $$
 DECLARE
@@ -561,6 +746,7 @@ BEGIN
     'group_events',
     'conversations',
     'conversation_participants',
+    'conversation_device_states',
     'messages',
     'message_attachments',
     'notifications',
@@ -574,8 +760,18 @@ BEGIN
     'follows',
     'ai_conversations',
     'ai_messages',
+    'ai_message_traces',
     'ai_uploaded_files',
     'ai_file_chunks',
+    'agent_style_profiles',
+    'agent_profiles',
+    'agent_bindings',
+    'agent_runs',
+    'agent_memories',
+    'rag_documents',
+    'rag_chunks',
+    'mcp_servers',
+    'mcp_tools',
     'operation_receipts'
   ]
   LOOP

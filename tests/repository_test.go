@@ -33,6 +33,12 @@ func TestRepositoryAggregateConstructor(t *testing.T) {
 	if repositories.AI == nil {
 		t.Fatal("AI repository is nil")
 	}
+	if repositories.Agents == nil {
+		t.Fatal("Agents repository is nil")
+	}
+	if repositories.MCP == nil {
+		t.Fatal("MCP repository is nil")
+	}
 	if repositories.RealtimeEvents == nil {
 		t.Fatal("RealtimeEvents repository is nil")
 	}

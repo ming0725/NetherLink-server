@@ -54,6 +54,7 @@ type AttachmentInput struct {
 
 type ListMessagesInput struct {
 	UserID         string
+	DeviceID       string
 	ConversationID string
 	BeforeSeq      *int64
 	AfterSeq       *int64
@@ -61,10 +62,11 @@ type ListMessagesInput struct {
 }
 
 type ListConversationsInput struct {
-	UserID  string
-	Keyword string
-	Limit   int
-	Offset  int
+	UserID   string
+	DeviceID string
+	Keyword  string
+	Limit    int
+	Offset   int
 }
 
 type OpenDirectConversationInput struct {
@@ -112,6 +114,7 @@ type RecallMessageInput struct {
 
 type HideConversationHistoryInput struct {
 	UserID         string
+	DeviceID       string
 	ConversationID string
 }
 
@@ -123,10 +126,10 @@ func (s *Service) ListConversations(ctx context.Context, input ListConversations
 	if s.repos.Chat == nil {
 		return nil, ErrUnavailable
 	}
-	if strings.TrimSpace(input.UserID) == "" || input.Limit <= 0 || input.Offset < 0 {
+	if strings.TrimSpace(input.UserID) == "" || strings.TrimSpace(input.DeviceID) == "" || input.Limit <= 0 || input.Offset < 0 {
 		return nil, ErrValidation
 	}
-	conversations, err := s.repos.Chat.ListConversationsForUser(ctx, input.UserID, input.Keyword, input.Limit, input.Offset)
+	conversations, err := s.repos.Chat.ListConversationsForUser(ctx, input.UserID, input.DeviceID, input.Keyword, input.Limit, input.Offset)
 	if err != nil {
 		return nil, mapError(err)
 	}
@@ -322,10 +325,10 @@ func (s *Service) HideConversationHistory(ctx context.Context, input HideConvers
 	if s.repos.Chat == nil {
 		return repository.ConversationParticipant{}, ErrUnavailable
 	}
-	if strings.TrimSpace(input.UserID) == "" || strings.TrimSpace(input.ConversationID) == "" {
+	if strings.TrimSpace(input.UserID) == "" || strings.TrimSpace(input.DeviceID) == "" || strings.TrimSpace(input.ConversationID) == "" {
 		return repository.ConversationParticipant{}, ErrValidation
 	}
-	participant, err := s.repos.Chat.HideConversationHistory(ctx, input.UserID, input.ConversationID)
+	participant, err := s.repos.Chat.HideConversationHistory(ctx, input.UserID, input.DeviceID, input.ConversationID)
 	if err != nil {
 		return repository.ConversationParticipant{}, mapError(err)
 	}
@@ -468,14 +471,14 @@ func (s *Service) ListMessages(ctx context.Context, input ListMessagesInput) ([]
 	if s.repos.Chat == nil {
 		return nil, ErrUnavailable
 	}
-	if strings.TrimSpace(input.UserID) == "" || strings.TrimSpace(input.ConversationID) == "" || input.Limit <= 0 {
+	if strings.TrimSpace(input.UserID) == "" || strings.TrimSpace(input.DeviceID) == "" || strings.TrimSpace(input.ConversationID) == "" || input.Limit <= 0 {
 		return nil, ErrValidation
 	}
 	if input.BeforeSeq != nil && input.AfterSeq != nil {
 		return nil, ErrValidation
 	}
 
-	messages, err := s.repos.Chat.ListMessagesForParticipant(ctx, input.UserID, input.ConversationID, input.BeforeSeq, input.AfterSeq, input.Limit)
+	messages, err := s.repos.Chat.ListMessagesForParticipant(ctx, input.UserID, input.DeviceID, input.ConversationID, input.BeforeSeq, input.AfterSeq, input.Limit)
 	if err != nil {
 		return nil, mapError(err)
 	}
