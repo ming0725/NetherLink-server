@@ -718,7 +718,7 @@ func TestCompletionToolDefinitionsExposeSearchAndRead(t *testing.T) {
 	for _, definition := range definitions {
 		names[definition.Name] = true
 	}
-	for _, name := range []string{toolNameLocalTime, toolNameCalculate, toolNameCalendar, toolNameWebSearch, toolNameWebRead} {
+	for _, name := range []string{toolNameLocalTime, toolNameCalculate, toolNameCalendar, toolNameWebSearch, toolNameWebRead, toolNameSubAgent} {
 		if !names[name] {
 			t.Fatalf("tool definitions missing %q: %#v", name, definitions)
 		}
@@ -737,8 +737,42 @@ func TestCompletionToolDefinitionsExposeDirectReadWithoutSearchKey(t *testing.T)
 	if names[toolNameWebSearch] {
 		t.Fatalf("tool definitions unexpectedly include %q without key", toolNameWebSearch)
 	}
-	if !names[toolNameCalculate] || !names[toolNameCalendar] {
+	if !names[toolNameCalculate] || !names[toolNameCalendar] || !names[toolNameSubAgent] {
 		t.Fatalf("tool definitions missing utility tools without search key: %#v", definitions)
+	}
+}
+
+func TestCompletionToolDefinitionsExposeSearchWithBaiduOnly(t *testing.T) {
+	definitions := completionToolDefinitions(config.AIConfig{BaiduSearchAPIKey: "configured"})
+	names := map[string]bool{}
+	for _, definition := range definitions {
+		names[definition.Name] = true
+	}
+	if !names[toolNameWebSearch] {
+		t.Fatalf("tool definitions missing %q with Baidu configured: %#v", toolNameWebSearch, definitions)
+	}
+}
+
+func TestGroupBotCompletionToolDefinitionsExposeTwoStepGroupSearch(t *testing.T) {
+	definitions := groupBotCompletionToolDefinitions(config.AIConfig{})
+	var groupSearch *tools.ToolDefinition
+	for index := range definitions {
+		if definitions[index].Name == toolNameGroupChatSearch {
+			groupSearch = &definitions[index]
+			break
+		}
+	}
+	if groupSearch == nil {
+		t.Fatalf("group bot tool definitions missing %q: %#v", toolNameGroupChatSearch, definitions)
+	}
+	properties, ok := groupSearch.Schema.(map[string]any)["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("group search schema = %#v, want properties", groupSearch.Schema)
+	}
+	for _, name := range []string{"mode", "message_id", "message_seq", "context_before", "context_after"} {
+		if _, ok := properties[name]; !ok {
+			t.Fatalf("group search schema missing %q: %#v", name, properties)
+		}
 	}
 }
 
@@ -764,6 +798,71 @@ func TestRunCompletionToolExecutesUtilityTools(t *testing.T) {
 	})
 	if !strings.Contains(calendarResult, `"date":"2026-06-29"`) || !strings.Contains(calendarResult, `"ok":true`) {
 		t.Fatalf("calendar result = %s, want next business day", calendarResult)
+	}
+}
+
+func TestRunCompletionToolExecutesSubAgentResearch(t *testing.T) {
+	service := &Service{}
+	result := service.runCompletionTool(context.Background(), tools.ToolCall{
+		ID:   "call_subagent",
+		Name: toolNameSubAgent,
+		Arguments: map[string]any{
+			"objective": "check utility subtasks",
+			"tasks": []map[string]any{
+				{
+					"id":              "calc",
+					"title":           "calculate expression",
+					"input":           "7 * 6",
+					"expected_output": "numeric value 42",
+					"available_tools": []string{toolNameCalculate},
+					"need_tool":       true,
+					"tool_necessity":  "A calculator avoids arithmetic mistakes.",
+					"tool":            toolNameCalculate,
+					"arguments":       map[string]any{"expression": "7 * 6"},
+					"validation":      "Result value must equal 42.",
+				},
+				{
+					"id":              "calendar",
+					"title":           "business day",
+					"input":           "add one business day to 2026-06-26",
+					"expected_output": "2026-06-29",
+					"available_tools": []string{toolNameCalendar},
+					"need_tool":       true,
+					"tool_necessity":  "Business-day logic depends on calendar rules.",
+					"tool":            toolNameCalendar,
+					"arguments": map[string]any{
+						"operation": "business_add",
+						"date":      "2026-06-26",
+						"amount":    1,
+					},
+					"validation": "Result date must be the next business day.",
+				},
+			},
+		},
+	})
+	var decoded struct {
+		OK          bool `json:"ok"`
+		ResultCount int  `json:"result_count"`
+		TaskCount   int  `json:"task_count"`
+		Results     []struct {
+			ID     string         `json:"id"`
+			Tool   string         `json:"tool"`
+			OK     bool           `json:"ok"`
+			Result map[string]any `json:"result"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(result), &decoded); err != nil {
+		t.Fatalf("decode subagent result: %v\n%s", err, result)
+	}
+	if !decoded.OK || decoded.ResultCount != 2 || decoded.TaskCount != 2 || len(decoded.Results) != 2 {
+		t.Fatalf("subagent result = %#v, raw=%s", decoded, result)
+	}
+	if decoded.Results[0].ID != "calc" || decoded.Results[0].Tool != toolNameCalculate || !decoded.Results[0].OK || decoded.Results[0].Result["value"] != "42" {
+		t.Fatalf("calc subtask = %#v", decoded.Results[0])
+	}
+	calendarPayload, _ := decoded.Results[1].Result["result"].(map[string]any)
+	if decoded.Results[1].ID != "calendar" || decoded.Results[1].Tool != toolNameCalendar || !decoded.Results[1].OK || calendarPayload["date"] != "2026-06-29" {
+		t.Fatalf("calendar subtask = %#v", decoded.Results[1])
 	}
 }
 

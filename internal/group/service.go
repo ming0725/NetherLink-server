@@ -28,6 +28,7 @@ const (
 	groupPublicIDLength       = 10
 	groupRoleOwner            = "owner"
 	groupRoleAdmin            = "admin"
+	groupRoleAI               = "ai"
 	groupRoleMember           = "member"
 )
 
@@ -400,7 +401,7 @@ func (s *Service) UpdateMember(ctx context.Context, input UpdateMemberInput) (re
 		return repository.GroupMember{}, mapRepositoryError(err)
 	}
 	if role != nil {
-		if viewer.Role != groupRoleOwner || target.Role == groupRoleOwner {
+		if viewer.Role != groupRoleOwner || target.Role == groupRoleOwner || target.Role == groupRoleAI {
 			return repository.GroupMember{}, ErrForbidden
 		}
 	} else if input.UserID != input.TargetUserID {
@@ -438,8 +439,12 @@ func (s *Service) TransferOwner(ctx context.Context, input TransferOwnerInput) (
 		if viewer.Role != groupRoleOwner {
 			return ErrForbidden
 		}
-		if _, err := repos.Groups.GetMember(ctx, input.GroupID, input.TargetUserID); err != nil {
+		target, err := repos.Groups.GetMember(ctx, input.GroupID, input.TargetUserID)
+		if err != nil {
 			return mapRepositoryError(err)
+		}
+		if target.Role == groupRoleAI {
+			return ErrForbidden
 		}
 		if _, err := repos.Groups.UpdateOwner(ctx, input.GroupID, input.TargetUserID); err != nil {
 			return mapRepositoryError(err)

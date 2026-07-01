@@ -41,6 +41,56 @@ func EnsureRuntimeSchema(ctx context.Context, db schemaExecer) error {
 			FOREIGN KEY (conversation_id, user_id) REFERENCES conversation_participants(conversation_id, user_id) ON DELETE CASCADE
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_conversation_device_states_user_device ON conversation_device_states(user_id, device_id)`,
+		`CREATE TABLE IF NOT EXISTS message_mentions (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+			target_type TEXT NOT NULL,
+			target_identifier TEXT NOT NULL,
+			target_user_id UUID REFERENCES users(id) ON DELETE RESTRICT,
+			position INTEGER NOT NULL DEFAULT 0,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			CONSTRAINT message_mentions_target_type_check CHECK (target_type IN ('user', 'ai')),
+			CONSTRAINT message_mentions_user_target_check CHECK (target_type <> 'user' OR target_user_id IS NOT NULL),
+			UNIQUE (message_id, target_type, target_identifier)
+		)`,
+		`ALTER TABLE message_mentions DROP CONSTRAINT IF EXISTS message_mentions_target_type_check`,
+		`ALTER TABLE message_mentions ADD CONSTRAINT message_mentions_target_type_check CHECK (target_type IN ('user', 'ai'))`,
+		`ALTER TABLE message_mentions DROP CONSTRAINT IF EXISTS message_mentions_user_target_check`,
+		`ALTER TABLE message_mentions ADD CONSTRAINT message_mentions_user_target_check CHECK (target_type <> 'user' OR target_user_id IS NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS idx_message_mentions_user_id ON message_mentions(target_user_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_message_mentions_message_user_unique ON message_mentions(message_id, target_user_id) WHERE target_type = 'user' AND target_user_id IS NOT NULL`,
+		`CREATE TABLE IF NOT EXISTS group_states (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			group_id UUID NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+			state_type TEXT NOT NULL,
+			state_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+			source_refs_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+			version INTEGER NOT NULL DEFAULT 1,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			deleted_at TIMESTAMPTZ,
+			UNIQUE (group_id, state_type)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_group_states_group_type ON group_states(group_id, state_type) WHERE deleted_at IS NULL`,
+		`CREATE TABLE IF NOT EXISTS group_chat_summaries (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			group_id UUID NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+			conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+			period_type TEXT NOT NULL,
+			period_start DATE NOT NULL,
+			period_end DATE NOT NULL,
+			summary TEXT NOT NULL,
+			topic_tags_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+			source_refs_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+			created_by_agent_id UUID,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			deleted_at TIMESTAMPTZ,
+			CONSTRAINT group_chat_summaries_period_type_check CHECK (period_type IN ('day', 'week', 'month')),
+			UNIQUE (group_id, conversation_id, period_type, period_start)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_group_chat_summaries_group_period ON group_chat_summaries(group_id, conversation_id, period_type, period_start DESC) WHERE deleted_at IS NULL`,
 		`CREATE TABLE IF NOT EXISTS ai_message_traces (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			conversation_id UUID NOT NULL REFERENCES ai_conversations(id) ON DELETE CASCADE,
@@ -166,6 +216,19 @@ func EnsureRuntimeSchema(ctx context.Context, db schemaExecer) error {
 		`CREATE INDEX IF NOT EXISTS idx_agent_runs_agent_created ON agent_runs(agent_id, created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_runs_invoker_created ON agent_runs(invoker_user_id, created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_memories_scope ON agent_memories(agent_id, user_id, scope_type, scope_id) WHERE deleted_at IS NULL`,
+		`UPDATE group_members gm
+		SET role = 'ai',
+		    updated_at = now()
+		FROM agent_bindings ab
+		JOIN agent_profiles ap
+		  ON ap.id = ab.agent_id
+		 AND ap.deleted_at IS NULL
+		 AND ap.kind = 'group_bot'
+		WHERE ab.scope_type = 'group'
+		  AND ab.scope_id = gm.group_id
+		  AND ab.deleted_at IS NULL
+		  AND gm.user_id = ap.bot_user_id
+		  AND gm.role <> 'ai'`,
 		`CREATE INDEX IF NOT EXISTS idx_rag_documents_source ON rag_documents(source_type, source_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_rag_chunks_document_index ON rag_chunks(document_id, chunk_index)`,
 		`CREATE TABLE IF NOT EXISTS mcp_servers (
@@ -219,16 +282,19 @@ func EnsureRuntimeSchema(ctx context.Context, db schemaExecer) error {
 		`DO $$
 		DECLARE
 			table_name TEXT;
-		BEGIN
-			IF to_regproc('set_updated_at') IS NULL THEN
-				RETURN;
-			END IF;
-			FOREACH table_name IN ARRAY ARRAY[
-				'ai_message_traces',
-				'agent_style_profiles',
-				'agent_profiles',
-				'agent_bindings',
-				'agent_runs',
+			BEGIN
+				IF to_regproc('set_updated_at') IS NULL THEN
+					RETURN;
+				END IF;
+				FOREACH table_name IN ARRAY ARRAY[
+					'message_mentions',
+					'group_states',
+					'group_chat_summaries',
+					'ai_message_traces',
+					'agent_style_profiles',
+					'agent_profiles',
+					'agent_bindings',
+					'agent_runs',
 				'agent_memories',
 				'rag_documents',
 				'rag_chunks',

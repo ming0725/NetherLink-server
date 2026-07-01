@@ -129,6 +129,34 @@ type GroupJoinRequest struct {
 	UpdatedAt    time.Time
 }
 
+type GroupState struct {
+	ID         string
+	GroupID    string
+	StateType  string
+	State      json.RawMessage
+	SourceRefs json.RawMessage
+	Version    int
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+	DeletedAt  *time.Time
+}
+
+type GroupChatSummary struct {
+	ID               string
+	GroupID          string
+	ConversationID   string
+	PeriodType       string
+	PeriodStart      string
+	PeriodEnd        string
+	Summary          string
+	TopicTags        json.RawMessage
+	SourceRefs       json.RawMessage
+	CreatedByAgentID *string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	DeletedAt        *time.Time
+}
+
 type CreateGroupParams struct {
 	PublicID     string
 	Name         string
@@ -168,6 +196,25 @@ type UpsertGroupUserSettingsParams struct {
 	ListGroupNameSet bool
 	ListGroupName    *string
 	IsDND            *bool
+}
+
+type UpsertGroupStateParams struct {
+	GroupID    string
+	StateType  string
+	State      json.RawMessage
+	SourceRefs json.RawMessage
+}
+
+type UpsertGroupChatSummaryParams struct {
+	GroupID          string
+	ConversationID   string
+	PeriodType       string
+	PeriodStart      string
+	PeriodEnd        string
+	Summary          string
+	TopicTags        json.RawMessage
+	SourceRefs       json.RawMessage
+	CreatedByAgentID *string
 }
 
 func NewGroupRepository(db DBTX) *GroupRepository {
@@ -692,6 +739,176 @@ func (r *GroupRepository) AddEvent(ctx context.Context, groupID string, eventTyp
 	return translateWriteError(err)
 }
 
+func (r *GroupRepository) UpsertState(ctx context.Context, params UpsertGroupStateParams) (GroupState, error) {
+	state, err := scanGroupState(r.db.QueryRow(ctx, `
+		INSERT INTO group_states (
+			group_id,
+			state_type,
+			state_json,
+			source_refs_json
+		)
+		VALUES ($1::uuid, $2, $3, $4)
+		ON CONFLICT (group_id, state_type) DO UPDATE
+		SET state_json = EXCLUDED.state_json,
+		    source_refs_json = EXCLUDED.source_refs_json,
+		    version = group_states.version + 1,
+		    updated_at = now(),
+		    deleted_at = NULL
+		RETURNING
+			id,
+			group_id,
+			state_type,
+			state_json,
+			source_refs_json,
+			version,
+			created_at,
+			updated_at,
+			deleted_at`,
+		normalizeText(params.GroupID),
+		normalizeText(params.StateType),
+		jsonOrDefault(params.State),
+		jsonOrDefault(params.SourceRefs),
+	))
+	return state, translateWriteError(err)
+}
+
+func (r *GroupRepository) ListStates(ctx context.Context, groupID string, stateTypes []string) ([]GroupState, error) {
+	filter := ""
+	args := []any{normalizeText(groupID)}
+	if len(stateTypes) > 0 {
+		filter = " AND state_type = ANY($2::text[])"
+		args = append(args, stateTypes)
+	}
+	rows, err := r.db.Query(ctx, `
+		SELECT
+			id,
+			group_id,
+			state_type,
+			state_json,
+			source_refs_json,
+			version,
+			created_at,
+			updated_at,
+			deleted_at
+		FROM group_states
+		WHERE group_id = $1::uuid
+		  AND deleted_at IS NULL`+filter+`
+		ORDER BY state_type ASC, updated_at DESC`,
+		args...,
+	)
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	defer rows.Close()
+
+	states, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (GroupState, error) {
+		return scanGroupState(row)
+	})
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	return states, nil
+}
+
+func (r *GroupRepository) UpsertChatSummary(ctx context.Context, params UpsertGroupChatSummaryParams) (GroupChatSummary, error) {
+	summary, err := scanGroupChatSummary(r.db.QueryRow(ctx, `
+		INSERT INTO group_chat_summaries (
+			group_id,
+			conversation_id,
+			period_type,
+			period_start,
+			period_end,
+			summary,
+			topic_tags_json,
+			source_refs_json,
+			created_by_agent_id
+		)
+		VALUES ($1::uuid, $2::uuid, $3, $4::date, $5::date, $6, $7, $8, NULLIF($9, '')::uuid)
+		ON CONFLICT (group_id, conversation_id, period_type, period_start) DO UPDATE
+		SET period_end = EXCLUDED.period_end,
+		    summary = EXCLUDED.summary,
+		    topic_tags_json = EXCLUDED.topic_tags_json,
+		    source_refs_json = EXCLUDED.source_refs_json,
+		    created_by_agent_id = EXCLUDED.created_by_agent_id,
+		    updated_at = now(),
+		    deleted_at = NULL
+		RETURNING
+			id,
+			group_id,
+			conversation_id,
+			period_type,
+			period_start::text,
+			period_end::text,
+			summary,
+			topic_tags_json,
+			source_refs_json,
+			created_by_agent_id,
+			created_at,
+			updated_at,
+			deleted_at`,
+		normalizeText(params.GroupID),
+		normalizeText(params.ConversationID),
+		normalizeText(params.PeriodType),
+		normalizeText(params.PeriodStart),
+		normalizeText(params.PeriodEnd),
+		normalizeText(params.Summary),
+		jsonOrDefaultArray(params.TopicTags),
+		jsonOrDefault(params.SourceRefs),
+		normalizeTextPtr(params.CreatedByAgentID),
+	))
+	return summary, translateWriteError(err)
+}
+
+func (r *GroupRepository) ListChatSummaries(ctx context.Context, groupID string, conversationID string, periodTypes []string, limit int) ([]GroupChatSummary, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	filter := ""
+	args := []any{normalizeText(groupID), normalizeText(conversationID), limit}
+	if len(periodTypes) > 0 {
+		filter = " AND period_type = ANY($4::text[])"
+		args = append(args, periodTypes)
+	}
+	rows, err := r.db.Query(ctx, `
+		SELECT
+			id,
+			group_id,
+			conversation_id,
+			period_type,
+			period_start::text,
+			period_end::text,
+			summary,
+			topic_tags_json,
+			source_refs_json,
+			created_by_agent_id,
+			created_at,
+			updated_at,
+			deleted_at
+		FROM group_chat_summaries
+		WHERE group_id = $1::uuid
+		  AND conversation_id = $2::uuid
+		  AND deleted_at IS NULL`+filter+`
+		ORDER BY period_start DESC, updated_at DESC
+		LIMIT $3`,
+		args...,
+	)
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	defer rows.Close()
+
+	summaries, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (GroupChatSummary, error) {
+		return scanGroupChatSummary(row)
+	})
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	return summaries, nil
+}
+
 func (r *GroupRepository) ListForUser(ctx context.Context, userID string, keyword string, categoryID string, roleFilter string, limit int, offset int) ([]GroupListEntry, int, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT
@@ -732,6 +949,7 @@ func (r *GroupRepository) ListForUser(ctx context.Context, userID string, keywor
 		    OR $4 = 'joined'
 		    OR ($4 IN ('created', 'owner') AND gm.role = 'owner')
 		    OR ($4 = 'admin' AND gm.role = 'admin')
+		    OR ($4 = 'ai' AND gm.role = 'ai')
 		    OR ($4 = 'managed' AND gm.role IN ('owner', 'admin'))
 		    OR ($4 = 'member' AND gm.role = 'member')
 		  )
@@ -888,7 +1106,7 @@ func (r *GroupRepository) ListMembers(ctx context.Context, userID string, groupI
 		  )
 		  AND ($3 = '' OR u.public_id ILIKE '%' || $3 || '%' OR u.nick ILIKE '%' || $3 || '%' OR gm.nickname ILIKE '%' || $3 || '%')
 		ORDER BY
-		  CASE gm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
+		  CASE gm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'ai' THEN 2 ELSE 3 END,
 		  gm.joined_at ASC
 		LIMIT $4 OFFSET $5`,
 		normalizeText(userID),
@@ -1077,6 +1295,76 @@ func (r *GroupRepository) listMemberUserIDsByRole(ctx context.Context, groupID s
 		return nil, err
 	}
 	return userIDs, nil
+}
+
+func scanGroupState(row scanner) (GroupState, error) {
+	var (
+		id        pgtype.UUID
+		groupID   pgtype.UUID
+		deletedAt pgtype.Timestamptz
+		state     GroupState
+	)
+	err := row.Scan(
+		&id,
+		&groupID,
+		&state.StateType,
+		&state.State,
+		&state.SourceRefs,
+		&state.Version,
+		&state.CreatedAt,
+		&state.UpdatedAt,
+		&deletedAt,
+	)
+	if err != nil {
+		return GroupState{}, err
+	}
+	state.ID = uuidString(id)
+	state.GroupID = uuidString(groupID)
+	state.State = jsonOrDefault(state.State)
+	state.SourceRefs = jsonOrDefault(state.SourceRefs)
+	if deletedAt.Valid {
+		state.DeletedAt = &deletedAt.Time
+	}
+	return state, nil
+}
+
+func scanGroupChatSummary(row scanner) (GroupChatSummary, error) {
+	var (
+		id               pgtype.UUID
+		groupID          pgtype.UUID
+		conversationID   pgtype.UUID
+		createdByAgentID pgtype.UUID
+		deletedAt        pgtype.Timestamptz
+		summary          GroupChatSummary
+	)
+	err := row.Scan(
+		&id,
+		&groupID,
+		&conversationID,
+		&summary.PeriodType,
+		&summary.PeriodStart,
+		&summary.PeriodEnd,
+		&summary.Summary,
+		&summary.TopicTags,
+		&summary.SourceRefs,
+		&createdByAgentID,
+		&summary.CreatedAt,
+		&summary.UpdatedAt,
+		&deletedAt,
+	)
+	if err != nil {
+		return GroupChatSummary{}, err
+	}
+	summary.ID = uuidString(id)
+	summary.GroupID = uuidString(groupID)
+	summary.ConversationID = uuidString(conversationID)
+	summary.TopicTags = jsonOrDefaultArray(summary.TopicTags)
+	summary.SourceRefs = jsonOrDefault(summary.SourceRefs)
+	summary.CreatedByAgentID = uuidStringPtr(createdByAgentID)
+	if deletedAt.Valid {
+		summary.DeletedAt = &deletedAt.Time
+	}
+	return summary, nil
 }
 
 func scanGroupListEntry(row scanner) (GroupListEntry, int, error) {

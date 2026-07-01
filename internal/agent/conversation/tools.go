@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"nlserver/internal/agent/mcp"
@@ -17,24 +18,37 @@ import (
 )
 
 const (
-	toolNameWebSearch = agenttoolbuiltins.ModelToolWebSearch
-	toolNameWebRead   = agenttoolbuiltins.ModelToolWebRead
-	toolNameLocalTime = agenttoolbuiltins.ModelToolLocalTime
-	toolNameCalculate = agenttoolbuiltins.ModelToolCalculate
-	toolNameCalendar  = agenttoolbuiltins.ModelToolCalendar
+	toolNameWebSearch       = agenttoolbuiltins.ModelToolWebSearch
+	toolNameWebRead         = agenttoolbuiltins.ModelToolWebRead
+	toolNameLocalTime       = agenttoolbuiltins.ModelToolLocalTime
+	toolNameCalculate       = agenttoolbuiltins.ModelToolCalculate
+	toolNameCalendar        = agenttoolbuiltins.ModelToolCalendar
+	toolNameSubAgent        = agenttoolbuiltins.ModelToolSubAgentResearch
+	toolNameGroupChatSearch = agenttoolbuiltins.ModelToolGroupChatSearch
 )
 
 var (
-	tavilySearchEndpoint  = mcp_websearch.TavilySearchEndpoint
-	tavilyExtractEndpoint = mcp_websearch.TavilyExtractEndpoint
-	braveSearchEndpoint   = mcp_websearch.BraveSearchEndpoint
+	tavilySearchEndpoint   = mcp_websearch.TavilySearchEndpoint
+	tavilyExtractEndpoint  = mcp_websearch.TavilyExtractEndpoint
+	braveSearchEndpoint    = mcp_websearch.BraveSearchEndpoint
+	baiduSearchMCPEndpoint = mcp_websearch.BaiduSearchMCPEndpoint
 )
 
 func completionToolDefinitions(cfg config.AIConfig) []tools.ToolDefinition {
 	return agenttoolbuiltins.CompletionToolDefinitions(cfg)
 }
 
+func groupBotCompletionToolDefinitions(cfg config.AIConfig) []tools.ToolDefinition {
+	return agenttoolbuiltins.CompletionToolDefinitionsWithExtraTools(cfg, []tools.ToolDefinition{
+		agenttoolbuiltins.GroupChatSearchDefinition(),
+	})
+}
+
 func (s *Service) runCompletionTool(ctx context.Context, call tools.ToolCall) string {
+	return s.runCompletionToolWithExecutor(ctx, call, s.runBaseCompletionTool)
+}
+
+func (s *Service) runCompletionToolWithExecutor(ctx context.Context, call tools.ToolCall, executor func(context.Context, tools.ToolCall) string) string {
 	var payload any
 	var err error
 	switch call.Name {
@@ -48,6 +62,10 @@ func (s *Service) runCompletionTool(ctx context.Context, call tools.ToolCall) st
 		payload, err = s.runWebSearchMCPTool(ctx, mcp_websearch.SearchTool, call.Arguments)
 	case toolNameWebRead:
 		payload, err = s.runWebSearchMCPTool(ctx, mcp_websearch.ReadTool, call.Arguments)
+	case toolNameSubAgent:
+		payload, err = s.runSubAgentResearchTool(ctx, call.Arguments, executor)
+	case toolNameGroupChatSearch:
+		err = fmt.Errorf("group_chat_search requires group bot runtime context")
 	default:
 		err = fmt.Errorf("unknown tool %q", call.Name)
 	}
@@ -65,6 +83,265 @@ func (s *Service) runCompletionTool(ctx context.Context, call tools.ToolCall) st
 		return `{"ok":false,"error":"failed to encode tool result"}`
 	}
 	return string(data)
+}
+
+func (s *Service) runBaseCompletionTool(ctx context.Context, call tools.ToolCall) string {
+	var payload any
+	var err error
+	switch call.Name {
+	case toolNameLocalTime:
+		payload, err = runLocalTimeTool(call.Arguments)
+	case toolNameCalculate:
+		payload, err = s.runUtilityMCPTool(ctx, mcp_utility.CalculateTool, call.Arguments)
+	case toolNameCalendar:
+		payload, err = s.runUtilityMCPTool(ctx, mcp_utility.CalendarTool, call.Arguments)
+	case toolNameWebSearch:
+		payload, err = s.runWebSearchMCPTool(ctx, mcp_websearch.SearchTool, call.Arguments)
+	case toolNameWebRead:
+		payload, err = s.runWebSearchMCPTool(ctx, mcp_websearch.ReadTool, call.Arguments)
+	case toolNameGroupChatSearch:
+		err = fmt.Errorf("group_chat_search requires group bot runtime context")
+	default:
+		err = fmt.Errorf("unknown tool %q", call.Name)
+	}
+	if err != nil {
+		s.logCompletionToolFailure(ctx, call, payload, err)
+		payload = map[string]any{
+			"ok":    false,
+			"error": err.Error(),
+		}
+	} else if toolPayloadFailed(payload) {
+		s.logCompletionToolFailure(ctx, call, payload, nil)
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return `{"ok":false,"error":"failed to encode tool result"}`
+	}
+	return string(data)
+}
+
+type subAgentResearchInput struct {
+	Objective string              `json:"objective"`
+	Tasks     []subAgentTaskInput `json:"tasks"`
+}
+
+type subAgentTaskInput struct {
+	ID             string         `json:"id"`
+	Title          string         `json:"title"`
+	Input          string         `json:"input"`
+	ExpectedOutput string         `json:"expected_output"`
+	AvailableTools []string       `json:"available_tools"`
+	NeedTool       *bool          `json:"need_tool"`
+	ToolNecessity  string         `json:"tool_necessity"`
+	Tool           string         `json:"tool"`
+	Arguments      map[string]any `json:"arguments"`
+	Validation     string         `json:"validation"`
+}
+
+type subAgentTaskResult struct {
+	ID               string         `json:"id"`
+	Title            string         `json:"title,omitempty"`
+	Input            string         `json:"input"`
+	ExpectedOutput   string         `json:"expected_output"`
+	AvailableTools   []string       `json:"available_tools"`
+	NeedTool         bool           `json:"need_tool"`
+	ToolNecessity    string         `json:"tool_necessity"`
+	Tool             string         `json:"tool"`
+	Validation       string         `json:"validation"`
+	ValidationStatus string         `json:"validation_status"`
+	Executed         bool           `json:"executed"`
+	OK               bool           `json:"ok"`
+	Result           map[string]any `json:"result,omitempty"`
+	Error            string         `json:"error,omitempty"`
+	ElapsedMS        int            `json:"elapsed_ms"`
+}
+
+func (s *Service) runSubAgentResearchTool(ctx context.Context, args any, executor func(context.Context, tools.ToolCall) string) (map[string]any, error) {
+	var input subAgentResearchInput
+	if err := mcp_websearch.MapToolArgs(args, &input); err != nil {
+		return nil, err
+	}
+	input.Objective = strings.TrimSpace(input.Objective)
+	tasks, err := normalizeSubAgentTasks(input.Tasks)
+	if err != nil {
+		return nil, err
+	}
+	if len(tasks) == 0 {
+		return nil, fmt.Errorf("subagent_research tasks are required")
+	}
+	if executor == nil {
+		executor = s.runBaseCompletionTool
+	}
+	results := make([]subAgentTaskResult, len(tasks))
+	var wg sync.WaitGroup
+	for index, task := range tasks {
+		index := index
+		task := task
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[index] = s.runSubAgentTask(ctx, task, executor)
+		}()
+	}
+	wg.Wait()
+
+	okCount := 0
+	executedCount := 0
+	for _, result := range results {
+		if result.Executed {
+			executedCount++
+		}
+		if result.OK && result.Executed {
+			okCount++
+		}
+	}
+	return map[string]any{
+		"ok":             okCount > 0,
+		"tool":           toolNameSubAgent,
+		"objective":      input.Objective,
+		"result_count":   okCount,
+		"task_count":     len(results),
+		"executed_count": executedCount,
+		"max_steps":      6,
+		"results":        results,
+	}, nil
+}
+
+func normalizeSubAgentTasks(tasks []subAgentTaskInput) ([]subAgentTaskInput, error) {
+	normalized := make([]subAgentTaskInput, 0, len(tasks))
+	for index, task := range tasks {
+		task.ID = strings.TrimSpace(task.ID)
+		if task.ID == "" {
+			task.ID = fmt.Sprintf("task-%d", index+1)
+		}
+		task.Title = strings.TrimSpace(task.Title)
+		task.Input = strings.TrimSpace(task.Input)
+		task.ExpectedOutput = strings.TrimSpace(task.ExpectedOutput)
+		task.AvailableTools = uniqueStrings(task.AvailableTools)
+		task.ToolNecessity = strings.TrimSpace(task.ToolNecessity)
+		task.Tool = strings.TrimSpace(task.Tool)
+		task.Validation = strings.TrimSpace(task.Validation)
+		if task.Arguments == nil {
+			task.Arguments = map[string]any{}
+		}
+		if task.Input == "" {
+			return nil, fmt.Errorf("subagent_research task %d input is required", index+1)
+		}
+		if task.ExpectedOutput == "" {
+			return nil, fmt.Errorf("subagent_research task %d expected_output is required", index+1)
+		}
+		if len(task.AvailableTools) == 0 {
+			return nil, fmt.Errorf("subagent_research task %d available_tools is required", index+1)
+		}
+		if task.NeedTool == nil {
+			return nil, fmt.Errorf("subagent_research task %d need_tool is required", index+1)
+		}
+		if task.ToolNecessity == "" {
+			return nil, fmt.Errorf("subagent_research task %d tool_necessity is required", index+1)
+		}
+		if task.Tool == "" {
+			return nil, fmt.Errorf("subagent_research task %d tool is required", index+1)
+		}
+		if task.Tool == toolNameSubAgent {
+			return nil, fmt.Errorf("subagent_research tasks cannot call subagent_research recursively")
+		}
+		if !stringListContains(task.AvailableTools, task.Tool) {
+			return nil, fmt.Errorf("subagent_research task %d available_tools must include selected tool %q", index+1, task.Tool)
+		}
+		if task.Validation == "" {
+			return nil, fmt.Errorf("subagent_research task %d validation is required", index+1)
+		}
+		normalized = append(normalized, task)
+		if len(normalized) >= 6 {
+			break
+		}
+	}
+	return normalized, nil
+}
+
+func (s *Service) runSubAgentTask(ctx context.Context, task subAgentTaskInput, executor func(context.Context, tools.ToolCall) string) subAgentTaskResult {
+	started := time.Now()
+	needTool := true
+	if task.NeedTool != nil {
+		needTool = *task.NeedTool
+	}
+	result := subAgentTaskResult{
+		ID:             task.ID,
+		Title:          task.Title,
+		Input:          task.Input,
+		ExpectedOutput: task.ExpectedOutput,
+		AvailableTools: task.AvailableTools,
+		NeedTool:       needTool,
+		ToolNecessity:  task.ToolNecessity,
+		Tool:           task.Tool,
+		Validation:     task.Validation,
+	}
+	if !needTool {
+		result.OK = true
+		result.Executed = false
+		result.ValidationStatus = "skipped_tool_not_necessary"
+		result.ElapsedMS = int(time.Since(started).Milliseconds())
+		return result
+	}
+	if executor == nil {
+		executor = s.runBaseCompletionTool
+	}
+	payload := executor(ctx, tools.ToolCall{
+		ID:        "subagent:" + task.ID,
+		Name:      task.Tool,
+		Arguments: task.Arguments,
+	})
+	result.Executed = true
+	result.ElapsedMS = int(time.Since(started).Milliseconds())
+	decoded := map[string]any{}
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		result.Error = "failed to decode subagent tool result: " + err.Error()
+		result.ValidationStatus = "failed_invalid_tool_result"
+		return result
+	}
+	result.OK = toolPayloadOK(decoded)
+	if !result.OK {
+		result.Error = toolPayloadError(decoded)
+		if result.Error == "" {
+			result.Error = "subagent tool returned ok=false"
+		}
+		result.ValidationStatus = "failed_tool_result_not_ok"
+	} else if toolPayloadInt(decoded, "result_count") == 0 && (task.Tool == toolNameWebSearch || task.Tool == toolNameWebRead || task.Tool == toolNameGroupChatSearch) {
+		result.OK = false
+		result.Error = "subagent tool returned no matching results"
+		result.ValidationStatus = "failed_no_matching_results"
+	} else {
+		result.ValidationStatus = "passed_basic_result_available"
+	}
+	result.Result = decoded
+	return result
+}
+
+type groupChatSearchInput struct {
+	Mode             string   `json:"mode"`
+	Query            string   `json:"query"`
+	Keywords         []string `json:"keywords"`
+	MessageID        string   `json:"message_id"`
+	MessageSeq       int64    `json:"message_seq"`
+	Since            string   `json:"since"`
+	Until            string   `json:"until"`
+	BeforeMessageSeq int64    `json:"before_message_seq"`
+	ContextBefore    int      `json:"context_before"`
+	ContextAfter     int      `json:"context_after"`
+	Limit            int      `json:"limit"`
+}
+
+func stringListContains(values []string, target string) bool {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return false
+	}
+	for _, value := range values {
+		if strings.TrimSpace(value) == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) runWebSearchMCPTool(ctx context.Context, toolName string, args any) (map[string]any, error) {
@@ -190,6 +467,7 @@ func syncWebSearchProviderEndpoints() {
 	mcp_websearch.TavilySearchEndpoint = tavilySearchEndpoint
 	mcp_websearch.TavilyExtractEndpoint = tavilyExtractEndpoint
 	mcp_websearch.BraveSearchEndpoint = braveSearchEndpoint
+	mcp_websearch.BaiduSearchMCPEndpoint = baiduSearchMCPEndpoint
 }
 
 func normalizeTavilyTopic(topic string) string {
@@ -220,6 +498,18 @@ func toolPayloadFailed(payload any) bool {
 		return false
 	}
 	return strings.TrimSpace(toolPayloadError(payload)) != ""
+}
+
+func toolPayloadOK(payload any) bool {
+	values, ok := payload.(map[string]any)
+	if !ok {
+		return false
+	}
+	okValue, exists := values["ok"].(bool)
+	if !exists {
+		return true
+	}
+	return okValue
 }
 
 func toolPayloadError(payload any) string {

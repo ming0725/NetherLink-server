@@ -23,6 +23,7 @@ const (
 
 var (
 	ErrValidation  = errors.New("agent: validation failed")
+	ErrForbidden   = errors.New("agent: forbidden")
 	ErrUnavailable = errors.New("agent: unavailable")
 )
 
@@ -47,6 +48,19 @@ type CreateProfileInput struct {
 	Model        *string
 	ToolPolicy   json.RawMessage
 	SafetyPolicy json.RawMessage
+}
+
+type CreateGroupBotInput struct {
+	UserID            string
+	GroupID           string
+	Name              string
+	AvatarFileID      *string
+	BasePrompt        string
+	Model             *string
+	ToolPolicy        json.RawMessage
+	SafetyPolicy      json.RawMessage
+	CooldownSeconds   int
+	ClientOperationID string
 }
 
 type GetProfileInput struct {
@@ -112,6 +126,119 @@ func (s *Service) CreateProfile(ctx context.Context, input CreateProfileInput) (
 		})
 		if err != nil {
 			return err
+		}
+		profile = created
+		return nil
+	})
+	if err != nil {
+		return repository.AgentProfile{}, mapRepositoryError(err)
+	}
+	return profile, nil
+}
+
+func (s *Service) CreateGroupBot(ctx context.Context, input CreateGroupBotInput) (repository.AgentProfile, error) {
+	if s == nil || s.repos.Agents == nil || s.repos.Groups == nil || s.tx == nil {
+		return repository.AgentProfile{}, ErrUnavailable
+	}
+	if normalizedOptional(input.AvatarFileID) != nil && s.repos.Files == nil {
+		return repository.AgentProfile{}, ErrUnavailable
+	}
+	name := strings.TrimSpace(input.Name)
+	basePrompt := strings.TrimSpace(input.BasePrompt)
+	model := normalizeOptionalString(input.Model)
+	if strings.TrimSpace(input.UserID) == "" ||
+		strings.TrimSpace(input.GroupID) == "" ||
+		name == "" ||
+		len([]rune(name)) > maxAgentNameLength ||
+		len([]rune(basePrompt)) > maxAgentPromptLength ||
+		(model != nil && len(*model) > maxAgentModelLength) ||
+		input.CooldownSeconds < 0 ||
+		!validJSONObject(input.ToolPolicy) ||
+		!validJSONObject(input.SafetyPolicy) {
+		return repository.AgentProfile{}, ErrValidation
+	}
+	member, err := s.repos.Groups.GetMember(ctx, input.GroupID, input.UserID)
+	if err != nil {
+		return repository.AgentProfile{}, mapRepositoryError(err)
+	}
+	if member.Role != "owner" && member.Role != "admin" {
+		return repository.AgentProfile{}, ErrForbidden
+	}
+
+	var profile repository.AgentProfile
+	err = repository.WithTx(ctx, s.tx, func(repos repository.Repositories) error {
+		avatarFileID := normalizedOptional(input.AvatarFileID)
+		if avatarFileID != nil {
+			if err := validateAgentAvatarFile(ctx, repos, *avatarFileID); err != nil {
+				return err
+			}
+		}
+		botUserID, err := repos.Agents.CreateBotUser(ctx, repository.CreateAgentBotUserParams{
+			Name:         name,
+			AvatarFileID: avatarFileID,
+		})
+		if err != nil {
+			return err
+		}
+		if avatarFileID != nil && repos.Files != nil {
+			if _, err := repos.Files.CreateUsage(ctx, repository.CreateFileUsageParams{
+				FileID:      *avatarFileID,
+				UsageType:   "avatar",
+				BusinessID:  botUserID,
+				OwnerUserID: input.UserID,
+				Visibility:  "public",
+			}); err != nil {
+				return err
+			}
+		}
+		ownerUserID := input.UserID
+		created, err := repos.Agents.CreateProfile(ctx, repository.CreateAgentProfileParams{
+			BotUserID:    botUserID,
+			OwnerUserID:  &ownerUserID,
+			Kind:         "group_bot",
+			Visibility:   "private",
+			Name:         name,
+			AvatarFileID: avatarFileID,
+			BasePrompt:   basePrompt,
+			Model:        model,
+			ToolPolicy:   jsonObjectOrDefault(input.ToolPolicy),
+			SafetyPolicy: jsonObjectOrDefault(input.SafetyPolicy),
+		})
+		if err != nil {
+			return err
+		}
+		if _, err := repos.Agents.CreateBinding(ctx, repository.CreateAgentBindingParams{
+			AgentID:         created.ID,
+			ScopeType:       "group",
+			ScopeID:         input.GroupID,
+			TriggerMode:     "mention",
+			Enabled:         true,
+			CooldownSeconds: input.CooldownSeconds,
+			CreatedBy:       input.UserID,
+		}); err != nil {
+			return err
+		}
+		if err := repos.Groups.AddMembers(ctx, input.GroupID, []string{botUserID}, "ai"); err != nil {
+			return err
+		}
+		if _, err := repos.Groups.UpdateMember(ctx, repository.UpdateGroupMemberParams{
+			GroupID:     input.GroupID,
+			UserID:      botUserID,
+			NicknameSet: true,
+			Nickname:    &name,
+		}); err != nil {
+			return err
+		}
+		if repos.Chat != nil {
+			conversationID, found, err := repos.Chat.FindGroupConversation(ctx, input.GroupID)
+			if err != nil {
+				return err
+			}
+			if found {
+				if err := repos.Chat.AddConversationParticipants(ctx, conversationID, []string{botUserID}); err != nil {
+					return err
+				}
+			}
 		}
 		profile = created
 		return nil
@@ -254,4 +381,36 @@ func validJSONObject(value json.RawMessage) bool {
 	}
 	var decoded map[string]any
 	return json.Unmarshal(value, &decoded) == nil
+}
+
+func normalizedOptional(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	normalized := strings.TrimSpace(*value)
+	if normalized == "" {
+		return nil
+	}
+	return &normalized
+}
+
+func validateAgentAvatarFile(ctx context.Context, repos repository.Repositories, fileID string) error {
+	if repos.Files == nil {
+		return ErrUnavailable
+	}
+	file, err := repos.Files.Get(ctx, fileID)
+	if err != nil {
+		return err
+	}
+	if file.StorageStatus != "ready" {
+		return ErrValidation
+	}
+	isAvatar, err := repos.Files.IsAvatarFile(ctx, file.ID)
+	if err != nil {
+		return err
+	}
+	if !isAvatar {
+		return ErrValidation
+	}
+	return nil
 }

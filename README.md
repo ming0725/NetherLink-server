@@ -104,6 +104,8 @@ AI configuration:
 - `NETHERLINK_AI_REQUEST_TIMEOUT`: default `1m`.
 - `NETHERLINK_TAVILY_API_KEY`: optional Tavily API key. When set, AI conversations can call backend live web search for current web/news/finance information.
 - `NETHERLINK_BRAVE_SEARCH_API_KEY`: optional Brave Search API key. When set, web search merges Brave's independent, fresh web index and available rich results with Tavily results.
+- `NETHERLINK_BAIDU_SEARCH_API_KEY`: optional Baidu Qianfan Web Search MCP bearer token value, without the `Bearer ` prefix. When set, backend `web_search` also queries Baidu MCP.
+- `NETHERLINK_BAIDU_SEARCH_MCP_URL`: Baidu Web Search MCP Streamable HTTP URL, default `https://qianfan.baidubce.com/v2/tools/web-search/mcp`.
 - `NETHERLINK_BROWSERLESS_API_KEY`: optional Browserless API key. When set, `web_read` can execute JavaScript and read fully rendered dynamic pages before falling back to direct HTTP.
 - `NETHERLINK_BROWSERLESS_BASE_URL`: Browserless service URL, default `https://production-sfo.browserless.io`; may point to a self-hosted Browserless deployment.
 - `NETHERLINK_AI_OCR_LANGS`: optional Tesseract language list for scanned PDF OCR when `pdftoppm` and `tesseract` are installed; default `eng`.

@@ -22,11 +22,13 @@ const (
 	defaultMaxToolCalls     = 8
 	finalAnswerStreamChunk  = 512
 
-	toolNameLocalTime = agenttoolbuiltins.ModelToolLocalTime
-	toolNameCalculate = agenttoolbuiltins.ModelToolCalculate
-	toolNameCalendar  = agenttoolbuiltins.ModelToolCalendar
-	toolNameWebSearch = agenttoolbuiltins.ModelToolWebSearch
-	toolNameWebRead   = agenttoolbuiltins.ModelToolWebRead
+	toolNameLocalTime       = agenttoolbuiltins.ModelToolLocalTime
+	toolNameCalculate       = agenttoolbuiltins.ModelToolCalculate
+	toolNameCalendar        = agenttoolbuiltins.ModelToolCalendar
+	toolNameWebSearch       = agenttoolbuiltins.ModelToolWebSearch
+	toolNameWebRead         = agenttoolbuiltins.ModelToolWebRead
+	toolNameSubAgent        = agenttoolbuiltins.ModelToolSubAgentResearch
+	toolNameGroupChatSearch = agenttoolbuiltins.ModelToolGroupChatSearch
 )
 
 type Runtime struct {
@@ -169,7 +171,7 @@ func (r *Runtime) Stream(ctx context.Context, req Request, onDelta func(model.Mo
 	if usedTools {
 		completion, err = r.streamFinalAnswerWithRepair(ctx, req, messages, thinkingType, reasoningEffort, onDelta)
 	} else {
-		completion, err = r.streamFinalCompletion(ctx, req, finalAnswerMessages(messages, usedTools, false), thinkingType, reasoningEffort, onDelta)
+		completion, err = r.streamFinalCompletion(ctx, req, finalAnswerMessages(messages, usedTools, false, req.ScopeType), thinkingType, reasoningEffort, onDelta)
 	}
 	if err != nil {
 		return Response{
@@ -220,7 +222,7 @@ func (r *Runtime) streamFinalCompletion(ctx context.Context, req Request, messag
 }
 
 func (r *Runtime) completeFinalAnswerWithRepair(ctx context.Context, req Request, messages []model.ModelMessage, usedTools bool, thinkingType string, reasoningEffort string) (model.ModelResponse, error) {
-	completion, err := r.completeFinalAnswer(ctx, req, finalAnswerMessages(messages, usedTools, false), thinkingType, reasoningEffort)
+	completion, err := r.completeFinalAnswer(ctx, req, finalAnswerMessages(messages, usedTools, false, req.ScopeType), thinkingType, reasoningEffort)
 	if err != nil {
 		return model.ModelResponse{}, err
 	}
@@ -234,7 +236,7 @@ func (r *Runtime) completeFinalAnswerWithRepair(ctx context.Context, req Request
 	}); err != nil {
 		return model.ModelResponse{}, err
 	}
-	retry, retryErr := r.completeFinalAnswer(ctx, req, finalAnswerMessages(messages, usedTools, true), thinkingType, reasoningEffort)
+	retry, retryErr := r.completeFinalAnswer(ctx, req, finalAnswerMessages(messages, usedTools, true, req.ScopeType), thinkingType, reasoningEffort)
 	if retryErr == nil {
 		completion = retry
 	} else if ctx.Err() != nil {
@@ -259,7 +261,7 @@ func (r *Runtime) completeFinalAnswer(ctx context.Context, req Request, messages
 }
 
 func (r *Runtime) streamFinalAnswerWithRepair(ctx context.Context, req Request, messages []model.ModelMessage, thinkingType string, reasoningEffort string, onDelta func(model.ModelDelta) error) (model.ModelResponse, error) {
-	completion, err := r.streamFinalCompletion(ctx, req, finalAnswerMessages(messages, true, false), thinkingType, reasoningEffort, nil)
+	completion, err := r.streamFinalCompletion(ctx, req, finalAnswerMessages(messages, true, false, req.ScopeType), thinkingType, reasoningEffort, nil)
 	if err != nil {
 		return completion, err
 	}
@@ -271,7 +273,7 @@ func (r *Runtime) streamFinalAnswerWithRepair(ctx context.Context, req Request, 
 		}); err != nil {
 			return model.ModelResponse{}, err
 		}
-		retry, retryErr := r.streamFinalCompletion(ctx, req, finalAnswerMessages(messages, true, true), thinkingType, reasoningEffort, nil)
+		retry, retryErr := r.streamFinalCompletion(ctx, req, finalAnswerMessages(messages, true, true, req.ScopeType), thinkingType, reasoningEffort, nil)
 		if retryErr == nil {
 			completion = retry
 		} else if ctx.Err() != nil {
@@ -300,6 +302,12 @@ func (r *Runtime) prepareToolAugmentedMessages(ctx context.Context, req Request,
 		Role:    "system",
 		Content: prompts.ReActRoutingSystemPrompt(routeOnly),
 	})
+	if isGroupScope(req.ScopeType) {
+		routingMessages = append(routingMessages, model.ModelMessage{
+			Role:    "system",
+			Content: prompts.GroupBotRoutingSupplementPrompt(),
+		})
+	}
 	if req.ToolExecutor != nil {
 		if requestClock := executeTool(ctx, req.ToolExecutor, tools.ToolCall{
 			ID:        "request_start_clock",
@@ -355,6 +363,17 @@ func (r *Runtime) prepareToolAugmentedMessages(ctx context.Context, req Request,
 		completion = nextCompletion
 		if len(completion.ToolCalls) == 0 {
 			if !toolsUsed {
+				forcedTranscript, forcedSummaries, forced, err := r.forceGroupChatSearchIfNeeded(ctx, req, completion, userMessage, toolCatalog, toolPolicy, &toolCallsUsed, &stepSequence)
+				if err != nil {
+					return nil, false, nil, err
+				}
+				if forced {
+					routingMessages = append(routingMessages, forcedTranscript...)
+					toolTranscript = append(toolTranscript, forcedTranscript...)
+					toolResultSummaries = append(toolResultSummaries, forcedSummaries...)
+					toolsUsed = true
+					continue
+				}
 				if err := reportProgress(req.OnProgress, Progress{
 					Phase:   "thinking",
 					Status:  "completed",
@@ -372,7 +391,7 @@ func (r *Runtime) prepareToolAugmentedMessages(ctx context.Context, req Request,
 			if err != nil {
 				return nil, false, nil, err
 			}
-			return finalToolAugmentedMessages(baseMessages, toolTranscript, toolResultSummaries), true, nil, nil
+			return finalToolAugmentedMessages(baseMessages, toolTranscript, toolResultSummaries, req.ScopeType), true, nil, nil
 		}
 
 		toolsUsed = true
@@ -426,7 +445,7 @@ func (r *Runtime) prepareToolAugmentedMessages(ctx context.Context, req Request,
 				return nil, false, nil, err
 			}
 			if call.Name == toolNameWebSearch && webSearchProviderUnavailable(result) {
-				return finalToolAugmentedMessages(baseMessages, toolTranscript, toolResultSummaries), true, nil, nil
+				return finalToolAugmentedMessages(baseMessages, toolTranscript, toolResultSummaries, req.ScopeType), true, nil, nil
 			}
 		}
 		if webSearchCalls >= 2 {
@@ -435,7 +454,7 @@ func (r *Runtime) prepareToolAugmentedMessages(ctx context.Context, req Request,
 			if err != nil {
 				return nil, false, nil, err
 			}
-			return finalToolAugmentedMessages(baseMessages, toolTranscript, toolResultSummaries), true, nil, nil
+			return finalToolAugmentedMessages(baseMessages, toolTranscript, toolResultSummaries, req.ScopeType), true, nil, nil
 		}
 	}
 
@@ -445,9 +464,146 @@ func (r *Runtime) prepareToolAugmentedMessages(ctx context.Context, req Request,
 		if err != nil {
 			return nil, false, nil, err
 		}
-		return finalToolAugmentedMessages(baseMessages, toolTranscript, toolResultSummaries), true, nil, nil
+		return finalToolAugmentedMessages(baseMessages, toolTranscript, toolResultSummaries, req.ScopeType), true, nil, nil
 	}
 	return baseMessages, false, &completion, nil
+}
+
+func (r *Runtime) forceGroupChatSearchIfNeeded(ctx context.Context, req Request, completion model.ModelResponse, userMessage string, catalog map[string]tools.ToolDefinition, policy guardrails.ToolPolicy, toolCallsUsed *int, stepSequence *int) ([]model.ModelMessage, []string, bool, error) {
+	if !shouldForceGroupChatSearch(req, completion.Content, userMessage, catalog, policy) {
+		return nil, nil, false, nil
+	}
+	query := groupChatSearchFallbackQuery(userMessage)
+	if strings.TrimSpace(query) == "" {
+		return nil, nil, false, nil
+	}
+	sequence := 1
+	if stepSequence != nil {
+		*stepSequence = *stepSequence + 1
+		sequence = *stepSequence
+	}
+	call := tools.ToolCall{
+		ID:        fmt.Sprintf("forced_group_chat_search_%d", sequence),
+		Name:      toolNameGroupChatSearch,
+		Arguments: map[string]any{"mode": "search", "query": query},
+	}
+	stepID := fmt.Sprintf("step-%d", sequence)
+	if err := reportProgress(req.OnProgress, progressForToolStart(call, 0, stepID, sequence, "我先检索群聊历史。", userMessage)); err != nil {
+		return nil, nil, false, err
+	}
+	result, _, auditStatus, auditError := r.executeGuardedTool(ctx, req, call, catalog, policy, toolCallsUsed)
+	if err := reportToolAudit(req, ToolAuditEvent{
+		Sequence: sequence,
+		Tool:     call.Name,
+		CallID:   call.ID,
+		Status:   auditStatus,
+		Error:    auditError,
+	}); err != nil {
+		return nil, nil, false, err
+	}
+	if err := reportProgress(req.OnProgress, progressForToolResult(call, result, stepID, sequence, userMessage)); err != nil {
+		return nil, nil, false, err
+	}
+	assistantToolMessage := model.ModelMessage{
+		Role:    "assistant",
+		Content: "我先检索群聊历史。",
+		ToolCalls: []tools.ToolCall{
+			call,
+		},
+	}
+	toolMessage := model.ModelMessage{
+		Role:       "tool",
+		ToolCallID: call.ID,
+		Content:    result,
+	}
+	toolTranscript := []model.ModelMessage{assistantToolMessage, toolMessage}
+	toolResultSummaries := []string{fmt.Sprintf("Tool %s result:\n%s", call.Name, result)}
+	return toolTranscript, toolResultSummaries, true, nil
+}
+
+func shouldForceGroupChatSearch(req Request, completionContent string, userMessage string, catalog map[string]tools.ToolDefinition, policy guardrails.ToolPolicy) bool {
+	if !isGroupScope(req.ScopeType) || req.ToolExecutor == nil {
+		return false
+	}
+	if _, ok := catalog[toolNameGroupChatSearch]; !ok {
+		return false
+	}
+	if !guardrails.ToolAllowed(policy, toolNameGroupChatSearch) {
+		return false
+	}
+	trigger := groupBotTriggerText(userMessage)
+	return groupChatSearchRequested(trigger) || groupChatSearchClaimedWithoutTool(completionContent)
+}
+
+func groupChatSearchFallbackQuery(userMessage string) string {
+	query := groupBotTriggerText(userMessage)
+	if query == "" {
+		query = userMessage
+	}
+	return truncateTextRunes(query, 240)
+}
+
+func groupBotTriggerText(userMessage string) string {
+	text := strings.TrimSpace(userMessage)
+	if text == "" {
+		return ""
+	}
+	marker := "刚刚 @ 你的消息："
+	if strings.Contains(text, marker) {
+		text = strings.TrimSpace(text[strings.LastIndex(text, marker)+len(marker):])
+	}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if index := strings.IndexAny(line, ":："); index >= 0 && index+1 < len(line) {
+			line = strings.TrimSpace(line[index+1:])
+		}
+		return line
+	}
+	return text
+}
+
+func groupChatSearchRequested(text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return false
+	}
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, toolNameGroupChatSearch) {
+		return true
+	}
+	if containsAnyText(lower, []string{"搜", "搜索", "查", "检索", "翻"}) &&
+		containsAnyText(lower, []string{"群", "聊天", "记录", "历史", "消息", "关键词", "女神"}) {
+		return true
+	}
+	if containsAnyText(lower, []string{"之前", "以前", "上次", "昨天", "前天", "刚才", "刚刚", "前面", "历史", "记录", "说过", "提过", "聊过", "讨论过", "喊过", "叫过", "答应", "承诺"}) {
+		return true
+	}
+	if containsAnyText(lower, []string{"谁", "哪位", "哪个"}) &&
+		containsAnyText(lower, []string{"我", "你", "群", "女神", "喜欢", "说", "喊", "叫", "提", "聊", "发"}) {
+		return true
+	}
+	return false
+}
+
+func groupChatSearchClaimedWithoutTool(content string) bool {
+	lower := strings.ToLower(strings.TrimSpace(content))
+	if lower == "" {
+		return false
+	}
+	return containsAnyText(lower, []string{"搜", "搜索", "检索", "查", "翻", "工具正常", "工具跑通"}) &&
+		containsAnyText(lower, []string{"没找到", "没有找到", "没命中", "没有命中", "没检索到", "历史记录", "群聊", "聊天记录", "记录里"})
+}
+
+func containsAnyText(value string, needles []string) bool {
+	for _, needle := range needles {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Runtime) ensureSearchSourcesRead(ctx context.Context, req Request, summaries []string, transcript *[]model.ModelMessage, searchResult string, readUsed bool, query string, stepSequence *int, catalog map[string]tools.ToolDefinition, policy guardrails.ToolPolicy, toolCallsUsed *int) ([]string, bool, error) {
@@ -585,6 +741,32 @@ func progressForToolStart(call tools.ToolCall, completedWebSearches int, stepID 
 			Query:     query,
 			URLs:      urls,
 		}
+	case toolNameSubAgent:
+		return Progress{
+			StepID:    stepID,
+			Sequence:  sequence,
+			Phase:     "researching",
+			Status:    "running",
+			Message:   "正在并行执行子任务",
+			Narration: narration,
+			Tool:      call.Name,
+			Query:     subAgentObjective(call.Arguments),
+		}
+	case toolNameGroupChatSearch:
+		query := toolQuery(call.Arguments)
+		if narration == "" {
+			narration = userFacingGroupChatSearchStart(query, userMessage)
+		}
+		return Progress{
+			StepID:    stepID,
+			Sequence:  sequence,
+			Phase:     "searching_chat",
+			Status:    "running",
+			Message:   "正在检索群聊历史",
+			Narration: narration,
+			Tool:      call.Name,
+			Query:     query,
+		}
 	default:
 		return Progress{
 			StepID:   stepID,
@@ -671,6 +853,33 @@ func progressForToolResult(call tools.ToolCall, result string, stepID string, se
 			Query:     query,
 			URLs:      resultURLs(result, 5),
 		}
+	case toolNameSubAgent:
+		return Progress{
+			StepID:    stepID,
+			Sequence:  sequence,
+			Phase:     "researching",
+			Status:    terminalToolStatus(ok),
+			Message:   subAgentResultMessage(ok, resultCount),
+			Narration: userFacingToolFailure(subAgentObjective(call.Arguments), ok, userMessage),
+			Tool:      call.Name,
+			Query:     subAgentObjective(call.Arguments),
+			URLs:      resultURLs(result, 5),
+		}
+	case toolNameGroupChatSearch:
+		if ok {
+			message = fmt.Sprintf("检索到 %d 条群聊记录", resultCount)
+		}
+		query := toolQuery(call.Arguments)
+		return Progress{
+			StepID:    stepID,
+			Sequence:  sequence,
+			Phase:     "searching_chat",
+			Status:    terminalToolStatus(ok),
+			Message:   message,
+			Narration: userFacingToolFailure(query, ok, userMessage),
+			Tool:      call.Name,
+			Query:     query,
+		}
 	default:
 		return Progress{
 			StepID:   stepID,
@@ -734,6 +943,20 @@ func userFacingReadStart(query string, userMessage string) string {
 	return fmt.Sprintf("A few results need primary-page support; I’ll open the sources most relevant to %s.\n", subject)
 }
 
+func userFacingGroupChatSearchStart(query string, userMessage string) string {
+	subject := progressSubject(query)
+	if prefersChinese(userMessage) {
+		if subject == "" {
+			return "我会先查一下群聊历史里是否有相关记录。\n"
+		}
+		return fmt.Sprintf("我会先查一下群聊历史里和 %s 相关的记录。\n", subject)
+	}
+	if subject == "" {
+		return "I’ll check older group-chat records for relevant context.\n"
+	}
+	return fmt.Sprintf("I’ll check older group-chat records related to %s.\n", subject)
+}
+
 func userFacingToolFailure(query string, ok bool, userMessage string) string {
 	if ok {
 		return ""
@@ -763,6 +986,42 @@ func readResultMessage(ok bool, resultCount int) string {
 		return "来源读取未返回可用内容"
 	}
 	return fmt.Sprintf("已读取 %d 个来源", resultCount)
+}
+
+func subAgentResultMessage(ok bool, resultCount int) string {
+	if !ok {
+		return "子任务未返回可用结果"
+	}
+	return fmt.Sprintf("子任务返回 %d 个可用结果", resultCount)
+}
+
+func subAgentObjective(args any) string {
+	values, err := toolArgsMap(args)
+	if err != nil {
+		return ""
+	}
+	if objective := strings.TrimSpace(stringArg(values["objective"])); objective != "" {
+		return objective
+	}
+	tasks, _ := values["tasks"].([]any)
+	titles := []string{}
+	for _, rawTask := range tasks {
+		task, ok := rawTask.(map[string]any)
+		if !ok {
+			continue
+		}
+		title := strings.TrimSpace(stringArg(task["title"]))
+		if title == "" {
+			title = strings.TrimSpace(stringArg(task["tool"]))
+		}
+		if title != "" {
+			titles = append(titles, title)
+		}
+		if len(titles) >= 3 {
+			break
+		}
+	}
+	return strings.Join(titles, "; ")
 }
 
 func prefersChinese(text string) bool {
@@ -795,31 +1054,43 @@ func progressSubject(value string) string {
 	return subject
 }
 
-func finalToolAugmentedMessages(baseMessages []model.ModelMessage, toolTranscript []model.ModelMessage, toolResultSummaries []string) []model.ModelMessage {
+func finalToolAugmentedMessages(baseMessages []model.ModelMessage, toolTranscript []model.ModelMessage, toolResultSummaries []string, scopeType string) []model.ModelMessage {
 	messages := cloneMessages(baseMessages)
 	messages = append(messages, toolTranscript...)
-	return appendBackendToolResults(messages, toolResultSummaries)
+	return appendBackendToolResults(messages, toolResultSummaries, scopeType)
 }
 
-func appendBackendToolResults(messages []model.ModelMessage, toolResultSummaries []string) []model.ModelMessage {
+func appendBackendToolResults(messages []model.ModelMessage, toolResultSummaries []string, scopeType string) []model.ModelMessage {
 	if len(toolResultSummaries) == 0 {
 		return messages
 	}
+	prompt := prompts.BackendToolEvidencePrompt(toolResultSummaries)
+	if isGroupScope(scopeType) {
+		prompt = prompts.GroupBotBackendToolEvidencePrompt(toolResultSummaries)
+	}
 	return append(messages, model.ModelMessage{
 		Role:    "system",
-		Content: prompts.BackendToolEvidencePrompt(toolResultSummaries),
+		Content: prompt,
 	})
 }
 
-func finalAnswerMessages(messages []model.ModelMessage, usedTools bool, retry bool) []model.ModelMessage {
+func finalAnswerMessages(messages []model.ModelMessage, usedTools bool, retry bool, scopeType string) []model.ModelMessage {
 	if !usedTools {
 		return messages
+	}
+	prompt := prompts.FinalAnswerAfterToolsPrompt(retry)
+	if isGroupScope(scopeType) {
+		prompt = prompts.GroupBotFinalAnswerAfterToolsPrompt(retry)
 	}
 	finalMessages := cloneMessages(messages)
 	return append(finalMessages, model.ModelMessage{
 		Role:    "system",
-		Content: prompts.FinalAnswerAfterToolsPrompt(retry),
+		Content: prompt,
 	})
+}
+
+func isGroupScope(scopeType string) bool {
+	return strings.EqualFold(strings.TrimSpace(scopeType), "group")
 }
 
 func finalGenerationReasoningSettings(thinkingType string, reasoningEffort string, usedTools bool) (string, string) {
@@ -848,6 +1119,9 @@ func validateAndSanitizeToolCall(req Request, call tools.ToolCall, catalog map[s
 	toolName := strings.TrimSpace(call.Name)
 	if toolName == "" {
 		return call, fmt.Errorf("tool call missing name")
+	}
+	if toolName == toolNameGroupChatSearch && !isGroupScope(req.ScopeType) {
+		return call, fmt.Errorf("tool %q is only available in group scope", toolName)
 	}
 	definition, advertised := catalog[toolName]
 	if !advertised {
@@ -881,6 +1155,8 @@ func applyDefaultToolTimezone(call tools.ToolCall, timezone string) tools.ToolCa
 	}
 	switch call.Name {
 	case toolNameLocalTime, toolNameCalendar, toolNameWebSearch:
+	case toolNameSubAgent:
+		return applyDefaultSubAgentTaskTimezone(call, timezone)
 	default:
 		return call
 	}
@@ -892,6 +1168,40 @@ func applyDefaultToolTimezone(call tools.ToolCall, timezone string) tools.ToolCa
 		args["timezone"] = timezone
 		call.Arguments = args
 	}
+	return call
+}
+
+func applyDefaultSubAgentTaskTimezone(call tools.ToolCall, timezone string) tools.ToolCall {
+	args, err := toolArgsMap(call.Arguments)
+	if err != nil {
+		return call
+	}
+	tasks, ok := args["tasks"].([]any)
+	if !ok {
+		return call
+	}
+	for _, rawTask := range tasks {
+		task, ok := rawTask.(map[string]any)
+		if !ok {
+			continue
+		}
+		toolName := strings.TrimSpace(stringArg(task["tool"]))
+		switch toolName {
+		case toolNameLocalTime, toolNameCalendar, toolNameWebSearch:
+		default:
+			continue
+		}
+		taskArgs, ok := task["arguments"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(stringArg(taskArgs["timezone"])) == "" {
+			taskArgs["timezone"] = timezone
+			task["arguments"] = taskArgs
+		}
+	}
+	args["tasks"] = tasks
+	call.Arguments = args
 	return call
 }
 
@@ -950,6 +1260,93 @@ func validateRequiredToolArguments(call tools.ToolCall) (tools.ToolCall, error) 
 		args["urls"] = urls
 		call.Arguments = args
 		return call, nil
+	case toolNameGroupChatSearch:
+		args, err := toolObjectArgs(call)
+		if err != nil {
+			return call, err
+		}
+		mode := strings.ToLower(strings.TrimSpace(stringArg(args["mode"])))
+		if mode == "" {
+			mode = "search"
+			args["mode"] = mode
+		}
+		switch mode {
+		case "search":
+			if strings.TrimSpace(stringArg(args["query"])) == "" {
+				return call, fmt.Errorf("group_chat_search query is required")
+			}
+		case "context":
+			if strings.TrimSpace(stringArg(args["message_id"])) == "" && numericArg(args["message_seq"]) <= 0 {
+				return call, fmt.Errorf("group_chat_search context requires message_id or message_seq")
+			}
+		default:
+			return call, fmt.Errorf("group_chat_search mode %q is invalid", mode)
+		}
+		call.Arguments = args
+		return call, nil
+	case toolNameSubAgent:
+		args, err := toolObjectArgs(call)
+		if err != nil {
+			return call, err
+		}
+		tasks, ok := args["tasks"].([]any)
+		if !ok || len(tasks) == 0 {
+			return call, fmt.Errorf("subagent_research tasks are required")
+		}
+		if len(tasks) > 6 {
+			return call, fmt.Errorf("subagent_research supports at most 6 tasks")
+		}
+		for index, rawTask := range tasks {
+			task, ok := rawTask.(map[string]any)
+			if !ok {
+				return call, fmt.Errorf("subagent_research task %d must be an object", index+1)
+			}
+			if strings.TrimSpace(stringArg(task["input"])) == "" {
+				return call, fmt.Errorf("subagent_research task %d input is required", index+1)
+			}
+			if strings.TrimSpace(stringArg(task["expected_output"])) == "" {
+				return call, fmt.Errorf("subagent_research task %d expected_output is required", index+1)
+			}
+			availableTools := stringSliceArg(task["available_tools"])
+			if len(availableTools) == 0 {
+				return call, fmt.Errorf("subagent_research task %d available_tools is required", index+1)
+			}
+			needTool, ok := task["need_tool"].(bool)
+			if !ok {
+				return call, fmt.Errorf("subagent_research task %d need_tool is required", index+1)
+			}
+			if strings.TrimSpace(stringArg(task["tool_necessity"])) == "" {
+				return call, fmt.Errorf("subagent_research task %d tool_necessity is required", index+1)
+			}
+			toolName := strings.TrimSpace(stringArg(task["tool"]))
+			if toolName == "" {
+				return call, fmt.Errorf("subagent_research task %d tool is required", index+1)
+			}
+			if toolName == toolNameSubAgent {
+				return call, fmt.Errorf("subagent_research tasks cannot call subagent_research recursively")
+			}
+			if !stringSliceContains(availableTools, toolName) {
+				return call, fmt.Errorf("subagent_research task %d available_tools must include selected tool %q", index+1, toolName)
+			}
+			if strings.TrimSpace(stringArg(task["validation"])) == "" {
+				return call, fmt.Errorf("subagent_research task %d validation is required", index+1)
+			}
+			task["available_tools"] = availableTools
+			if !needTool {
+				continue
+			}
+			taskArgs, ok := task["arguments"].(map[string]any)
+			if !ok {
+				return call, fmt.Errorf("subagent_research task %d arguments must be an object", index+1)
+			}
+			nestedCall, err := validateRequiredToolArguments(tools.ToolCall{Name: toolName, Arguments: taskArgs})
+			if err != nil {
+				return call, fmt.Errorf("subagent_research task %d invalid %s call: %w", index+1, toolName, err)
+			}
+			task["arguments"] = nestedCall.Arguments
+		}
+		call.Arguments = args
+		return call, nil
 	default:
 		return call, nil
 	}
@@ -964,6 +1361,9 @@ func toolObjectArgs(call tools.ToolCall) (map[string]any, error) {
 }
 
 func sanitizeToolCallArguments(call tools.ToolCall, policy guardrails.ToolPolicy) (tools.ToolCall, error) {
+	if call.Name == toolNameSubAgent {
+		return sanitizeSubAgentResearchArguments(call, policy)
+	}
 	if len(guardrails.NormalizeDomains(policy.AllowedDomains)) == 0 {
 		return call, nil
 	}
@@ -1019,6 +1419,42 @@ func sanitizeWebReadArguments(call tools.ToolCall, policy guardrails.ToolPolicy)
 			return call, fmt.Errorf("web_read URL %q is outside the allowed domain policy", rawURL)
 		}
 	}
+	return call, nil
+}
+
+func sanitizeSubAgentResearchArguments(call tools.ToolCall, policy guardrails.ToolPolicy) (tools.ToolCall, error) {
+	args, err := toolArgsMap(call.Arguments)
+	if err != nil {
+		return call, err
+	}
+	tasks, _ := args["tasks"].([]any)
+	for index, rawTask := range tasks {
+		task, ok := rawTask.(map[string]any)
+		if !ok {
+			return call, fmt.Errorf("subagent_research task %d must be an object", index+1)
+		}
+		toolName := strings.TrimSpace(stringArg(task["tool"]))
+		if !guardrails.ToolAllowed(policy, toolName) {
+			return call, fmt.Errorf("subagent_research task %d tool %q is not allowed by runtime policy", index+1, toolName)
+		}
+		if toolName == toolNameSubAgent {
+			return call, fmt.Errorf("subagent_research tasks cannot call subagent_research recursively")
+		}
+		taskArgs, _ := task["arguments"].(map[string]any)
+		nested := tools.ToolCall{Name: toolName, Arguments: taskArgs}
+		switch toolName {
+		case toolNameWebSearch:
+			nested, err = sanitizeWebSearchArguments(nested, policy)
+		case toolNameWebRead:
+			nested, err = sanitizeWebReadArguments(nested, policy)
+		}
+		if err != nil {
+			return call, fmt.Errorf("subagent_research task %d invalid %s call: %w", index+1, toolName, err)
+		}
+		task["arguments"] = nested.Arguments
+	}
+	args["tasks"] = tasks
+	call.Arguments = args
 	return call, nil
 }
 
@@ -1097,6 +1533,26 @@ func stringSliceArg(value any) []string {
 func stringArg(value any) string {
 	text, _ := value.(string)
 	return strings.TrimSpace(text)
+}
+
+func numericArg(value any) int64 {
+	switch typed := value.(type) {
+	case int:
+		return int64(typed)
+	case int64:
+		return typed
+	case int32:
+		return int64(typed)
+	case float64:
+		return int64(typed)
+	case float32:
+		return int64(typed)
+	case json.Number:
+		parsed, _ := typed.Int64()
+		return parsed
+	default:
+		return 0
+	}
 }
 
 func splitTextRunes(text string, maxRunes int) []string {
@@ -1503,6 +1959,19 @@ func normalizeStringList(values []string) []string {
 		result = append(result, trimmed)
 	}
 	return result
+}
+
+func stringSliceContains(values []string, target string) bool {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return false
+	}
+	for _, value := range values {
+		if strings.TrimSpace(value) == target {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizedRoutingMaxTokens(value int) int {

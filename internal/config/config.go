@@ -84,6 +84,8 @@ type AIConfig struct {
 	RequestTimeout     time.Duration
 	TavilyAPIKey       string
 	BraveSearchAPIKey  string
+	BaiduSearchAPIKey  string
+	BaiduSearchMCPURL  string
 	BrowserlessAPIKey  string
 	BrowserlessBaseURL string
 	LangSmith          LangSmithConfig
@@ -167,6 +169,8 @@ func Load() (Config, error) {
 			RequestTimeout:     getEnvDuration(&validationErrors, "NETHERLINK_AI_REQUEST_TIMEOUT", time.Minute),
 			TavilyAPIKey:       getEnv("NETHERLINK_TAVILY_API_KEY", ""),
 			BraveSearchAPIKey:  getEnv("NETHERLINK_BRAVE_SEARCH_API_KEY", ""),
+			BaiduSearchAPIKey:  getEnv("NETHERLINK_BAIDU_SEARCH_API_KEY", ""),
+			BaiduSearchMCPURL:  getEnv("NETHERLINK_BAIDU_SEARCH_MCP_URL", "https://qianfan.baidubce.com/v2/tools/web-search/mcp"),
 			BrowserlessAPIKey:  getEnv("NETHERLINK_BROWSERLESS_API_KEY", ""),
 			BrowserlessBaseURL: getEnv("NETHERLINK_BROWSERLESS_BASE_URL", "https://production-sfo.browserless.io"),
 			LangSmith: LangSmithConfig{

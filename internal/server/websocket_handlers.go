@@ -405,6 +405,10 @@ func (s *Server) handleWebSocketSendMessage(ctx context.Context, conn *realtime.
 	for _, attachment := range req.Attachments {
 		attachments = append(attachments, chatsvc.AttachmentInput(attachment))
 	}
+	mentions := make([]chatsvc.MentionInput, 0, len(req.Mentions))
+	for _, mention := range req.Mentions {
+		mentions = append(mentions, chatsvc.MentionInput(mention))
+	}
 
 	message, err := s.chatService.SendMessage(ctx, chatsvc.SendMessageInput{
 		UserID:              principal.UserID,
@@ -415,6 +419,7 @@ func (s *Server) handleWebSocketSendMessage(ctx context.Context, conn *realtime.
 		Content:             req.Content,
 		Attachments:         attachments,
 		ReferencedMessageID: req.ReferencedMessageID,
+		Mentions:            mentions,
 	})
 	if err != nil {
 		code, message := chatErrorCodeAndMessage(err)
@@ -431,6 +436,8 @@ func (s *Server) handleWebSocketSendMessage(ctx context.Context, conn *realtime.
 
 	s.publishConversationMessage(ctx, req.ConversationID, "chat.message.created", response)
 	s.publishAllConversationSyncStates(ctx, req.ConversationID, "message.created")
+	s.publishAllConversationUpdated(ctx, req.ConversationID, "message.created")
+	s.triggerGroupBotReplies(ctx, message)
 	s.realtimeHub.Send(conn, "chat.message.sent", websocketMessageSentPayload{
 		ClientMessageID: req.ClientMessageID,
 		Message:         response,

@@ -177,6 +177,7 @@ type Message struct {
 	EditedAt            *time.Time
 	RecalledAt          *time.Time
 	Attachments         []MessageAttachment
+	Mentions            []MessageMention
 }
 
 type MessageAttachment struct {
@@ -191,6 +192,17 @@ type MessageAttachment struct {
 	UpdatedAt   time.Time
 }
 
+type MessageMention struct {
+	ID               string
+	MessageID        string
+	TargetType       string
+	TargetIdentifier string
+	TargetUserID     *string
+	Position         int
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
 type CreateMessageParams struct {
 	ConversationID      string
 	SenderID            string
@@ -202,6 +214,7 @@ type CreateMessageParams struct {
 	ClientMessageID     string
 	ClientSentAt        *time.Time
 	Attachments         []CreateMessageAttachmentParams
+	Mentions            []CreateMessageMentionParams
 }
 
 type CreateMessageAttachmentParams struct {
@@ -210,6 +223,13 @@ type CreateMessageAttachmentParams struct {
 	DurationMS  *int
 	Width       *int
 	Height      *int
+}
+
+type CreateMessageMentionParams struct {
+	TargetType       string
+	TargetIdentifier string
+	TargetUserID     *string
+	Position         int
 }
 
 func NewChatRepository(db DBTX) *ChatRepository {
@@ -630,6 +650,30 @@ func (r *ChatRepository) CreateMessage(ctx context.Context, params CreateMessage
 		}
 	}
 
+	for index, mention := range params.Mentions {
+		position := mention.Position
+		if position <= 0 {
+			position = index + 1
+		}
+		if _, err := r.db.Exec(ctx, `
+			INSERT INTO message_mentions (
+				message_id,
+				target_type,
+				target_identifier,
+				target_user_id,
+				position
+			)
+			VALUES ($1::uuid, $2, $3, NULLIF($4, '')::uuid, $5)`,
+			message.ID,
+			normalizeText(mention.TargetType),
+			normalizeText(mention.TargetIdentifier),
+			normalizeOptionalUUIDPtr(mention.TargetUserID),
+			position,
+		); err != nil {
+			return Message{}, translateWriteError(err)
+		}
+	}
+
 	return r.GetMessageForParticipant(ctx, params.SenderID, message.ID)
 }
 
@@ -700,6 +744,9 @@ func (r *ChatRepository) RecallMessage(ctx context.Context, userID string, conve
 
 	messages := []Message{message}
 	if err := r.loadAttachments(ctx, messages); err != nil {
+		return Message{}, err
+	}
+	if err := r.loadMentions(ctx, messages); err != nil {
 		return Message{}, err
 	}
 	return messages[0], nil
@@ -794,6 +841,100 @@ func (r *ChatRepository) ListMessagesForParticipant(ctx context.Context, userID 
 	if err := r.loadAttachments(ctx, messages); err != nil {
 		return nil, err
 	}
+	if err := r.loadMentions(ctx, messages); err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
+func (r *ChatRepository) SearchMessagesForParticipant(ctx context.Context, userID string, deviceID string, conversationID string, beforeSeq *int64, keywords []string, since *time.Time, until *time.Time, limit int) ([]Message, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	normalizedKeywords := make([]string, 0, len(keywords))
+	seen := map[string]struct{}{}
+	for _, keyword := range keywords {
+		keyword = normalizeText(keyword)
+		if keyword == "" {
+			continue
+		}
+		if _, ok := seen[keyword]; ok {
+			continue
+		}
+		seen[keyword] = struct{}{}
+		normalizedKeywords = append(normalizedKeywords, keyword)
+	}
+
+	rows, err := r.db.Query(ctx, `
+		SELECT `+messageSelectColumns+`
+		FROM messages m
+		JOIN conversation_participants cp
+		  ON cp.conversation_id = m.conversation_id
+		 AND cp.user_id = $2::uuid
+		JOIN conversations c
+		  ON c.id = m.conversation_id
+		 AND c.deleted_at IS NULL
+		LEFT JOIN conversation_device_states cds
+		  ON cds.conversation_id = m.conversation_id
+		 AND cds.user_id = cp.user_id
+		 AND cds.device_id = $3
+		WHERE m.conversation_id = $1::uuid
+		  AND (cp.hidden_at IS NULL OR m.created_at > cp.hidden_at)
+		  AND (cds.hidden_at IS NULL OR m.created_at > cds.hidden_at)
+		  AND ($4::bigint IS NULL OR m.message_seq < $4)
+		  AND ($5::timestamptz IS NULL OR m.created_at >= $5)
+		  AND ($6::timestamptz IS NULL OR m.created_at < $6)
+		  AND m.recalled_at IS NULL
+		  AND (
+		    cardinality($7::text[]) = 0
+		    OR EXISTS (
+		      SELECT 1
+		      FROM unnest($7::text[]) AS query_terms(term)
+		      WHERE m.content_text ILIKE '%' || query_terms.term || '%'
+		    )
+		  )
+		ORDER BY m.message_seq DESC
+		LIMIT $8`,
+		normalizeText(conversationID),
+		normalizeText(userID),
+		normalizeText(deviceID),
+		beforeSeq,
+		since,
+		until,
+		normalizedKeywords,
+		limit,
+	)
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	defer rows.Close()
+
+	messages, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Message, error) {
+		return scanMessage(row)
+	})
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	if len(messages) == 0 {
+		exists, existsErr := r.ParticipantExists(ctx, conversationID, userID)
+		if existsErr != nil {
+			return nil, existsErr
+		}
+		if !exists {
+			return nil, ErrNotFound
+		}
+		return messages, nil
+	}
+
+	if err := r.loadAttachments(ctx, messages); err != nil {
+		return nil, err
+	}
+	if err := r.loadMentions(ctx, messages); err != nil {
+		return nil, err
+	}
 	return messages, nil
 }
 
@@ -817,6 +958,9 @@ func (r *ChatRepository) GetMessageForParticipant(ctx context.Context, userID st
 
 	messages := []Message{message}
 	if err := r.loadAttachments(ctx, messages); err != nil {
+		return Message{}, err
+	}
+	if err := r.loadMentions(ctx, messages); err != nil {
 		return Message{}, err
 	}
 	return messages[0], nil
@@ -846,6 +990,9 @@ func (r *ChatRepository) GetMessageByClientMessageID(ctx context.Context, userID
 
 	messages := []Message{message}
 	if err := r.loadAttachments(ctx, messages); err != nil {
+		return Message{}, err
+	}
+	if err := r.loadMentions(ctx, messages); err != nil {
 		return Message{}, err
 	}
 	return messages[0], nil
@@ -902,6 +1049,49 @@ func (r *ChatRepository) loadAttachments(ctx context.Context, messages []Message
 		}
 		if index, ok := messageIndex[attachment.MessageID]; ok {
 			messages[index].Attachments = append(messages[index].Attachments, attachment)
+		}
+	}
+	return translateReadError(rows.Err())
+}
+
+func (r *ChatRepository) loadMentions(ctx context.Context, messages []Message) error {
+	messageIDs := make([]string, 0, len(messages))
+	messageIndex := make(map[string]int, len(messages))
+	for index, message := range messages {
+		messageIDs = append(messageIDs, message.ID)
+		messageIndex[message.ID] = index
+	}
+	if len(messageIDs) == 0 {
+		return nil
+	}
+
+	rows, err := r.db.Query(ctx, `
+		SELECT
+			id,
+			message_id,
+			target_type,
+			target_identifier,
+			target_user_id,
+			position,
+			created_at,
+			updated_at
+		FROM message_mentions
+		WHERE message_id::text = ANY($1)
+		ORDER BY position ASC, created_at ASC, id ASC`,
+		messageIDs,
+	)
+	if err != nil {
+		return translateReadError(err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		mention, err := scanMessageMention(rows)
+		if err != nil {
+			return translateReadError(err)
+		}
+		if index, ok := messageIndex[mention.MessageID]; ok {
+			messages[index].Mentions = append(messages[index].Mentions, mention)
 		}
 	}
 	return translateReadError(rows.Err())
@@ -1036,6 +1226,34 @@ func scanMessageAttachment(row scanner) (MessageAttachment, error) {
 	}
 
 	return attachment, nil
+}
+
+func scanMessageMention(row scanner) (MessageMention, error) {
+	var (
+		mention      MessageMention
+		id           pgtype.UUID
+		messageID    pgtype.UUID
+		targetUserID pgtype.UUID
+	)
+
+	err := row.Scan(
+		&id,
+		&messageID,
+		&mention.TargetType,
+		&mention.TargetIdentifier,
+		&targetUserID,
+		&mention.Position,
+		&mention.CreatedAt,
+		&mention.UpdatedAt,
+	)
+	if err != nil {
+		return MessageMention{}, err
+	}
+
+	mention.ID = uuidString(id)
+	mention.MessageID = uuidString(messageID)
+	mention.TargetUserID = uuidStringPtr(targetUserID)
+	return mention, nil
 }
 
 func conversationEntrySelectSQL() string {
@@ -1450,6 +1668,9 @@ func (r *ChatRepository) loadEntryLastMessageAttachments(ctx context.Context, en
 		return nil
 	}
 	if err := r.loadAttachments(ctx, messages); err != nil {
+		return err
+	}
+	if err := r.loadMentions(ctx, messages); err != nil {
 		return err
 	}
 	for index := range entries {

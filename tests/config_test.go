@@ -93,6 +93,8 @@ func TestConfigLoadAIProvider(t *testing.T) {
 	t.Setenv("NETHERLINK_AI_REQUEST_TIMEOUT", "45s")
 	t.Setenv("NETHERLINK_TAVILY_API_KEY", "test-tavily-key")
 	t.Setenv("NETHERLINK_BRAVE_SEARCH_API_KEY", "test-brave-key")
+	t.Setenv("NETHERLINK_BAIDU_SEARCH_API_KEY", "test-baidu-key")
+	t.Setenv("NETHERLINK_BAIDU_SEARCH_MCP_URL", "https://baidu.example/mcp")
 	t.Setenv("NETHERLINK_BROWSERLESS_API_KEY", "test-browserless-key")
 	t.Setenv("NETHERLINK_BROWSERLESS_BASE_URL", "https://browserless.example")
 	t.Setenv("LANGSMITH_TRACING", "true")
@@ -135,6 +137,12 @@ func TestConfigLoadAIProvider(t *testing.T) {
 	}
 	if cfg.AI.BraveSearchAPIKey != "test-brave-key" {
 		t.Fatalf("brave search api key = %q, want test-brave-key", cfg.AI.BraveSearchAPIKey)
+	}
+	if cfg.AI.BaiduSearchAPIKey != "test-baidu-key" {
+		t.Fatalf("baidu search api key = %q, want test-baidu-key", cfg.AI.BaiduSearchAPIKey)
+	}
+	if cfg.AI.BaiduSearchMCPURL != "https://baidu.example/mcp" {
+		t.Fatalf("baidu search MCP URL = %q, want https://baidu.example/mcp", cfg.AI.BaiduSearchMCPURL)
 	}
 	if cfg.AI.BrowserlessAPIKey != "test-browserless-key" {
 		t.Fatalf("browserless api key = %q, want test-browserless-key", cfg.AI.BrowserlessAPIKey)

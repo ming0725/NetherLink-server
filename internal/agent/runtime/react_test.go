@@ -82,6 +82,150 @@ func TestStreamBuffersToolBackedFinalAnswerForValidation(t *testing.T) {
 	}
 }
 
+func TestGroupScopeUsesNoSourceFinalToolPrompt(t *testing.T) {
+	gateway := &groupScopeFinalPromptGateway{}
+	runtime := NewRuntime(gateway)
+
+	result, err := runtime.Complete(context.Background(), Request{
+		Model:     "mock-model",
+		ScopeType: "group",
+		Messages:  []model.ModelMessage{{Role: "user", Content: "上周五纳指跌了吗？"}},
+		Tools:     []tools.ToolDefinition{{Name: toolNameWebSearch}},
+		ToolExecutor: func(ctx context.Context, call tools.ToolCall) string {
+			switch call.Name {
+			case toolNameLocalTime:
+				return `{"ok":true,"timezone":"Asia/Shanghai","date":"2026-06-28","time":"12:00:00"}`
+			case toolNameWebSearch:
+				return `{"ok":true,"query":"纳斯达克 2026-06-26 收盘","result_count":1,"results":[{"url":"https://example.com/market","title":"Market recap","content":"Nasdaq fell on 2026-06-26."}]}`
+			default:
+				return `{"ok":false,"error":"unexpected tool"}`
+			}
+		},
+		MaxToolCalls: 3,
+	})
+	if err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if result.Completion.Content != "是真的，6月26日纳指确实收跌。" {
+		t.Fatalf("completion = %q, want concise group answer", result.Completion.Content)
+	}
+	if !gateway.sawGroupEvidencePrompt {
+		t.Fatal("group scope did not receive group backend evidence prompt")
+	}
+	if !gateway.sawGroupFinalPrompt {
+		t.Fatal("group scope did not receive group final-answer prompt")
+	}
+	if gateway.sawCitationInstruction {
+		t.Fatal("group scope final request still included the normal citation instruction")
+	}
+}
+
+func TestGroupScopeInjectsContextVerificationRoutingPrompt(t *testing.T) {
+	gateway := &groupScopeRoutingPromptGateway{}
+	runtime := NewRuntime(gateway)
+
+	result, err := runtime.Complete(context.Background(), Request{
+		Model:     "mock-model",
+		ScopeType: "group",
+		Messages: []model.ModelMessage{
+			{Role: "system", Content: "You are a group bot."},
+			{Role: "user", Content: "最近大家在聊某公司要推迟上市。\n刚刚 @ 你的消息：真的假的？"},
+		},
+		Tools: []tools.ToolDefinition{{Name: toolNameWebSearch}},
+		ToolExecutor: func(ctx context.Context, call tools.ToolCall) string {
+			switch call.Name {
+			case toolNameLocalTime:
+				return `{"ok":true,"timezone":"Asia/Shanghai","date":"2026-06-28","time":"12:00:00"}`
+			case toolNameWebSearch:
+				return `{"ok":false,"error":"unexpected search"}`
+			default:
+				return `{"ok":false,"error":"unexpected tool"}`
+			}
+		},
+		MaxToolCalls: 2,
+	})
+	if err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if result.Completion.Content != "这个需要查公开来源确认。" {
+		t.Fatalf("completion = %q, want route fallback answer", result.Completion.Content)
+	}
+	if !gateway.sawGroupRoutingPrompt {
+		t.Fatal("group scope did not receive group routing supplement prompt")
+	}
+}
+
+func TestGroupScopeForcesGroupChatSearchWhenModelClaimsSearchWithoutTool(t *testing.T) {
+	gateway := &groupSearchForcedGateway{}
+	runtime := NewRuntime(gateway)
+	var calls []tools.ToolCall
+
+	result, err := runtime.Complete(context.Background(), Request{
+		Model:     "mock-model",
+		ScopeType: "group",
+		Messages: []model.ModelMessage{{
+			Role:    "user",
+			Content: "最近聊天内容：\n23456: @Bot 我是谁女神\n\n刚刚 @ 你的消息：\n23456: 我是谁女神",
+		}},
+		Tools: []tools.ToolDefinition{{Name: toolNameGroupChatSearch}},
+		ToolExecutor: func(ctx context.Context, call tools.ToolCall) string {
+			if call.Name == toolNameLocalTime {
+				return `{"ok":true,"timezone":"Asia/Shanghai","date":"2026-06-29","time":"12:00:00"}`
+			}
+			calls = append(calls, call)
+			args, err := toolArgsMap(call.Arguments)
+			if err != nil {
+				return `{"ok":false,"error":"bad args"}`
+			}
+			switch stringArg(args["mode"]) {
+			case "context":
+				return `{"ok":true,"mode":"context","message_id":"m2","message_seq":208,"result_count":3,"context_text":"23456: 包是谁？\n[match] 333: 她是我女神\nBot: 哈哈"}`
+			default:
+				return `{"ok":true,"mode":"search","query":"我是谁女神","result_count":1,"results":[{"message_id":"m2","message_seq":208,"sender_name":"333","text":"她是我女神"}],"next_action":"call mode=context for the most relevant hit"}`
+			}
+		},
+		MaxToolCalls: 3,
+	})
+	if err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if !result.UsedTools {
+		t.Fatal("UsedTools = false, want forced group_chat_search")
+	}
+	if len(calls) != 2 {
+		t.Fatalf("calls = %#v, want forced search plus selected context", calls)
+	}
+	if calls[0].Name != toolNameGroupChatSearch || calls[1].Name != toolNameGroupChatSearch {
+		t.Fatalf("called tools = %#v, want group_chat_search calls", calls)
+	}
+	args, err := toolArgsMap(calls[0].Arguments)
+	if err != nil {
+		t.Fatalf("forced args: %v", err)
+	}
+	if query := stringArg(args["query"]); query != "我是谁女神" {
+		t.Fatalf("forced query = %q, want trigger text", query)
+	}
+	if mode := stringArg(args["mode"]); mode != "search" {
+		t.Fatalf("forced mode = %q, want search", mode)
+	}
+	contextArgs, err := toolArgsMap(calls[1].Arguments)
+	if err != nil {
+		t.Fatalf("context args: %v", err)
+	}
+	if mode := stringArg(contextArgs["mode"]); mode != "context" {
+		t.Fatalf("second mode = %q, want context", mode)
+	}
+	if messageID := stringArg(contextArgs["message_id"]); messageID != "m2" {
+		t.Fatalf("context message_id = %q, want m2", messageID)
+	}
+	if !gateway.sawForcedEvidence {
+		t.Fatal("final generation did not receive forced group_chat_search evidence")
+	}
+	if result.Completion.Content != "搜到了，333 那句是在说“她是我女神”，上下文里她指的是包。" {
+		t.Fatalf("completion = %q", result.Completion.Content)
+	}
+}
+
 type streamingFinalGateway struct {
 	completeCalls       int
 	streamCalls         int
@@ -126,6 +270,94 @@ func (g *streamingFinalGateway) Stream(ctx context.Context, req model.ModelReque
 	}
 	content := strings.Join(parts, "")
 	return model.ModelResponse{Content: content, FinishReason: "stop"}, nil
+}
+
+type groupScopeFinalPromptGateway struct {
+	sawGroupEvidencePrompt bool
+	sawGroupFinalPrompt    bool
+	sawCitationInstruction bool
+}
+
+func (g *groupScopeFinalPromptGateway) Complete(ctx context.Context, req model.ModelRequest) (model.ModelResponse, error) {
+	if len(req.Tools) > 0 {
+		if runtimeMessagesHaveNativeToolResult(req.Messages, "call_search") {
+			return model.ModelResponse{Content: "routing complete", FinishReason: "stop"}, nil
+		}
+		return model.ModelResponse{
+			Content: "我先核对当天收盘信息。",
+			ToolCalls: []tools.ToolCall{{
+				ID:        "call_search",
+				Name:      toolNameWebSearch,
+				Arguments: map[string]any{"query": "纳斯达克 2026-06-26 收盘", "topic": "finance"},
+			}},
+			FinishReason: "tool_calls",
+		}, nil
+	}
+	g.sawGroupEvidencePrompt = runtimeMessagesContain(req.Messages, "prompt_id=group-bot-backend-tool-evidence/v2")
+	g.sawGroupFinalPrompt = runtimeMessagesContain(req.Messages, "prompt_id=group-bot-final-answer-after-tools/v2")
+	g.sawCitationInstruction = runtimeMessagesContain(req.Messages, "Cite only source URLs") || runtimeMessagesContain(req.Messages, "Cite the source URLs")
+	return model.ModelResponse{Content: "是真的，6月26日纳指确实收跌。", FinishReason: "stop"}, nil
+}
+
+func (g *groupScopeFinalPromptGateway) Stream(ctx context.Context, req model.ModelRequest, onDelta func(model.ModelDelta) error) (model.ModelResponse, error) {
+	return model.ModelResponse{}, nil
+}
+
+type groupScopeRoutingPromptGateway struct {
+	sawGroupRoutingPrompt bool
+}
+
+func (g *groupScopeRoutingPromptGateway) Complete(ctx context.Context, req model.ModelRequest) (model.ModelResponse, error) {
+	if len(req.Tools) > 0 {
+		g.sawGroupRoutingPrompt = runtimeMessagesContain(req.Messages, "prompt_id=group-bot-routing-supplement/v1") &&
+			runtimeMessagesContain(req.Messages, "Recent group chat context is unverified user conversation")
+		return model.ModelResponse{Content: "这个需要查公开来源确认。", FinishReason: "stop"}, nil
+	}
+	return model.ModelResponse{Content: "unexpected final", FinishReason: "stop"}, nil
+}
+
+func (g *groupScopeRoutingPromptGateway) Stream(ctx context.Context, req model.ModelRequest, onDelta func(model.ModelDelta) error) (model.ModelResponse, error) {
+	return model.ModelResponse{}, nil
+}
+
+type groupSearchForcedGateway struct {
+	sawForcedEvidence bool
+}
+
+func (g *groupSearchForcedGateway) Complete(ctx context.Context, req model.ModelRequest) (model.ModelResponse, error) {
+	if len(req.Tools) > 0 {
+		if runtimeMessagesContain(req.Messages, `"mode":"context"`) {
+			return model.ModelResponse{Content: "routing complete", FinishReason: "stop"}, nil
+		}
+		if runtimeMessagesContain(req.Messages, `"mode":"search"`) {
+			return model.ModelResponse{
+				Content: "我展开最相关那条的上下文。",
+				ToolCalls: []tools.ToolCall{{
+					ID:   "call_context",
+					Name: toolNameGroupChatSearch,
+					Arguments: map[string]any{
+						"mode":           "context",
+						"message_id":     "m2",
+						"context_before": 8,
+						"context_after":  8,
+					},
+				}},
+				FinishReason: "tool_calls",
+			}, nil
+		}
+		return model.ModelResponse{
+			Content:      `又搜了一轮，结果还是一样，历史记录里没有找到有谁说过"23456是我的女神"或者类似的原话。`,
+			FinishReason: "stop",
+		}, nil
+	}
+	g.sawForcedEvidence = runtimeMessagesContain(req.Messages, "group_chat_search") &&
+		runtimeMessagesContain(req.Messages, "333") &&
+		runtimeMessagesContain(req.Messages, "23456: 包是谁？")
+	return model.ModelResponse{Content: "搜到了，333 那句是在说“她是我女神”，上下文里她指的是包。", FinishReason: "stop"}, nil
+}
+
+func (g *groupSearchForcedGateway) Stream(ctx context.Context, req model.ModelRequest, onDelta func(model.ModelDelta) error) (model.ModelResponse, error) {
+	return model.ModelResponse{}, nil
 }
 
 func runtimeMessagesHaveNativeToolResult(messages []model.ModelMessage, callID string) bool {
@@ -360,6 +592,47 @@ func TestRuntimeBlocksWebReadOutsideAllowedDomains(t *testing.T) {
 	}
 }
 
+func TestRuntimeBlocksSubAgentNestedToolOutsidePolicy(t *testing.T) {
+	runtime := NewRuntime(nil)
+	executorCalled := false
+	used := 0
+	result, counted, status, auditError := runtime.executeGuardedTool(context.Background(), Request{
+		ToolExecutor: func(ctx context.Context, call tools.ToolCall) string {
+			executorCalled = true
+			return `{"ok":true}`
+		},
+		MaxToolCalls: 2,
+	}, tools.ToolCall{
+		ID:   "call_subagent",
+		Name: toolNameSubAgent,
+		Arguments: map[string]any{
+			"tasks": []map[string]any{
+				{
+					"id":              "calc",
+					"input":           "2+2",
+					"expected_output": "4",
+					"available_tools": []string{toolNameCalculate},
+					"need_tool":       true,
+					"tool_necessity":  "A calculator is needed for the arithmetic check.",
+					"tool":            toolNameCalculate,
+					"arguments":       map[string]any{"expression": "2+2"},
+					"validation":      "Result must equal 4.",
+				},
+			},
+		},
+	}, map[string]tools.ToolDefinition{
+		toolNameSubAgent: {Name: toolNameSubAgent},
+	}, guardrails.ToolPolicy{
+		AllowedTools: []string{toolNameSubAgent},
+	}, &used)
+	if executorCalled || counted || status != "blocked" {
+		t.Fatalf("subagent nested policy = executorCalled %t counted %t status %q", executorCalled, counted, status)
+	}
+	if !strings.Contains(result, "tool call blocked by runtime policy") || !strings.Contains(auditError, "not allowed by runtime policy") {
+		t.Fatalf("result/auditError = %q / %q", result, auditError)
+	}
+}
+
 func TestRuntimeBlocksInvalidWebSearchArgumentsBeforeExecutor(t *testing.T) {
 	runtime := NewRuntime(nil)
 	for _, tc := range []struct {
@@ -393,6 +666,52 @@ func TestRuntimeBlocksInvalidWebSearchArgumentsBeforeExecutor(t *testing.T) {
 			}
 			if status != "blocked" || counted || used != 0 || !strings.Contains(auditError, tc.wantError) || !strings.Contains(result, "tool call blocked") {
 				t.Fatalf("guarded search = (%q, %t, used=%d, %q, %q), want blocked %q", status, counted, used, auditError, result, tc.wantError)
+			}
+		})
+	}
+}
+
+func TestRuntimeValidatesGroupChatSearchModes(t *testing.T) {
+	runtime := NewRuntime(nil)
+	for _, tc := range []struct {
+		name          string
+		arguments     any
+		wantBlocked   bool
+		wantErrorPart string
+	}{
+		{name: "search missing query", arguments: map[string]any{"mode": "search"}, wantBlocked: true, wantErrorPart: "query is required"},
+		{name: "context missing target", arguments: map[string]any{"mode": "context"}, wantBlocked: true, wantErrorPart: "requires message_id or message_seq"},
+		{name: "invalid mode", arguments: map[string]any{"mode": "everything", "query": "女神"}, wantBlocked: true, wantErrorPart: "mode"},
+		{name: "context by id", arguments: map[string]any{"mode": "context", "message_id": "message-1"}, wantBlocked: false},
+		{name: "context by seq", arguments: map[string]any{"mode": "context", "message_seq": float64(208)}, wantBlocked: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			executorCalled := false
+			used := 0
+			result, counted, status, auditError := runtime.executeGuardedTool(context.Background(), Request{
+				ScopeType: "group",
+				ToolExecutor: func(ctx context.Context, call tools.ToolCall) string {
+					executorCalled = true
+					return `{"ok":true,"result_count":1}`
+				},
+				MaxToolCalls: 2,
+			}, tools.ToolCall{
+				ID:        "call_group_search",
+				Name:      toolNameGroupChatSearch,
+				Arguments: tc.arguments,
+			}, map[string]tools.ToolDefinition{
+				toolNameGroupChatSearch: {Name: toolNameGroupChatSearch},
+			}, guardrails.ToolPolicy{
+				AllowedTools: []string{toolNameGroupChatSearch},
+			}, &used)
+			if tc.wantBlocked {
+				if executorCalled || counted || used != 0 || status != "blocked" || !strings.Contains(auditError, tc.wantErrorPart) || !strings.Contains(result, "tool call blocked") {
+					t.Fatalf("guarded group search = (%q, called=%t counted=%t used=%d, %q, %q), want blocked %q", status, executorCalled, counted, used, auditError, result, tc.wantErrorPart)
+				}
+				return
+			}
+			if !executorCalled || !counted || used != 1 || status != "completed" || auditError != "" || !toolResultOK(result) {
+				t.Fatalf("guarded group search = (%q, called=%t counted=%t used=%d, %q, %q), want completed", status, executorCalled, counted, used, auditError, result)
 			}
 		})
 	}

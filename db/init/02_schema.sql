@@ -252,6 +252,19 @@ CREATE TABLE group_events (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE group_states (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  group_id UUID NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+  state_type TEXT NOT NULL,
+  state_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  source_refs_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at TIMESTAMPTZ,
+  UNIQUE (group_id, state_type)
+);
+
 CREATE TABLE conversations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   type TEXT NOT NULL,
@@ -332,6 +345,38 @@ CREATE TABLE message_attachments (
   height INTEGER,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE message_mentions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  target_type TEXT NOT NULL,
+  target_identifier TEXT NOT NULL,
+  target_user_id UUID REFERENCES users(id) ON DELETE RESTRICT,
+  position INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT message_mentions_target_type_check CHECK (target_type IN ('user', 'ai')),
+  CONSTRAINT message_mentions_user_target_check CHECK (target_type <> 'user' OR target_user_id IS NOT NULL),
+  UNIQUE (message_id, target_type, target_identifier)
+);
+
+CREATE TABLE group_chat_summaries (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  group_id UUID NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+  conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  period_type TEXT NOT NULL,
+  period_start DATE NOT NULL,
+  period_end DATE NOT NULL,
+  summary TEXT NOT NULL,
+  topic_tags_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  source_refs_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_by_agent_id UUID,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at TIMESTAMPTZ,
+  CONSTRAINT group_chat_summaries_period_type_check CHECK (period_type IN ('day', 'week', 'month')),
+  UNIQUE (group_id, conversation_id, period_type, period_start)
 );
 
 CREATE TABLE notifications (
@@ -700,9 +745,13 @@ CREATE UNIQUE INDEX idx_user_sessions_refresh_token_hash ON user_sessions(refres
 CREATE INDEX idx_friendships_user_id ON friendships(user_id);
 CREATE INDEX idx_friend_requests_to_user_status ON friend_requests(to_user_id, status);
 CREATE INDEX idx_group_members_user_id ON group_members(user_id);
+CREATE INDEX idx_group_states_group_type ON group_states(group_id, state_type) WHERE deleted_at IS NULL;
 CREATE INDEX idx_conversation_participants_user_id ON conversation_participants(user_id);
 CREATE INDEX idx_conversation_device_states_user_device ON conversation_device_states(user_id, device_id);
 CREATE INDEX idx_messages_conversation_seq ON messages(conversation_id, message_seq DESC);
+CREATE INDEX idx_message_mentions_user_id ON message_mentions(target_user_id);
+CREATE UNIQUE INDEX idx_message_mentions_message_user_unique ON message_mentions(message_id, target_user_id) WHERE target_type = 'user' AND target_user_id IS NOT NULL;
+CREATE INDEX idx_group_chat_summaries_group_period ON group_chat_summaries(group_id, conversation_id, period_type, period_start DESC) WHERE deleted_at IS NULL;
 CREATE INDEX idx_notifications_user_read ON notifications(user_id, read_at);
 CREATE INDEX idx_realtime_events_emitted_seq ON realtime_events(emitted_at, event_seq);
 CREATE INDEX idx_realtime_event_recipients_user_seq ON realtime_event_recipients(user_id, event_seq DESC);
@@ -744,11 +793,14 @@ BEGIN
     'group_user_settings',
     'group_join_requests',
     'group_events',
+    'group_states',
     'conversations',
     'conversation_participants',
     'conversation_device_states',
     'messages',
     'message_attachments',
+    'message_mentions',
+    'group_chat_summaries',
     'notifications',
     'posts',
     'post_media',

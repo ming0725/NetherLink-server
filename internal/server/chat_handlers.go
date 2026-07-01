@@ -21,6 +21,7 @@ type sendMessageRequest struct {
 	Content             chatsvc.MessageContentInput `json:"content"`
 	Attachments         []messageAttachmentRequest  `json:"attachments"`
 	ReferencedMessageID *string                     `json:"referencedMessageId"`
+	Mentions            []messageMentionRequest     `json:"mentions"`
 }
 
 type messageAttachmentRequest struct {
@@ -29,6 +30,11 @@ type messageAttachmentRequest struct {
 	DurationMS  *int    `json:"durationMs"`
 	Width       *int    `json:"width"`
 	Height      *int    `json:"height"`
+}
+
+type messageMentionRequest struct {
+	TargetType string `json:"targetType"`
+	TargetID   string `json:"targetId"`
 }
 
 type openDirectConversationRequest struct {
@@ -164,6 +170,7 @@ type messageResponse struct {
 	Type                string                      `json:"type"`
 	Content             messageContentResponse      `json:"content"`
 	Attachments         []messageAttachmentResponse `json:"attachments"`
+	Mentions            []messageMentionResponse    `json:"mentions"`
 	ReferencedMessageID *string                     `json:"referencedMessageId,omitempty"`
 	ClientMessageID     string                      `json:"clientMessageId"`
 	ClientSentAt        *time.Time                  `json:"clientSentAt,omitempty"`
@@ -191,6 +198,14 @@ type messageAttachmentResponse struct {
 	DurationMS   *int    `json:"durationMs,omitempty"`
 	Width        *int    `json:"width,omitempty"`
 	Height       *int    `json:"height,omitempty"`
+}
+
+type messageMentionResponse struct {
+	MentionID      string  `json:"mentionId"`
+	TargetType     string  `json:"targetType"`
+	TargetID       string  `json:"targetId"`
+	TargetUserUUID *string `json:"targetUserUuid,omitempty"`
+	Position       int     `json:"position"`
 }
 
 type realtimeMessagePayload struct {
@@ -647,6 +662,10 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	for _, attachment := range req.Attachments {
 		attachments = append(attachments, chatsvc.AttachmentInput(attachment))
 	}
+	mentions := make([]chatsvc.MentionInput, 0, len(req.Mentions))
+	for _, mention := range req.Mentions {
+		mentions = append(mentions, chatsvc.MentionInput(mention))
+	}
 
 	message, err := s.chatService.SendMessage(r.Context(), chatsvc.SendMessageInput{
 		UserID:              principal.UserID,
@@ -657,6 +676,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		Content:             req.Content,
 		Attachments:         attachments,
 		ReferencedMessageID: req.ReferencedMessageID,
+		Mentions:            mentions,
 	})
 	if err != nil {
 		writeChatError(w, r, err)
@@ -676,6 +696,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	s.publishConversationMessage(r.Context(), conversationID, "chat.message.created", response)
 	s.publishAllConversationSyncStates(r.Context(), conversationID, "message.created")
 	s.publishAllConversationUpdated(r.Context(), conversationID, "message.created")
+	s.triggerGroupBotReplies(r.Context(), message)
 	writeJSON(w, http.StatusCreated, messageDetailResponse{Message: response, Included: included})
 }
 
@@ -767,6 +788,11 @@ func validateSendMessageRequest(req sendMessageRequest) *requestError {
 	for _, attachment := range req.Attachments {
 		if err := validateUUID(attachment.FileID, "attachments.fileId"); err != nil {
 			return err
+		}
+	}
+	for _, mention := range req.Mentions {
+		if strings.TrimSpace(mention.TargetType) == "" || strings.TrimSpace(mention.TargetID) == "" {
+			return &requestError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "mentions.targetType and mentions.targetId are required"}
 		}
 	}
 	return nil
@@ -906,6 +932,7 @@ func (s *Server) makeMessageResponse(r *http.Request, message repository.Message
 
 func (s *Server) makeMessageResponseFromContext(ctx context.Context, message repository.Message) (messageResponse, error) {
 	attachments := make([]messageAttachmentResponse, 0, len(message.Attachments))
+	mentions := make([]messageMentionResponse, 0, len(message.Mentions))
 	if message.RecalledAt == nil {
 		for _, attachment := range message.Attachments {
 			url, err := s.presignMessageAttachmentURL(ctx, attachment.File)
@@ -927,6 +954,15 @@ func (s *Server) makeMessageResponseFromContext(ctx context.Context, message rep
 				Height:       attachment.Height,
 			})
 		}
+		for _, mention := range message.Mentions {
+			mentions = append(mentions, messageMentionResponse{
+				MentionID:      mention.ID,
+				TargetType:     mention.TargetType,
+				TargetID:       mention.TargetIdentifier,
+				TargetUserUUID: mention.TargetUserID,
+				Position:       mention.Position,
+			})
+		}
 	}
 
 	var content messageContentResponse
@@ -945,6 +981,7 @@ func (s *Server) makeMessageResponseFromContext(ctx context.Context, message rep
 		Type:                message.Type,
 		Content:             content,
 		Attachments:         attachments,
+		Mentions:            mentions,
 		ReferencedMessageID: message.ReferencedMessageID,
 		ClientMessageID:     message.ClientMessageID,
 		ClientSentAt:        message.ClientSentAt,

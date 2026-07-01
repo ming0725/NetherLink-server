@@ -27,6 +27,25 @@ const agentProfileSelectColumns = `
 	updated_at,
 	deleted_at`
 
+const agentProfileSelectColumnsAP = `
+	ap.id,
+	ap.bot_user_id,
+	ap.owner_user_id,
+	ap.kind,
+	ap.visibility,
+	ap.name,
+	ap.avatar_file_id,
+	ap.base_prompt,
+	ap.model,
+	ap.tool_policy_json,
+	ap.safety_policy_json,
+	ap.style_profile_id,
+	ap.status,
+	ap.version,
+	ap.created_at,
+	ap.updated_at,
+	ap.deleted_at`
+
 type AgentRepository struct {
 	db DBTX
 }
@@ -78,6 +97,28 @@ type CreateAgentRunParams struct {
 	InputSnapshot     json.RawMessage
 	ContextRefs       json.RawMessage
 	ClientOperationID *string
+}
+
+type UpdateAgentRunResultParams struct {
+	RunID            string
+	Status           string
+	ToolCalls        json.RawMessage
+	Output           json.RawMessage
+	Model            *string
+	PromptTokens     int
+	CompletionTokens int
+	LatencyMS        int
+	ErrorCode        *string
+}
+
+type CreateAgentBindingParams struct {
+	AgentID         string
+	ScopeType       string
+	ScopeID         string
+	TriggerMode     string
+	Enabled         bool
+	CooldownSeconds int
+	CreatedBy       string
 }
 
 type CreateAgentMemoryParams struct {
@@ -259,6 +300,47 @@ func (r *AgentRepository) CreateProfile(ctx context.Context, params CreateAgentP
 	return profile, translateWriteError(err)
 }
 
+func (r *AgentRepository) CreateBinding(ctx context.Context, params CreateAgentBindingParams) (AgentBinding, error) {
+	binding, err := scanAgentBinding(r.db.QueryRow(ctx, `
+		INSERT INTO agent_bindings (
+			agent_id,
+			scope_type,
+			scope_id,
+			trigger_mode,
+			enabled,
+			cooldown_seconds,
+			created_by
+		)
+		VALUES ($1::uuid, $2, $3::uuid, $4, $5, $6, $7::uuid)
+		ON CONFLICT (agent_id, scope_type, scope_id) DO UPDATE
+		SET trigger_mode = EXCLUDED.trigger_mode,
+		    enabled = EXCLUDED.enabled,
+		    cooldown_seconds = EXCLUDED.cooldown_seconds,
+		    updated_at = now(),
+		    deleted_at = NULL
+		RETURNING
+			id,
+			agent_id,
+			scope_type,
+			scope_id,
+			trigger_mode,
+			enabled,
+			cooldown_seconds,
+			created_by,
+			created_at,
+			updated_at,
+			deleted_at`,
+		normalizeText(params.AgentID),
+		normalizeText(params.ScopeType),
+		normalizeText(params.ScopeID),
+		normalizeText(params.TriggerMode),
+		params.Enabled,
+		params.CooldownSeconds,
+		normalizeText(params.CreatedBy),
+	))
+	return binding, translateWriteError(err)
+}
+
 func (r *AgentRepository) ListProfilesForUser(ctx context.Context, userID string, limit int, offset int) ([]AgentProfile, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT `+agentProfileSelectColumns+`
@@ -313,6 +395,48 @@ func (r *AgentRepository) GetProfileForUser(ctx context.Context, userID string, 
 		normalizeText(agentID),
 	))
 	return profile, translateReadError(err)
+}
+
+func (r *AgentRepository) GetActiveGroupAgentByIdentifier(ctx context.Context, groupID string, identifier string) (AgentProfile, AgentBinding, error) {
+	row := r.db.QueryRow(ctx, `
+		SELECT
+			`+agentProfileSelectColumnsAP+`,
+			ab.id,
+			ab.agent_id,
+			ab.scope_type,
+			ab.scope_id,
+			ab.trigger_mode,
+			ab.enabled,
+			ab.cooldown_seconds,
+			ab.created_by,
+			ab.created_at,
+			ab.updated_at,
+			ab.deleted_at
+		FROM agent_bindings ab
+		JOIN agent_profiles ap
+		  ON ap.id = ab.agent_id
+		 AND ap.deleted_at IS NULL
+		 AND ap.status = 'active'
+		JOIN users bot
+		  ON bot.id = ap.bot_user_id
+		 AND bot.deleted_at IS NULL
+		 AND bot.status = 'active'
+		WHERE ab.scope_type = 'group'
+		  AND ab.scope_id = $1::uuid
+		  AND ab.trigger_mode = 'mention'
+		  AND ab.enabled = true
+		  AND ab.deleted_at IS NULL
+		  AND (
+		    ap.id::text = $2
+		    OR ap.bot_user_id::text = $2
+		    OR bot.public_id = $2
+		  )
+		LIMIT 1`,
+		normalizeText(groupID),
+		normalizeText(identifier),
+	)
+	profile, binding, err := scanAgentProfileWithBinding(row)
+	return profile, binding, translateReadError(err)
 }
 
 func (r *AgentRepository) SoftDeleteProfile(ctx context.Context, ownerUserID string, agentID string) error {
@@ -375,6 +499,53 @@ func (r *AgentRepository) CreateRun(ctx context.Context, params CreateAgentRunPa
 	return run, translateWriteError(err)
 }
 
+func (r *AgentRepository) UpdateRunResult(ctx context.Context, params UpdateAgentRunResultParams) (AgentRun, error) {
+	run, err := scanAgentRun(r.db.QueryRow(ctx, `
+		UPDATE agent_runs
+		SET status = $2,
+		    tool_calls_json = $3,
+		    output_json = $4,
+		    model = $5,
+		    prompt_tokens = $6,
+		    completion_tokens = $7,
+		    latency_ms = $8,
+		    error_code = $9,
+		    updated_at = now()
+		WHERE id = $1::uuid
+		  AND deleted_at IS NULL
+		RETURNING
+			id,
+			agent_id,
+			invoker_user_id,
+			source_type,
+			source_id,
+			status,
+			input_snapshot_json,
+			context_refs_json,
+			tool_calls_json,
+			output_json,
+			model,
+			prompt_tokens,
+			completion_tokens,
+			latency_ms,
+			error_code,
+			client_operation_id,
+			created_at,
+			updated_at,
+			deleted_at`,
+		normalizeText(params.RunID),
+		normalizeText(params.Status),
+		jsonOrDefaultArray(params.ToolCalls),
+		jsonOrDefault(params.Output),
+		normalizeTextPtr(params.Model),
+		params.PromptTokens,
+		params.CompletionTokens,
+		params.LatencyMS,
+		normalizeTextPtr(params.ErrorCode),
+	))
+	return run, translateWriteError(err)
+}
+
 func (r *AgentRepository) CreateMemory(ctx context.Context, params CreateAgentMemoryParams) (AgentMemory, error) {
 	memory, err := scanAgentMemory(r.db.QueryRow(ctx, `
 		INSERT INTO agent_memories (
@@ -412,6 +583,63 @@ func (r *AgentRepository) CreateMemory(ctx context.Context, params CreateAgentMe
 		params.Confidence,
 	))
 	return memory, translateWriteError(err)
+}
+
+func (r *AgentRepository) ListGroupBotMemories(ctx context.Context, agentID string, groupID string, userID string, limit int) ([]AgentMemory, error) {
+	if limit <= 0 {
+		limit = 8
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	rows, err := r.db.Query(ctx, `
+		SELECT
+			id,
+			agent_id,
+			user_id,
+			scope_type,
+			scope_id,
+			memory_type,
+			content,
+			source_refs_json,
+			confidence,
+			status,
+			created_at,
+			updated_at,
+			deleted_at
+		FROM agent_memories
+		WHERE agent_id = $1::uuid
+		  AND user_id = $3::uuid
+		  AND status = 'active'
+		  AND deleted_at IS NULL
+		  AND (
+		    (scope_type = 'user' AND scope_id IS NULL)
+		    OR (scope_type = 'group' AND scope_id = $2::uuid)
+		  )
+		ORDER BY confidence DESC, updated_at DESC, created_at DESC
+		LIMIT $4`,
+		normalizeText(agentID),
+		normalizeText(groupID),
+		normalizeText(userID),
+		limit,
+	)
+	if err != nil {
+		return nil, translateReadError(err)
+	}
+	defer rows.Close()
+
+	memories := []AgentMemory{}
+	for rows.Next() {
+		memory, err := scanAgentMemory(rows)
+		if err != nil {
+			return nil, err
+		}
+		memories = append(memories, memory)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return memories, nil
 }
 
 func (r *AgentRepository) CreateRAGDocument(ctx context.Context, params CreateRAGDocumentParams) (RAGDocument, error) {
@@ -533,6 +761,76 @@ func scanAgentProfile(row scanner) (AgentProfile, error) {
 	return profile, nil
 }
 
+func scanAgentProfileWithBinding(row scanner) (AgentProfile, AgentBinding, error) {
+	var (
+		id             pgtype.UUID
+		botUserID      pgtype.UUID
+		ownerUserID    pgtype.UUID
+		avatarFileID   pgtype.UUID
+		styleProfileID pgtype.UUID
+		profileDeleted pgtype.Timestamptz
+		profile        AgentProfile
+
+		bindingID      pgtype.UUID
+		bindingAgentID pgtype.UUID
+		bindingScopeID pgtype.UUID
+		createdBy      pgtype.UUID
+		bindingDeleted pgtype.Timestamptz
+		binding        AgentBinding
+	)
+	err := row.Scan(
+		&id,
+		&botUserID,
+		&ownerUserID,
+		&profile.Kind,
+		&profile.Visibility,
+		&profile.Name,
+		&avatarFileID,
+		&profile.BasePrompt,
+		&profile.Model,
+		&profile.ToolPolicy,
+		&profile.SafetyPolicy,
+		&styleProfileID,
+		&profile.Status,
+		&profile.Version,
+		&profile.CreatedAt,
+		&profile.UpdatedAt,
+		&profileDeleted,
+		&bindingID,
+		&bindingAgentID,
+		&binding.ScopeType,
+		&bindingScopeID,
+		&binding.TriggerMode,
+		&binding.Enabled,
+		&binding.CooldownSeconds,
+		&createdBy,
+		&binding.CreatedAt,
+		&binding.UpdatedAt,
+		&bindingDeleted,
+	)
+	if err != nil {
+		return AgentProfile{}, AgentBinding{}, err
+	}
+	profile.ID = uuidString(id)
+	profile.BotUserID = uuidString(botUserID)
+	profile.OwnerUserID = uuidStringPtr(ownerUserID)
+	profile.AvatarFileID = uuidStringPtr(avatarFileID)
+	profile.ToolPolicy = jsonOrDefault(profile.ToolPolicy)
+	profile.SafetyPolicy = jsonOrDefault(profile.SafetyPolicy)
+	profile.StyleProfileID = uuidStringPtr(styleProfileID)
+	if profileDeleted.Valid {
+		profile.DeletedAt = &profileDeleted.Time
+	}
+	binding.ID = uuidString(bindingID)
+	binding.AgentID = uuidString(bindingAgentID)
+	binding.ScopeID = uuidString(bindingScopeID)
+	binding.CreatedBy = uuidString(createdBy)
+	if bindingDeleted.Valid {
+		binding.DeletedAt = &bindingDeleted.Time
+	}
+	return profile, binding, nil
+}
+
 func scanAgentRun(row scanner) (AgentRun, error) {
 	var (
 		id            pgtype.UUID
@@ -578,6 +876,41 @@ func scanAgentRun(row scanner) (AgentRun, error) {
 		run.DeletedAt = &deletedAt.Time
 	}
 	return run, nil
+}
+
+func scanAgentBinding(row scanner) (AgentBinding, error) {
+	var (
+		id        pgtype.UUID
+		agentID   pgtype.UUID
+		scopeID   pgtype.UUID
+		createdBy pgtype.UUID
+		deletedAt pgtype.Timestamptz
+		binding   AgentBinding
+	)
+	err := row.Scan(
+		&id,
+		&agentID,
+		&binding.ScopeType,
+		&scopeID,
+		&binding.TriggerMode,
+		&binding.Enabled,
+		&binding.CooldownSeconds,
+		&createdBy,
+		&binding.CreatedAt,
+		&binding.UpdatedAt,
+		&deletedAt,
+	)
+	if err != nil {
+		return AgentBinding{}, translateReadError(err)
+	}
+	binding.ID = uuidString(id)
+	binding.AgentID = uuidString(agentID)
+	binding.ScopeID = uuidString(scopeID)
+	binding.CreatedBy = uuidString(createdBy)
+	if deletedAt.Valid {
+		binding.DeletedAt = &deletedAt.Time
+	}
+	return binding, nil
 }
 
 func scanAgentMemory(row scanner) (AgentMemory, error) {

@@ -39,6 +39,56 @@ func TestValidateImageMessageAcceptsAttachmentDimensions(t *testing.T) {
 	}
 }
 
+func TestValidateMessageMentionRejectsDuplicateTarget(t *testing.T) {
+	err := validateSendMessageInput(SendMessageInput{
+		UserID:          "user-1",
+		ConversationID:  "conversation-1",
+		ClientMessageID: "client-1",
+		Type:            "text",
+		Content:         MessageContentInput{Text: "hi @alice"},
+		Mentions: []MentionInput{
+			{TargetType: "user", TargetID: "alice_123"},
+			{TargetType: "user", TargetID: "alice_123"},
+		},
+	})
+	if !errors.Is(err, ErrValidation) {
+		t.Fatalf("error = %v, want ErrValidation", err)
+	}
+}
+
+func TestValidateMessageMentionRejectsNameLikeTarget(t *testing.T) {
+	err := validateSendMessageInput(SendMessageInput{
+		UserID:          "user-1",
+		ConversationID:  "conversation-1",
+		ClientMessageID: "client-1",
+		Type:            "text",
+		Content:         MessageContentInput{Text: "hi @Alice Zhang"},
+		Mentions: []MentionInput{
+			{TargetType: "user", TargetID: "Alice Zhang"},
+		},
+	})
+	if !errors.Is(err, ErrValidation) {
+		t.Fatalf("error = %v, want ErrValidation", err)
+	}
+}
+
+func TestValidateMessageMentionAcceptsUserAndAIIdentifiers(t *testing.T) {
+	err := validateSendMessageInput(SendMessageInput{
+		UserID:          "user-1",
+		ConversationID:  "conversation-1",
+		ClientMessageID: "client-1",
+		Type:            "text",
+		Content:         MessageContentInput{Text: "hi @alice @agent"},
+		Mentions: []MentionInput{
+			{TargetType: "user", TargetID: "alice_123"},
+			{TargetType: "ai", TargetID: "00000000-0000-0000-0000-000000000001"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("error = %v, want nil", err)
+	}
+}
+
 func TestIsSendableAttachmentStatus(t *testing.T) {
 	tests := []struct {
 		name   string

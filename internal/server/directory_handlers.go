@@ -437,13 +437,13 @@ func parseAcceptFriendGroupID(groupID *string, friendGroupID *string) (optionalS
 
 func validateOptionalGroupRoleFilter(role string) *requestError {
 	switch strings.TrimSpace(role) {
-	case "", "joined", "created", "owner", "managed", "admin", "member":
+	case "", "joined", "created", "owner", "managed", "admin", "ai", "member":
 		return nil
 	default:
 		return &requestError{
 			Status:  http.StatusBadRequest,
 			Code:    "VALIDATION_ERROR",
-			Message: "role must be one of joined, created, owner, managed, admin, or member",
+			Message: "role must be one of joined, created, owner, managed, admin, ai, or member",
 		}
 	}
 }

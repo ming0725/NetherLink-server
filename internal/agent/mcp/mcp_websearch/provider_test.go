@@ -172,6 +172,69 @@ func TestRunSearchStopsVariantsWhenOnlyProviderFailsFirstQuery(t *testing.T) {
 	}
 }
 
+func TestRunSearchUsesBaiduMCPProvider(t *testing.T) {
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-baidu-key" {
+			t.Fatalf("Authorization = %q, want bearer token", got)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode Baidu MCP body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"jsonrpc": "2.0",
+			"id": "test",
+			"result": {
+				"content": [
+					{
+						"type": "text",
+						"text": "{\"results\":[{\"title\":\"Baidu source\",\"url\":\"https://example.com/baidu\",\"snippet\":\"Fresh Baidu MCP result\",\"date\":\"2026-06-02\"}]}"
+					}
+				]
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	output, err := RunSearch(context.Background(), config.AIConfig{
+		BaiduSearchAPIKey: "test-baidu-key",
+		BaiduSearchMCPURL: server.URL,
+	}, map[string]any{
+		"query":       "Baidu MCP provider test",
+		"start_date":  "2026-06-01",
+		"end_date":    "2026-06-04",
+		"max_results": 3,
+	})
+	if err != nil {
+		t.Fatalf("RunSearch() error = %v", err)
+	}
+	if captured["method"] != "tools/call" {
+		t.Fatalf("captured method = %#v, want tools/call", captured["method"])
+	}
+	params, ok := captured["params"].(map[string]any)
+	if !ok || params["name"] != "web_search" {
+		t.Fatalf("captured params = %#v, want web_search call", captured["params"])
+	}
+	arguments, ok := params["arguments"].(map[string]any)
+	if !ok {
+		t.Fatalf("captured arguments = %#v, want object", params["arguments"])
+	}
+	if arguments["query"] != "Baidu MCP provider test" || arguments["count"] != float64(3) || arguments["freshness"] != "2026-06-01to2026-06-04" {
+		t.Fatalf("captured arguments = %#v, want query/count/freshness", arguments)
+	}
+	if output["ok"] != true || output["result_count"] != 1 {
+		t.Fatalf("output = %#v, want one Baidu result", output)
+	}
+	if got := stringSliceFromAny(output["providers"]); len(got) != 1 || got[0] != "baidu" {
+		t.Fatalf("providers = %#v, want baidu", output["providers"])
+	}
+	results, ok := output["results"].([]map[string]any)
+	if !ok || len(results) != 1 || results[0]["provider"] != "baidu" || results[0]["url"] != "https://example.com/baidu" {
+		t.Fatalf("results = %#v, want normalized Baidu result", output["results"])
+	}
+}
+
 func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {

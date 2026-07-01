@@ -103,6 +103,11 @@ func (s *Server) makeIncludedForMessages(ctx context.Context, viewerUserID strin
 	userIDs := make([]string, 0, len(messages))
 	for _, message := range messages {
 		userIDs = append(userIDs, message.SenderID)
+		for _, mention := range message.Mentions {
+			if mention.TargetUserID != nil {
+				userIDs = append(userIDs, *mention.TargetUserID)
+			}
+		}
 	}
 	userIDs = uniqueStrings(userIDs)
 	if len(userIDs) == 0 {
@@ -141,6 +146,18 @@ func (s *Server) makeIncludedForConversationEntries(ctx context.Context, viewerU
 		if entry.Conversation.GroupID != nil {
 			groupID := *entry.Conversation.GroupID
 			groupUserIDs[groupID] = append(groupUserIDs[groupID], entry.LastMessage.SenderID)
+			for _, mention := range entry.LastMessage.Mentions {
+				if mention.TargetUserID != nil {
+					userIDs = append(userIDs, *mention.TargetUserID)
+					groupUserIDs[groupID] = append(groupUserIDs[groupID], *mention.TargetUserID)
+				}
+			}
+		} else {
+			for _, mention := range entry.LastMessage.Mentions {
+				if mention.TargetUserID != nil {
+					userIDs = append(userIDs, *mention.TargetUserID)
+				}
+			}
 		}
 	}
 
@@ -179,7 +196,13 @@ func (s *Server) makeIncludedForConversationEntries(ctx context.Context, viewerU
 
 func (s *Server) makeRealtimeMessageRefs(ctx context.Context, conversationID string, message messageResponse) *referencedResourcesResponse {
 	refs := referencedResourcesResponse{}
-	users, err := s.loadUsersForIDs(ctx, []string{message.SenderUUID})
+	userIDs := []string{message.SenderUUID}
+	for _, mention := range message.Mentions {
+		if mention.TargetUserUUID != nil {
+			userIDs = append(userIDs, *mention.TargetUserUUID)
+		}
+	}
+	users, err := s.loadUsersForIDs(ctx, userIDs)
 	if err != nil {
 		s.logger.WarnContext(ctx, "failed to load realtime user refs", "error", err, "conversation_id", conversationID, "sender_id", message.SenderUUID)
 	} else {

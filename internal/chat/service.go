@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"regexp"
 	"strings"
 	"time"
 
@@ -21,6 +22,13 @@ const (
 	maxClientMessageIDLength = 128
 	maxMessageTextLength     = 4000
 	maxAttachmentsPerMessage = 20
+	maxMentionsPerMessage    = 50
+	maxMentionTargetIDLength = 128
+)
+
+var (
+	mentionUUIDPattern     = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	mentionPublicIDPattern = regexp.MustCompile(`^[A-Za-z0-9_]{4,32}$`)
 )
 
 type Service struct {
@@ -37,6 +45,7 @@ type SendMessageInput struct {
 	Content             MessageContentInput
 	Attachments         []AttachmentInput
 	ReferencedMessageID *string
+	Mentions            []MentionInput
 }
 
 type MessageContentInput struct {
@@ -50,6 +59,11 @@ type AttachmentInput struct {
 	DurationMS  *int    `json:"durationMs"`
 	Width       *int    `json:"width"`
 	Height      *int    `json:"height"`
+}
+
+type MentionInput struct {
+	TargetType string `json:"targetType"`
+	TargetID   string `json:"targetId"`
 }
 
 type ListMessagesInput struct {
@@ -345,6 +359,7 @@ func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (repo
 
 	messageType := normalizeMessageType(input.Type)
 	attachments := make([]repository.CreateMessageAttachmentParams, 0, len(input.Attachments))
+	mentions := make([]repository.CreateMessageMentionParams, 0, len(input.Mentions))
 	contentText := normalizeContentText(input.Content.Text)
 	contentJSON := input.Content.JSON
 
@@ -356,7 +371,12 @@ func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (repo
 			}
 			return err
 		}
-		if err := ensureDirectMessageAllowed(ctx, repos, input.UserID, input.ConversationID); err != nil {
+		entry, err := ensureMessageConversationAllowed(ctx, repos, input.UserID, input.ConversationID)
+		if err != nil {
+			return err
+		}
+		mentions, err = prepareMessageMentions(ctx, repos, entry, input.Mentions)
+		if err != nil {
 			return err
 		}
 
@@ -393,6 +413,7 @@ func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (repo
 			ClientMessageID:     input.ClientMessageID,
 			ClientSentAt:        input.ClientSentAt,
 			Attachments:         attachments,
+			Mentions:            mentions,
 		})
 		if err != nil {
 			return err
@@ -432,32 +453,32 @@ func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (repo
 	return created, nil
 }
 
-func ensureDirectMessageAllowed(ctx context.Context, repos repository.Repositories, userID string, conversationID string) error {
+func ensureMessageConversationAllowed(ctx context.Context, repos repository.Repositories, userID string, conversationID string) (repository.ConversationEntry, error) {
 	entry, err := repos.Chat.GetConversationForUser(ctx, userID, conversationID)
 	if err != nil {
-		return err
+		return repository.ConversationEntry{}, err
 	}
 	if entry.Conversation.Type != "direct" {
-		return nil
+		return entry, nil
 	}
 
 	peerUserID := directConversationPeerUserID(entry, userID)
 	if peerUserID == "" {
-		return ErrForbidden
+		return repository.ConversationEntry{}, ErrForbidden
 	}
 
 	forwardExists, err := repos.Friends.ActiveFriendshipExists(ctx, userID, peerUserID)
 	if err != nil {
-		return err
+		return repository.ConversationEntry{}, err
 	}
 	reverseExists, err := repos.Friends.ActiveFriendshipExists(ctx, peerUserID, userID)
 	if err != nil {
-		return err
+		return repository.ConversationEntry{}, err
 	}
 	if !forwardExists || !reverseExists {
-		return ErrNotFriend
+		return repository.ConversationEntry{}, ErrNotFriend
 	}
-	return nil
+	return entry, nil
 }
 
 func directConversationPeerUserID(entry repository.ConversationEntry, userID string) string {
@@ -505,7 +526,9 @@ func validateSendMessageInput(input SendMessageInput) error {
 	}
 
 	text := strings.TrimSpace(input.Content.Text)
-	if len([]rune(text)) > maxMessageTextLength || len(input.Attachments) > maxAttachmentsPerMessage {
+	if len([]rune(text)) > maxMessageTextLength ||
+		len(input.Attachments) > maxAttachmentsPerMessage ||
+		len(input.Mentions) > maxMentionsPerMessage {
 		return ErrValidation
 	}
 	if messageType == "text" && text == "" && len(input.Content.JSON) == 0 {
@@ -532,8 +555,128 @@ func validateSendMessageInput(input SendMessageInput) error {
 			return ErrValidation
 		}
 	}
+	if err := validateMentionInputs(input.Mentions); err != nil {
+		return err
+	}
 
 	return nil
+}
+
+func validateMentionInputs(mentions []MentionInput) error {
+	seen := make(map[string]struct{}, len(mentions))
+	for _, mention := range mentions {
+		targetType := normalizeMentionTargetType(mention.TargetType)
+		targetID := strings.TrimSpace(mention.TargetID)
+		if !validMentionTargetType(targetType) ||
+			targetID == "" ||
+			len([]rune(targetID)) > maxMentionTargetIDLength ||
+			!validMentionTargetIdentifier(targetID) {
+			return ErrValidation
+		}
+
+		key := targetType + ":" + mentionTargetDuplicateKey(targetID)
+		if _, ok := seen[key]; ok {
+			return ErrValidation
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+func prepareMessageMentions(ctx context.Context, repos repository.Repositories, entry repository.ConversationEntry, mentions []MentionInput) ([]repository.CreateMessageMentionParams, error) {
+	if len(mentions) == 0 {
+		return nil, nil
+	}
+	if entry.Conversation.Type != "group" || entry.Conversation.GroupID == nil {
+		return nil, ErrValidation
+	}
+	if repos.Users == nil || repos.Groups == nil {
+		return nil, ErrUnavailable
+	}
+
+	groupID := *entry.Conversation.GroupID
+	userTargets := make(map[string]struct{}, len(mentions))
+	aiTargets := make(map[string]struct{}, len(mentions))
+	resolved := make([]repository.CreateMessageMentionParams, 0, len(mentions))
+
+	for index, mention := range mentions {
+		targetType := normalizeMentionTargetType(mention.TargetType)
+		targetID := strings.TrimSpace(mention.TargetID)
+		switch targetType {
+		case "user":
+			user, err := resolveMentionUser(ctx, repos.Users, targetID)
+			if err != nil {
+				if errors.Is(err, repository.ErrNotFound) {
+					return nil, ErrValidation
+				}
+				return nil, err
+			}
+			if user.Status != "active" || user.AccountType == "agent" {
+				return nil, ErrValidation
+			}
+			if _, ok := userTargets[user.ID]; ok {
+				return nil, ErrValidation
+			}
+			if _, err := repos.Groups.GetMember(ctx, groupID, user.ID); err != nil {
+				if errors.Is(err, repository.ErrNotFound) {
+					return nil, ErrValidation
+				}
+				return nil, err
+			}
+
+			userTargets[user.ID] = struct{}{}
+			targetUserID := user.ID
+			resolved = append(resolved, repository.CreateMessageMentionParams{
+				TargetType:       "user",
+				TargetIdentifier: targetID,
+				TargetUserID:     &targetUserID,
+				Position:         index + 1,
+			})
+		case "ai":
+			if repos.Agents == nil {
+				return nil, ErrUnavailable
+			}
+			profile, _, err := repos.Agents.GetActiveGroupAgentByIdentifier(ctx, groupID, targetID)
+			if err != nil {
+				if errors.Is(err, repository.ErrNotFound) {
+					return nil, ErrValidation
+				}
+				return nil, err
+			}
+			if profile.Status != "active" {
+				return nil, ErrValidation
+			}
+			if _, err := repos.Groups.GetMember(ctx, groupID, profile.BotUserID); err != nil {
+				if errors.Is(err, repository.ErrNotFound) {
+					return nil, ErrValidation
+				}
+				return nil, err
+			}
+			key := mentionTargetDuplicateKey(profile.ID)
+			if _, ok := aiTargets[key]; ok {
+				return nil, ErrValidation
+			}
+			aiTargets[key] = struct{}{}
+			targetUserID := profile.BotUserID
+			resolved = append(resolved, repository.CreateMessageMentionParams{
+				TargetType:       "ai",
+				TargetIdentifier: profile.ID,
+				TargetUserID:     &targetUserID,
+				Position:         index + 1,
+			})
+		default:
+			return nil, ErrValidation
+		}
+	}
+
+	return resolved, nil
+}
+
+func resolveMentionUser(ctx context.Context, users *repository.UserRepository, targetID string) (repository.User, error) {
+	if mentionUUIDPattern.MatchString(targetID) {
+		return users.GetByID(ctx, targetID)
+	}
+	return users.GetByPublicID(ctx, targetID)
 }
 
 func isSendableAttachmentStatus(status string) bool {
@@ -547,6 +690,30 @@ func isSendableAttachmentStatus(status string) bool {
 
 func normalizeMessageType(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func normalizeMentionTargetType(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func validMentionTargetType(value string) bool {
+	switch value {
+	case "user", "ai":
+		return true
+	default:
+		return false
+	}
+}
+
+func validMentionTargetIdentifier(value string) bool {
+	return mentionUUIDPattern.MatchString(value) || mentionPublicIDPattern.MatchString(value)
+}
+
+func mentionTargetDuplicateKey(value string) string {
+	if mentionUUIDPattern.MatchString(value) {
+		return strings.ToLower(value)
+	}
+	return value
 }
 
 func normalizeContentText(value string) *string {

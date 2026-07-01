@@ -24,10 +24,13 @@ import (
 )
 
 var (
-	TavilySearchEndpoint  = "https://api.tavily.com/search"
-	TavilyExtractEndpoint = "https://api.tavily.com/extract"
-	BraveSearchEndpoint   = "https://api.search.brave.com/res/v1/web/search"
+	TavilySearchEndpoint   = "https://api.tavily.com/search"
+	TavilyExtractEndpoint  = "https://api.tavily.com/extract"
+	BraveSearchEndpoint    = "https://api.search.brave.com/res/v1/web/search"
+	BaiduSearchMCPEndpoint = "https://qianfan.baidubce.com/v2/tools/web-search/mcp"
 )
+
+var plainURLPattern = regexp.MustCompile(`https?://[^\s<>)\]）】"'，。]+`)
 
 var (
 	webSearchCache = newJSONToolCache(256)
@@ -55,6 +58,7 @@ var (
 
 const (
 	webSearchTavilyHTTPTimeout    = 8 * time.Second
+	webSearchBaiduMCPHTTPTimeout  = 12 * time.Second
 	webSearchProviderConcurrency  = 2
 	webReadTavilyFastPathDelay    = 1500 * time.Millisecond
 	webReadTavilyExtractTimeout   = 10 * time.Second
@@ -1041,7 +1045,12 @@ func extractHTMLText(document string) string {
 func RunSearch(ctx context.Context, cfg config.AIConfig, args any) (map[string]any, error) {
 	tavilyAPIKey := strings.TrimSpace(cfg.TavilyAPIKey)
 	braveAPIKey := strings.TrimSpace(cfg.BraveSearchAPIKey)
-	if tavilyAPIKey == "" && braveAPIKey == "" {
+	baiduAPIKey := strings.TrimSpace(cfg.BaiduSearchAPIKey)
+	baiduEndpoint := strings.TrimSpace(cfg.BaiduSearchMCPURL)
+	if baiduEndpoint == "" {
+		baiduEndpoint = BaiduSearchMCPEndpoint
+	}
+	if tavilyAPIKey == "" && braveAPIKey == "" && baiduAPIKey == "" {
 		return nil, errorsUnavailableWebSearch()
 	}
 	var input webSearchInput
@@ -1088,13 +1097,13 @@ func RunSearch(ctx context.Context, cfg config.AIConfig, args any) (map[string]a
 		return cached, nil
 	}
 	variants := expandedSearchInputs(input)
-	providers := configuredSearchProviders(tavilyAPIKey, braveAPIKey)
+	providers := configuredSearchProviders(tavilyAPIKey, braveAPIKey, baiduAPIKey)
 	if len(providers) == 1 && len(variants) > 1 {
-		outputs, providerErrors := runSearchProviderAttempts(ctx, tavilyAPIKey, braveAPIKey, variants[:1])
+		outputs, providerErrors := runSearchProviderAttempts(ctx, tavilyAPIKey, braveAPIKey, baiduAPIKey, baiduEndpoint, variants[:1])
 		if len(outputs) == 0 {
 			return failedSearchOutput(input, variants[:1], providers, providerErrors), nil
 		}
-		moreOutputs, moreErrors := runSearchProviderAttempts(ctx, tavilyAPIKey, braveAPIKey, variants[1:])
+		moreOutputs, moreErrors := runSearchProviderAttempts(ctx, tavilyAPIKey, braveAPIKey, baiduAPIKey, baiduEndpoint, variants[1:])
 		outputs = append(outputs, moreOutputs...)
 		providerErrors = append(providerErrors, moreErrors...)
 		output := mergeWebSearchProviderOutputs(input, variants, outputs, providerErrors)
@@ -1102,7 +1111,7 @@ func RunSearch(ctx context.Context, cfg config.AIConfig, args any) (map[string]a
 		webSearchCache.set(cacheKey, output, webSearchCacheTTL(input))
 		return output, nil
 	}
-	outputs, providerErrors := runSearchProviderAttempts(ctx, tavilyAPIKey, braveAPIKey, variants)
+	outputs, providerErrors := runSearchProviderAttempts(ctx, tavilyAPIKey, braveAPIKey, baiduAPIKey, baiduEndpoint, variants)
 	if len(outputs) == 0 {
 		if len(providerErrors) > 0 {
 			return failedSearchOutput(input, variants, providers, providerErrors), nil
@@ -1115,8 +1124,8 @@ func RunSearch(ctx context.Context, cfg config.AIConfig, args any) (map[string]a
 	return output, nil
 }
 
-func runSearchProviderAttempts(ctx context.Context, tavilyAPIKey string, braveAPIKey string, variants []webSearchInput) ([]map[string]any, []map[string]any) {
-	outputs := make([]map[string]any, 0, len(variants)*2)
+func runSearchProviderAttempts(ctx context.Context, tavilyAPIKey string, braveAPIKey string, baiduAPIKey string, baiduEndpoint string, variants []webSearchInput) ([]map[string]any, []map[string]any) {
+	outputs := make([]map[string]any, 0, len(variants)*3)
 	providerErrors := make([]map[string]any, 0)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -1167,6 +1176,31 @@ func runSearchProviderAttempts(ctx context.Context, tavilyAPIKey string, braveAP
 				defer mu.Unlock()
 				if err != nil {
 					providerErrors = append(providerErrors, map[string]any{"provider": "brave", "query": variant.Query, "error": err.Error(), "duration_ms": time.Since(start).Milliseconds()})
+					return
+				}
+				output["provider_duration_ms"] = time.Since(start).Milliseconds()
+				outputs = append(outputs, output)
+			}()
+		}
+		if baiduAPIKey != "" {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				select {
+				case sem <- struct{}{}:
+					defer func() { <-sem }()
+				case <-ctx.Done():
+					mu.Lock()
+					providerErrors = append(providerErrors, map[string]any{"provider": "baidu", "query": variant.Query, "error": ctx.Err().Error()})
+					mu.Unlock()
+					return
+				}
+				start := time.Now()
+				output, err := runBaiduMCPWebSearchTool(ctx, baiduAPIKey, baiduEndpoint, variant)
+				mu.Lock()
+				defer mu.Unlock()
+				if err != nil {
+					providerErrors = append(providerErrors, map[string]any{"provider": "baidu", "query": variant.Query, "error": err.Error(), "duration_ms": time.Since(start).Milliseconds()})
 					return
 				}
 				output["provider_duration_ms"] = time.Since(start).Milliseconds()
@@ -1367,6 +1401,264 @@ func runBraveWebSearchTool(ctx context.Context, apiKey string, input webSearchIn
 	return buildSearchOutput(input, results, extras), nil
 }
 
+func runBaiduMCPWebSearchTool(ctx context.Context, apiKey string, endpoint string, input webSearchInput) (map[string]any, error) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		endpoint = BaiduSearchMCPEndpoint
+	}
+	arguments := map[string]any{
+		"query": input.Query,
+		"count": input.MaxResults,
+	}
+	if arguments["count"] == 0 {
+		arguments["count"] = 5
+	}
+	if freshness := baiduFreshness(input); freshness != "" {
+		arguments["freshness"] = freshness
+	}
+	body := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      fmt.Sprintf("nlserver-web-search-%d", time.Now().UnixNano()),
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "web_search",
+			"arguments": arguments,
+		},
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+
+	resp, err := (&http.Client{Timeout: webSearchBaiduMCPHTTPTimeout}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("Baidu MCP search returned %d: %s", resp.StatusCode, TruncateToolText(string(respBody), 500))
+	}
+	decoded, err := decodeBaiduMCPResponse(resp.Header.Get("Content-Type"), respBody)
+	if err != nil {
+		return nil, err
+	}
+	results := normalizeBaiduSearchResults(decoded, input)
+	extras := map[string]any{
+		"providers": []string{"baidu"},
+	}
+	return buildSearchOutput(input, results, extras), nil
+}
+
+func baiduFreshness(input webSearchInput) string {
+	if input.StartDate != "" && input.EndDate != "" {
+		return input.StartDate + "to" + input.EndDate
+	}
+	switch input.TimeRange {
+	case "day":
+		return "pd"
+	case "week":
+		return "pw"
+	case "month":
+		return "pm"
+	case "year":
+		return "py"
+	default:
+		return ""
+	}
+}
+
+func decodeBaiduMCPResponse(contentType string, body []byte) (any, error) {
+	trimmed := strings.TrimSpace(string(body))
+	if strings.Contains(strings.ToLower(contentType), "text/event-stream") || strings.HasPrefix(trimmed, "event:") || strings.HasPrefix(trimmed, "data:") {
+		events := []string{}
+		for _, line := range strings.Split(trimmed, "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if payload == "" || payload == "[DONE]" {
+				continue
+			}
+			events = append(events, payload)
+		}
+		for i := len(events) - 1; i >= 0; i-- {
+			var decoded any
+			if err := json.Unmarshal([]byte(events[i]), &decoded); err == nil {
+				if mcpErr := baiduMCPError(decoded); mcpErr != "" {
+					return nil, fmt.Errorf("Baidu MCP search error: %s", mcpErr)
+				}
+				return unwrapBaiduMCPPayload(decoded), nil
+			}
+		}
+		return nil, fmt.Errorf("decode Baidu MCP SSE response: no JSON data event")
+	}
+	var decoded any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return nil, fmt.Errorf("decode Baidu MCP response: %w", err)
+	}
+	if err := baiduMCPError(decoded); err != "" {
+		return nil, fmt.Errorf("Baidu MCP search error: %s", err)
+	}
+	return unwrapBaiduMCPPayload(decoded), nil
+}
+
+func baiduMCPError(value any) string {
+	root, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	rawError, exists := root["error"]
+	if !exists {
+		return ""
+	}
+	if errorObject, ok := rawError.(map[string]any); ok {
+		message := firstBaiduString(errorObject, "message", "error", "detail")
+		code := jsonValueAsString(errorObject["code"])
+		if code != "" && message != "" {
+			return code + ": " + message
+		}
+		if message != "" {
+			return message
+		}
+	}
+	if errorText := jsonValueAsString(rawError); errorText != "" {
+		return errorText
+	}
+	return "unknown error"
+}
+
+func unwrapBaiduMCPPayload(value any) any {
+	root, ok := value.(map[string]any)
+	if !ok {
+		return value
+	}
+	if result, ok := root["result"]; ok {
+		return unwrapBaiduMCPPayload(result)
+	}
+	if structured, ok := root["structuredContent"]; ok {
+		return unwrapBaiduMCPPayload(structured)
+	}
+	if content, ok := root["content"].([]any); ok {
+		for _, item := range content {
+			entry, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			text := strings.TrimSpace(jsonValueAsString(entry["text"]))
+			if text == "" {
+				continue
+			}
+			var decoded any
+			if err := json.Unmarshal([]byte(text), &decoded); err == nil {
+				return unwrapBaiduMCPPayload(decoded)
+			}
+			return map[string]any{"text": text}
+		}
+	}
+	return value
+}
+
+func normalizeBaiduSearchResults(value any, input webSearchInput) []map[string]any {
+	items := findSearchResultItems(value)
+	results := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		title := firstBaiduString(item, "title", "name")
+		rawURL := firstBaiduString(item, "url", "link", "href")
+		content := firstBaiduString(item, "content", "snippet", "description", "summary", "text")
+		if rawURL == "" {
+			continue
+		}
+		result := map[string]any{
+			"title":          title,
+			"url":            rawURL,
+			"content":        TruncateToolText(content, 2500),
+			"published_date": firstBaiduString(item, "published_date", "date", "time", "publish_time"),
+			"provider":       "baidu",
+		}
+		if score, ok := jsonNumberAsFloat(item["score"]); ok {
+			result["score"] = score
+		}
+		results = append(results, normalizeSearchResult(result, input))
+	}
+	if len(results) > 0 {
+		return results
+	}
+	if text := baiduTextPayload(value); text != "" {
+		return normalizeBaiduTextResults(text, input)
+	}
+	return nil
+}
+
+func findSearchResultItems(value any) []map[string]any {
+	switch typed := value.(type) {
+	case []any:
+		items := make([]map[string]any, 0, len(typed))
+		for _, item := range typed {
+			if decoded, ok := item.(map[string]any); ok {
+				items = append(items, decoded)
+			}
+		}
+		return items
+	case map[string]any:
+		for _, key := range []string{"results", "items", "data", "list", "web_results"} {
+			if nested, exists := typed[key]; exists {
+				if items := findSearchResultItems(nested); len(items) > 0 {
+					return items
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func firstBaiduString(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(jsonValueAsString(values[key])); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func baiduTextPayload(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case map[string]any:
+		return strings.TrimSpace(jsonValueAsString(typed["text"]))
+	default:
+		return ""
+	}
+}
+
+func normalizeBaiduTextResults(text string, input webSearchInput) []map[string]any {
+	matches := plainURLPattern.FindAllString(text, -1)
+	urls := NormalizePublicWebURLs(matches)
+	results := make([]map[string]any, 0, len(urls))
+	for _, rawURL := range urls {
+		result := map[string]any{
+			"title":    rawURL,
+			"url":      rawURL,
+			"content":  TruncateToolText(text, 2500),
+			"provider": "baidu",
+		}
+		results = append(results, normalizeSearchResult(result, input))
+	}
+	return results
+}
+
 func fetchBraveRichResult(ctx context.Context, apiKey string, callbackKey string) (any, error) {
 	endpoint, err := url.Parse("https://api.search.brave.com/res/v1/web/rich")
 	if err != nil {
@@ -1518,13 +1810,16 @@ func failedSearchOutput(input webSearchInput, variants []webSearchInput, provide
 	}
 }
 
-func configuredSearchProviders(tavilyAPIKey string, braveAPIKey string) []string {
+func configuredSearchProviders(tavilyAPIKey string, braveAPIKey string, baiduAPIKey string) []string {
 	providers := []string{}
 	if strings.TrimSpace(tavilyAPIKey) != "" {
 		providers = append(providers, "tavily")
 	}
 	if strings.TrimSpace(braveAPIKey) != "" {
 		providers = append(providers, "brave")
+	}
+	if strings.TrimSpace(baiduAPIKey) != "" {
+		providers = append(providers, "baidu")
 	}
 	return providers
 }
@@ -1818,7 +2113,11 @@ func stripSocialPlatformTerms(query string) string {
 }
 
 func webSearchCacheKey(cfg config.AIConfig, input webSearchInput) string {
-	return stableCacheKey("web_search", input, TavilySearchEndpoint, BraveSearchEndpoint, strings.TrimSpace(cfg.TavilyAPIKey) != "", strings.TrimSpace(cfg.BraveSearchAPIKey) != "")
+	baiduEndpoint := strings.TrimSpace(cfg.BaiduSearchMCPURL)
+	if baiduEndpoint == "" {
+		baiduEndpoint = BaiduSearchMCPEndpoint
+	}
+	return stableCacheKey("web_search", input, TavilySearchEndpoint, BraveSearchEndpoint, baiduEndpoint, strings.TrimSpace(cfg.TavilyAPIKey) != "", strings.TrimSpace(cfg.BraveSearchAPIKey) != "", strings.TrimSpace(cfg.BaiduSearchAPIKey) != "")
 }
 
 func webSearchCacheTTL(input webSearchInput) time.Duration {

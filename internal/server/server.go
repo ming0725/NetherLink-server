@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -26,26 +27,28 @@ import (
 )
 
 type Server struct {
-	cfg             config.Config
-	db              *pgxpool.Pool
-	redis           *redis.Client
-	repos           repository.Repositories
-	authService     *authsvc.Service
-	aiService       *aisvc.Service
-	agentService    *agentprofile.Service
-	modelGateway    agentmodel.ModelGateway
-	chatService     *chatsvc.Service
-	fileService     *filesvc.Service
-	friendService   *friendsvc.Service
-	groupService    *groupsvc.Service
-	postService     *postsvc.Service
-	realtimeHub     *realtime.Hub
-	realtimeFanout  *realtime.RedisFanout
-	realtimeCleanup *realtime.CleanupWorker
-	aiStreams       *aiStreamRegistry
-	storage         storage.ObjectStorageProvider
-	logger          *slog.Logger
-	handler         http.Handler
+	cfg                 config.Config
+	db                  *pgxpool.Pool
+	redis               *redis.Client
+	repos               repository.Repositories
+	authService         *authsvc.Service
+	aiService           *aisvc.Service
+	agentService        *agentprofile.Service
+	modelGateway        agentmodel.ModelGateway
+	chatService         *chatsvc.Service
+	fileService         *filesvc.Service
+	friendService       *friendsvc.Service
+	groupService        *groupsvc.Service
+	postService         *postsvc.Service
+	realtimeHub         *realtime.Hub
+	realtimeFanout      *realtime.RedisFanout
+	realtimeCleanup     *realtime.CleanupWorker
+	aiStreams           *aiStreamRegistry
+	groupBotRepliesMu   sync.Mutex
+	groupBotRepliesSeen map[string]time.Time
+	storage             storage.ObjectStorageProvider
+	logger              *slog.Logger
+	handler             http.Handler
 }
 
 type Dependencies struct {
@@ -136,25 +139,26 @@ func NewWithDependencies(deps Dependencies) *Server {
 	}
 
 	server := &Server{
-		cfg:             deps.Config,
-		db:              deps.DB,
-		redis:           deps.Redis,
-		repos:           deps.Repos,
-		authService:     deps.AuthService,
-		aiService:       deps.AIService,
-		agentService:    deps.AgentService,
-		modelGateway:    deps.ModelGateway,
-		chatService:     deps.ChatService,
-		fileService:     deps.FileService,
-		friendService:   deps.FriendService,
-		groupService:    deps.GroupService,
-		postService:     deps.PostService,
-		realtimeHub:     deps.RealtimeHub,
-		realtimeFanout:  deps.RealtimeFanout,
-		realtimeCleanup: deps.RealtimeCleanup,
-		aiStreams:       newAIStreamRegistry(),
-		storage:         deps.Storage,
-		logger:          deps.Logger,
+		cfg:                 deps.Config,
+		db:                  deps.DB,
+		redis:               deps.Redis,
+		repos:               deps.Repos,
+		authService:         deps.AuthService,
+		aiService:           deps.AIService,
+		agentService:        deps.AgentService,
+		modelGateway:        deps.ModelGateway,
+		chatService:         deps.ChatService,
+		fileService:         deps.FileService,
+		friendService:       deps.FriendService,
+		groupService:        deps.GroupService,
+		postService:         deps.PostService,
+		realtimeHub:         deps.RealtimeHub,
+		realtimeFanout:      deps.RealtimeFanout,
+		realtimeCleanup:     deps.RealtimeCleanup,
+		aiStreams:           newAIStreamRegistry(),
+		groupBotRepliesSeen: make(map[string]time.Time),
+		storage:             deps.Storage,
+		logger:              deps.Logger,
 	}
 
 	mux := http.NewServeMux()
@@ -253,6 +257,7 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.Handle("PATCH /api/v1/groups/{groupId}/members/{userUuid}", s.withAuthRequired(http.HandlerFunc(s.handlePatchGroupMember)))
 	mux.Handle("POST /api/v1/groups/{groupId}/transfer-owner", s.withAuthRequired(http.HandlerFunc(s.handleTransferGroupOwner)))
 	mux.Handle("PATCH /api/v1/groups/{groupId}/my-settings", s.withAuthRequired(http.HandlerFunc(s.handlePatchGroupMySettings)))
+	mux.Handle("POST /api/v1/groups/{groupId}/bots", s.withAuthRequired(http.HandlerFunc(s.handleCreateGroupBot)))
 	mux.Handle("POST /api/v1/group-join-requests", s.withAuthRequired(http.HandlerFunc(s.handleCreateGroupJoinRequest)))
 	mux.Handle("GET /api/v1/group-notifications", s.withAuthRequired(http.HandlerFunc(s.handleGroupNotifications)))
 	mux.Handle("POST /api/v1/group-join-requests/{requestId}/accept", s.withAuthRequired(http.HandlerFunc(s.handleAcceptGroupJoinRequest)))
